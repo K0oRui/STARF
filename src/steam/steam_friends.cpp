@@ -2,6 +2,16 @@
 #include "core/callbacks.h"
 #include "core/settings.h"
 #include "steam/isteamfriends.h"
+#include "overlay/overlay.h"
+
+// Game asked for an overlay page (Achievements, Stats, ...): open our panel.
+// Open-only, never toggles an already-open panel shut.
+static void open_overlay_panel(const char* what)
+{
+    STAR_LOG("ActivateGameOverlay: %s", what ? what : "(null)");
+    auto& o = StarOverlay::get();
+    if (o.is_enabled()) o.open_panel();
+}
 
 StarSteamFriends& StarSteamFriends::get()
 {
@@ -50,12 +60,12 @@ int StarSteamFriends::GetFriendCountFromSource(CSteamID steamIDSource) { STAR_UN
 CSteamID StarSteamFriends::GetFriendFromSourceByIndex(CSteamID steamIDSource, int iFriend) { STAR_UNREFERENCED(steamIDSource); STAR_UNREFERENCED(iFriend); return k_steamIDNil; }
 bool StarSteamFriends::IsUserInSource(CSteamID steamIDUser, CSteamID steamIDSource) { STAR_UNREFERENCED(steamIDUser); STAR_UNREFERENCED(steamIDSource); return false; }
 void StarSteamFriends::SetInGameVoiceSpeaking(CSteamID steamIDUser, bool bSpeaking) { STAR_UNREFERENCED(steamIDUser); STAR_UNREFERENCED(bSpeaking); }
-void StarSteamFriends::ActivateGameOverlay(const char* pchDialog) { STAR_UNREFERENCED(pchDialog); }
-void StarSteamFriends::ActivateGameOverlayToUser(const char* pchDialog, CSteamID steamID) { STAR_UNREFERENCED(pchDialog); STAR_UNREFERENCED(steamID); }
-void StarSteamFriends::ActivateGameOverlayToWebPage(const char* pchURL) { STAR_UNREFERENCED(pchURL); }
-void StarSteamFriends::ActivateGameOverlayToStore(AppId_t nAppID, EOverlayToStoreFlag eFlag) { STAR_UNREFERENCED(nAppID); STAR_UNREFERENCED(eFlag); }
+void StarSteamFriends::ActivateGameOverlay(const char* pchDialog) { open_overlay_panel(pchDialog); }
+void StarSteamFriends::ActivateGameOverlayToUser(const char* pchDialog, CSteamID steamID) { STAR_UNREFERENCED(steamID); open_overlay_panel(pchDialog); }
+void StarSteamFriends::ActivateGameOverlayToWebPage(const char* pchURL) { STAR_UNREFERENCED(pchURL); open_overlay_panel("OfficialGameGroup"); }
+void StarSteamFriends::ActivateGameOverlayToStore(AppId_t nAppID, EOverlayToStoreFlag eFlag) { STAR_UNREFERENCED(nAppID); STAR_UNREFERENCED(eFlag); open_overlay_panel("Store"); }
 void StarSteamFriends::SetPlayedWith(CSteamID steamIDUserPlayedWith) { STAR_UNREFERENCED(steamIDUserPlayedWith); }
-void StarSteamFriends::ActivateGameOverlayInviteDialog(CSteamID steamIDLobby) { STAR_UNREFERENCED(steamIDLobby); }
+void StarSteamFriends::ActivateGameOverlayInviteDialog(CSteamID steamIDLobby) { STAR_UNREFERENCED(steamIDLobby); open_overlay_panel("LobbyInvite"); }
 int StarSteamFriends::GetSmallFriendAvatar(CSteamID steamIDFriend) { STAR_UNREFERENCED(steamIDFriend); return 0; }
 int StarSteamFriends::GetMediumFriendAvatar(CSteamID steamIDFriend) { STAR_UNREFERENCED(steamIDFriend); return 0; }
 int StarSteamFriends::GetLargeFriendAvatar(CSteamID steamIDFriend) { STAR_UNREFERENCED(steamIDFriend); return 0; }
@@ -128,9 +138,9 @@ void StarSteamFriends::ActivateGameOverlayToWebPage(const char* pchURL, EActivat
     STAR_UNREFERENCED(eMode);
     ActivateGameOverlayToWebPage(pchURL);
 }
-void StarSteamFriends::ActivateGameOverlayRemotePlayTogetherInviteDialog(CSteamID steamIDLobby) { STAR_UNREFERENCED(steamIDLobby); }
+void StarSteamFriends::ActivateGameOverlayRemotePlayTogetherInviteDialog(CSteamID steamIDLobby) { STAR_UNREFERENCED(steamIDLobby); open_overlay_panel("LobbyInvite"); }
 bool StarSteamFriends::RegisterProtocolInOverlayBrowser(const char* pchProtocol) { STAR_UNREFERENCED(pchProtocol); return false; }
-void StarSteamFriends::ActivateGameOverlayInviteDialogConnectString(const char* pchConnectString) { STAR_UNREFERENCED(pchConnectString); }
+void StarSteamFriends::ActivateGameOverlayInviteDialogConnectString(const char* pchConnectString) { STAR_UNREFERENCED(pchConnectString); open_overlay_panel("LobbyInvite"); }
 
 SteamAPICall_t StarSteamFriends::RequestEquippedProfileItems(CSteamID steamID)
 {

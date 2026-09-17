@@ -3,6 +3,9 @@
 #include "core/star_common.h"
 #include "steam/steam_api.h"
 #include "steam/steam_api_flat.h"
+#include "steam/steam_remote_storage.h"
+#include "steam/steam_utils.h"
+#include "steam/steam_friends.h"
 
 #pragma warning(push)
 #pragma warning(disable: 4190) // C-linkage returning UDT warning
@@ -439,15 +442,13 @@ STAR_EXPORT void SteamAPI_ISteamFriends_SetInGameVoiceSpeaking(ISteamFriends* se
 STAR_EXPORT void SteamAPI_ISteamFriends_ActivateGameOverlayToUser(ISteamFriends* self, const char * pchDialog, uint64_steamid steamID)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchDialog);
-    STAR_UNREFERENCED(steamID);
+    StarSteamFriends::get().ActivateGameOverlayToUser(pchDialog, CSteamID(steamID));
 }
 
 STAR_EXPORT void SteamAPI_ISteamFriends_ActivateGameOverlayToStore(ISteamFriends* self, AppId_t nAppID, EOverlayToStoreFlag eFlag)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(nAppID);
-    STAR_UNREFERENCED(eFlag);
+    StarSteamFriends::get().ActivateGameOverlayToStore(nAppID, eFlag);
 }
 
 STAR_EXPORT int SteamAPI_ISteamFriends_GetSmallFriendAvatar(ISteamFriends* self, uint64_steamid steamIDFriend)
@@ -720,7 +721,7 @@ STAR_EXPORT int SteamAPI_ISteamFriends_GetNumChatsWithUnreadPriorityMessages(ISt
 STAR_EXPORT void SteamAPI_ISteamFriends_ActivateGameOverlayRemotePlayTogetherInviteDialog(ISteamFriends* self, uint64_steamid steamIDLobby)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(steamIDLobby);
+    StarSteamFriends::get().ActivateGameOverlayRemotePlayTogetherInviteDialog(CSteamID(steamIDLobby));
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamFriends_RegisterProtocolInOverlayBrowser(ISteamFriends* self, const char * pchProtocol)
@@ -834,7 +835,7 @@ STAR_EXPORT uint32 SteamAPI_ISteamUtils_GetIPCCallCount(ISteamUtils* self)
 STAR_EXPORT steam_bool SteamAPI_ISteamUtils_IsOverlayEnabled(ISteamUtils* self)
 {
     STAR_UNREFERENCED(self);
-    return {};
+    return StarSteamUtils::get().IsOverlayEnabled();
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamUtils_BOverlayNeedsPresent(ISteamUtils* self)
@@ -1672,140 +1673,109 @@ STAR_EXPORT steam_bool SteamAPI_ISteamParties_GetBeaconLocationData(ISteamPartie
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_FileForget(ISteamRemoteStorage* self, const char * pchFile)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchFile);
-    return {};
+    return StarSteamRemoteStorage::get().FileForget(pchFile);
 }
 
 STAR_EXPORT SteamAPICall_t SteamAPI_ISteamRemoteStorage_FileShare(ISteamRemoteStorage* self, const char * pchFile)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchFile);
-    return {};
+    return StarSteamRemoteStorage::get().FileShare(pchFile);
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_SetSyncPlatforms(ISteamRemoteStorage* self, const char * pchFile, ERemoteStoragePlatform eRemoteStoragePlatform)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchFile);
-    STAR_UNREFERENCED(eRemoteStoragePlatform);
-    return {};
+    return StarSteamRemoteStorage::get().SetSyncPlatforms(pchFile, eRemoteStoragePlatform);
 }
 
 STAR_EXPORT UGCFileWriteStreamHandle_t SteamAPI_ISteamRemoteStorage_FileWriteStreamOpen(ISteamRemoteStorage* self, const char * pchFile)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchFile);
-    return {};
+    return StarSteamRemoteStorage::get().FileWriteStreamOpen(pchFile);
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_FileWriteStreamWriteChunk(ISteamRemoteStorage* self, UGCFileWriteStreamHandle_t writeHandle, const void * pvData, int32 cubData)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(writeHandle);
-    STAR_UNREFERENCED(pvData);
-    STAR_UNREFERENCED(cubData);
-    return {};
+    return StarSteamRemoteStorage::get().FileWriteStreamWriteChunk(writeHandle, pvData, cubData);
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_FileWriteStreamClose(ISteamRemoteStorage* self, UGCFileWriteStreamHandle_t writeHandle)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(writeHandle);
-    return {};
+    return StarSteamRemoteStorage::get().FileWriteStreamClose(writeHandle);
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_FileWriteStreamCancel(ISteamRemoteStorage* self, UGCFileWriteStreamHandle_t writeHandle)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(writeHandle);
-    return {};
+    return StarSteamRemoteStorage::get().FileWriteStreamCancel(writeHandle);
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_FilePersisted(ISteamRemoteStorage* self, const char * pchFile)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchFile);
-    return {};
+    return StarSteamRemoteStorage::get().FilePersisted(pchFile);
 }
 
 STAR_EXPORT int64 SteamAPI_ISteamRemoteStorage_GetFileTimestamp(ISteamRemoteStorage* self, const char * pchFile)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchFile);
-    return {};
+    return StarSteamRemoteStorage::get().GetFileTimestamp(pchFile);
 }
 
 STAR_EXPORT ERemoteStoragePlatform SteamAPI_ISteamRemoteStorage_GetSyncPlatforms(ISteamRemoteStorage* self, const char * pchFile)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(pchFile);
-    return {};
+    return StarSteamRemoteStorage::get().GetSyncPlatforms(pchFile);
 }
 
 STAR_EXPORT int32 SteamAPI_ISteamRemoteStorage_GetFileCount(ISteamRemoteStorage* self)
 {
     STAR_UNREFERENCED(self);
-    return {};
+    return StarSteamRemoteStorage::get().GetFileCount();
 }
 
 STAR_EXPORT const char * SteamAPI_ISteamRemoteStorage_GetFileNameAndSize(ISteamRemoteStorage* self, int iFile, int32 * pnFileSizeInBytes)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(iFile);
-    STAR_UNREFERENCED(pnFileSizeInBytes);
-    return "";
+    return StarSteamRemoteStorage::get().GetFileNameAndSize(iFile, pnFileSizeInBytes);
 }
 
 STAR_EXPORT SteamAPICall_t SteamAPI_ISteamRemoteStorage_UGCDownload(ISteamRemoteStorage* self, UGCHandle_t hContent, uint32 unPriority)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(hContent);
-    STAR_UNREFERENCED(unPriority);
-    return {};
+    return StarSteamRemoteStorage::get().UGCDownload(hContent, unPriority);
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_GetUGCDownloadProgress(ISteamRemoteStorage* self, UGCHandle_t hContent, int32 * pnBytesDownloaded, int32 * pnBytesExpected)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(hContent);
-    STAR_UNREFERENCED(pnBytesDownloaded);
-    STAR_UNREFERENCED(pnBytesExpected);
-    return {};
+    return StarSteamRemoteStorage::get().GetUGCDownloadProgress(hContent, pnBytesDownloaded, pnBytesExpected);
 }
 
 STAR_EXPORT steam_bool SteamAPI_ISteamRemoteStorage_GetUGCDetails(ISteamRemoteStorage* self, UGCHandle_t hContent, AppId_t * pnAppID, char ** ppchName, int32 * pnFileSizeInBytes, CSteamID * pSteamIDOwner)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(hContent);
-    STAR_UNREFERENCED(pnAppID);
-    STAR_UNREFERENCED(ppchName);
-    STAR_UNREFERENCED(pnFileSizeInBytes);
-    STAR_UNREFERENCED(pSteamIDOwner);
-    return {};
+    return StarSteamRemoteStorage::get().GetUGCDetails(hContent, pnAppID, ppchName, pnFileSizeInBytes, pSteamIDOwner);
 }
 
 STAR_EXPORT int32 SteamAPI_ISteamRemoteStorage_UGCRead(ISteamRemoteStorage* self, UGCHandle_t hContent, void * pvData, int32 cubDataToRead, uint32 cOffset, EUGCReadAction eAction)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(hContent);
-    STAR_UNREFERENCED(pvData);
-    STAR_UNREFERENCED(cubDataToRead);
-    STAR_UNREFERENCED(cOffset);
-    STAR_UNREFERENCED(eAction);
-    return {};
+    return StarSteamRemoteStorage::get().UGCRead(hContent, pvData, cubDataToRead, cOffset, eAction);
 }
 
 STAR_EXPORT int32 SteamAPI_ISteamRemoteStorage_GetCachedUGCCount(ISteamRemoteStorage* self)
 {
     STAR_UNREFERENCED(self);
-    return {};
+    return StarSteamRemoteStorage::get().GetCachedUGCCount();
 }
 
 STAR_EXPORT UGCHandle_t SteamAPI_ISteamRemoteStorage_GetCachedUGCHandle(ISteamRemoteStorage* self, int32 iCachedContent)
 {
     STAR_UNREFERENCED(self);
-    STAR_UNREFERENCED(iCachedContent);
-    return {};
+    return StarSteamRemoteStorage::get().GetCachedUGCHandle(iCachedContent);
 }
 
 STAR_EXPORT SteamAPICall_t SteamAPI_ISteamRemoteStorage_PublishWorkshopFile(ISteamRemoteStorage* self, const char * pchFile, const char * pchPreviewFile, AppId_t nConsumerAppId, const char * pchTitle, const char * pchDescription, ERemoteStoragePublishedFileVisibility eVisibility, SteamParamStringArray_t * pTags, EWorkshopFileType eWorkshopFileType)

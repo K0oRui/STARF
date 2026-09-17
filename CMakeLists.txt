@@ -87,6 +87,7 @@ set(STAR_SOURCES
     src/core/star_flat_stubs.cpp
     src/core/storage.cpp
     src/overlay/overlay.cpp
+    src/overlay/external.cpp
     src/steam/steam_applist.cpp
     src/steam/steam_apps.cpp
     src/steam/steam_client.cpp
@@ -171,6 +172,7 @@ if(MSVC)
     target_link_options(star PRIVATE /MAP)
     # Debug info in release for debugging if needed
     target_compile_options(star PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(star PRIVATE $<$<CONFIG:Release>:/DEBUG>)
 endif()
 
 add_library(version_proxy SHARED src/proxy/version.cpp)

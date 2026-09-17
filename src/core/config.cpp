@@ -53,6 +53,10 @@ bool IniFile::load(const std::string& path)
             if (comment != std::string::npos) {
                 val = trim(val.substr(0, comment));
             }
+            comment = val.find('#');
+            if (comment != std::string::npos) {
+                val = trim(val.substr(0, comment));
+            }
             if (!key.empty()) {
                 data_[current_section][key] = val;
             }

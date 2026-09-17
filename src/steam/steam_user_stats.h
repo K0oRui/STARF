@@ -124,11 +124,15 @@ public:
     int32 GetGlobalStatHistory(const char* pchStatName, double* pData, uint32 cubData) override;
 
     void load_from_storage();
-    void notify_achievement_unlock(const std::string& name);
+    void notify_achievement_unlock(const std::string& name, bool with_sound = true);
+    static void play_unlock_sound();
+    static void play_completion_sound();
+    void set_bulk_silent(bool silent) { bulk_silent_ = silent; }
 
 private:
     StarSteamUserStats() = default;
     bool stats_loaded_ = false;
+    bool bulk_silent_ = false; // bulk unlock: persist + callbacks, skip toast/sound
     std::unordered_map<std::string, AchievementState> achievements_;
     std::unordered_map<std::string, StatValue> stats_;
     std::vector<LeaderboardInfo> leaderboards_;

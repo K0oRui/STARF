@@ -109,13 +109,18 @@ UGCFileWriteStreamHandle_t StarSteamRemoteStorage::FileWriteStreamOpen(const cha
     WriteStream ws;
     ws.filename = pchFile;
     streams_[h] = std::move(ws);
+    STAR_LOG("FileWriteStreamOpen: '%s' -> handle=%llu", pchFile, (unsigned long long)h);
     return h;
 }
 
 bool StarSteamRemoteStorage::FileWriteStreamWriteChunk(UGCFileWriteStreamHandle_t writeHandle, const void* pvData, int32 cubData)
 {
     auto it = streams_.find(writeHandle);
-    if (it == streams_.end()) return false;
+    if (it == streams_.end()) {
+        STAR_LOG("FileWriteStreamWriteChunk: unknown handle=%llu cub=%d -> false",
+            (unsigned long long)writeHandle, (int)cubData);
+        return false;
+    }
     if (pvData && cubData > 0) {
         auto* p = (const uint8_t*)pvData;
         it->second.data.insert(it->second.data.end(), p, p + cubData);
@@ -126,10 +131,15 @@ bool StarSteamRemoteStorage::FileWriteStreamWriteChunk(UGCFileWriteStreamHandle_
 bool StarSteamRemoteStorage::FileWriteStreamClose(UGCFileWriteStreamHandle_t writeHandle)
 {
     auto it = streams_.find(writeHandle);
-    if (it == streams_.end()) return false;
-    Storage::get().write_remote_file(it->second.filename, it->second.data.data(), it->second.data.size());
+    if (it == streams_.end()) {
+        STAR_LOG("FileWriteStreamClose: unknown handle=%llu -> false", (unsigned long long)writeHandle);
+        return false;
+    }
+    bool ok = Storage::get().write_remote_file(it->second.filename, it->second.data.data(), it->second.data.size());
+    STAR_LOG("FileWriteStreamClose: '%s' bytes=%zu -> %d",
+        it->second.filename.c_str(), it->second.data.size(), (int)ok);
     streams_.erase(it);
-    return true;
+    return ok;
 }
 
 bool StarSteamRemoteStorage::FileWriteStreamCancel(UGCFileWriteStreamHandle_t writeHandle)
@@ -202,10 +212,24 @@ const char* StarSteamRemoteStorage::GetFileNameAndSize(int iFile, int32* pnFileS
     return cached_filelist_[iFile].c_str();
 }
 
+static const uint64 kCloudQuotaBytes = 128ull * 1024 * 1024;
+
+static uint64 cloud_used_bytes()
+{
+    uint64 used = 0;
+    for (auto& f : Storage::get().list_remote_files()) {
+        int64_t sz = Storage::get().remote_file_size(f);
+        if (sz > 0) used += (uint64)sz;
+    }
+    return used;
+}
+
 bool StarSteamRemoteStorage::GetQuota(int32* pnTotalBytes, int32* puAvailableBytes)
 {
-    if (pnTotalBytes) *pnTotalBytes = 100 * 1024 * 1024;
-    if (puAvailableBytes) *puAvailableBytes = 99 * 1024 * 1024;
+    uint64 used = cloud_used_bytes();
+    uint64 avail = (used < kCloudQuotaBytes) ? (kCloudQuotaBytes - used) : 0;
+    if (pnTotalBytes) *pnTotalBytes = (int32)kCloudQuotaBytes;
+    if (puAvailableBytes) *puAvailableBytes = (int32)avail;
     return true;
 }
 
@@ -275,7 +299,7 @@ int32 StarSteamRemoteStorage::UGCRead(UGCHandle_t h, void* pvData, int32 cubData
 SteamAPICall_t StarSteamRemoteStorage::UGCDownload(UGCHandle_t h) { return UGCDownload(h, 0); }
 bool StarSteamRemoteStorage::GetUGCDownloadProgress(UGCHandle_t h, uint32* pDownloaded, uint32* pTotal) { if (pDownloaded) *pDownloaded = 0; if (pTotal) *pTotal = 0; STAR_UNREFERENCED(h); return false; }
 SteamAPICall_t StarSteamRemoteStorage::GetPublishedFileDetails(PublishedFileId_t f) { return GetPublishedFileDetails(f, 0); }
-bool StarSteamRemoteStorage::GetQuota(uint64* pnTotalBytes, uint64* puAvailableBytes) { if (pnTotalBytes) *pnTotalBytes = 100ull * 1024 * 1024; if (puAvailableBytes) *puAvailableBytes = 100ull * 1024 * 1024; return true; }
+bool StarSteamRemoteStorage::GetQuota(uint64* pnTotalBytes, uint64* puAvailableBytes) { uint64 used = cloud_used_bytes(); uint64 avail = (used < kCloudQuotaBytes) ? (kCloudQuotaBytes - used) : 0; if (pnTotalBytes) *pnTotalBytes = kCloudQuotaBytes; if (puAvailableBytes) *puAvailableBytes = avail; return true; }
 
 SteamAPICall_t StarSteamRemoteStorage::PublishFile(const char* f, const char* pf, AppId_t a, const char* t, const char* d, ERemoteStoragePublishedFileVisibility v, SteamParamStringArray_t* tags)
 {

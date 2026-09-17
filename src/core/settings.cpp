@@ -1,6 +1,7 @@
 #include "core/settings.h"
 #include "core/config.h"
 #include "core/art_stamp.h"
+#include "core/storage.h"
 #include <nlohmann/json.hpp>
 
 Settings& Settings::get()
@@ -9,10 +10,107 @@ Settings& Settings::get()
     return instance;
 }
 
+static void write_default_file(const std::string& path, const char* content)
+{
+    std::ifstream probe(utf8_to_wstring(path));
+    if (probe.is_open()) return; // never overwrite user files
+    std::ofstream out(utf8_to_wstring(path));
+    if (!out.is_open()) {
+        STAR_LOG("bootstrap: cannot create %s", path.c_str());
+        return;
+    }
+    out << content;
+    STAR_LOG("bootstrap: created %s", path.c_str());
+}
+
+// First-run bootstrap: recipients of bare DLLs get a complete, working
+// STAR folder (defaults only; existing files are never touched).
+static void bootstrap_star_folder(const std::string& dir)
+{
+    if (!Storage::ensure_dir(dir)) {
+        STAR_LOG("bootstrap: cannot create settings dir %s", dir.c_str());
+        return;
+    }
+    Storage::ensure_dir(dir + "\\Fonts"); // custom overlay TTFs live here
+    write_default_file(dir + "\\identity.star",
+        "# Fake Steam identity shown to the game.\n"
+        "# display_name: anything - shown in overlay + reported to the game.\n"
+        "display_name = STAR Player\n"
+        "# xuid: 64-bit SteamID, must be greater than 76561190000000000 (see steamid.io).\n"
+        "xuid = 76561198000000001\n"
+        "# locale: Steam language name (english, french, german, spanish, ...).\n"
+        "# Must also be listed in languages.star or it falls back to the first entry.\n"
+        "locale = english\n");
+    write_default_file(dir + "\\game.star",
+        "# Game branch config.\n"
+        "# beta: true | false - report the beta branch instead of public.\n"
+        "beta = false\n"
+        "# branch: branch name reported to the game (usually \"public\").\n"
+        "branch = public\n"
+        "# dlc.unlock_all: true | false - report every DLC as owned.\n"
+        "dlc.unlock_all = false\n");
+    write_default_file(dir + "\\languages.star",
+        "# Languages the game may claim to support. One \"<name> = 1\" per line,\n"
+        "# same names as identity.star locale. Missing locale falls back to first entry.\n"
+        "[languages]\n"
+        "english = 1\n"
+        "french = 1\n"
+        "german = 1\n"
+        "spanish = 1\n"
+        "russian = 1\n"
+        "schinese = 1\n"
+        "japanese = 1\n");
+    write_default_file(dir + "\\overlay.star",
+        "# STAR overlay config. Delete any key to restore its default.\n"
+        "# Hotkeys: Shift+Tab (or Shift+`) opens the panel, F12 takes a screenshot.\n"
+        "# Screenshots go to Documents\\STAR\\screenshots\\<appid>\\.\n"
+        "# enabled: true | false - master switch. false = no hooks, no window.\n"
+        "enabled = true\n"
+        "# mode: auto | hook | external - auto tries hooks, falls back to external window if title hostile.\n"
+        "mode = auto\n"
+        "# scale: 0.75 - 2.0 - UI size multiplier. Needs game restart.\n"
+        "scale = 1.25\n"
+        "# accent: blue | red | green | purple | orange | yellow\n"
+        "accent = blue\n"
+        "# show_fps: true | false - FPS counter pill, top-left, always visible.\n"
+        "show_fps = false\n"
+        "# show_playtime: true | false - session clock pill next to FPS.\n"
+        "show_playtime = false\n"
+        "# play_sound: true | false - achievement unlock jingle.\n"
+        "play_sound = true\n"
+        "# notify_pos: top_left | top_right | bottom_left | bottom_right (tl | tr | bl | br work too)\n"
+        "notify_pos = bottom_right\n"
+        "# dx12_render: true | false - DX12 in-backbuffer drawing. Leave true; auto disables on hostile titles.\n"
+        "dx12_render = true\n"
+        "# font: custom TTF for the overlay. Put the file in STAR/Fonts and name it here (e.g. poppins.ttf).\n"
+        "# Absolute paths work too. Empty = system font. Needs game restart.\n"
+        "font = \n");
+    write_default_file(dir + "\\achievements.json", "[]\n");
+    write_default_file(dir + "\\README.txt",
+        "STAR config folder (auto-generated with defaults).\n"
+        "What matters most:\n"
+        "  steam_appid.txt  - the game's numeric AppID (Steam store URL / SteamDB).\n"
+        "                     STAR also accepts steam_appid.txt next to the game EXE.\n"
+        "  identity.star    - display name, SteamID (xuid), language.\n"
+        "  achievements.json - achievement API names + display text + icon paths.\n"
+        "                     'name' must EXACTLY match what the game unlocks.\n"
+        "                     Icons live under STAR/ (e.g. Icons/win.png).\n"
+        "  overlay.star     - overlay on/off, scale, accent, HUD toggles.\n"
+        "  Controller/<SET>.txt - Steam Input bindings, Goldberg format\n"
+        "                     (ACTION=BUTTON or ACTION=ANALOG=MODE). See Controller/ExampleSet.txt.\n"
+        "  notes.txt        - your in-overlay game notes (created on first edit).\n"
+        "  Sounds/achievement.mp3|achievement.wav (.mp3 wins) - unlock sound.\n"
+        "  Sounds/completion.mp3|completion.wav                  - 100% jingle (optional).\n"
+        "  Icons/summary.png       - 100% toast icon (optional).\n"
+        "Screenshots go to Documents\\STAR\\screenshots\\<appid>\\. Saves live in\n"
+        "%APPDATA%\\STAR\\<appid>\\<steamid>\\. Shift+Tab opens the overlay.\n");
+}
+
 void Settings::load(const std::string& dir)
 {
     settings_dir = dir;
     STAR_LOG("Settings::load from %s", dir.c_str());
+    bootstrap_star_folder(dir);
     stamp_star_configs(dir);
 
     {
@@ -53,6 +151,10 @@ void Settings::load(const std::string& dir)
     }
 
     STAR_LOG("App ID: %u", app_id);
+    if (app_id == 0) {
+        STAR_LOG("WARNING: no App ID found - put the numeric App ID in STAR/steam_appid.txt "
+            "(or steam_appid.txt next to the game EXE). Saves and achievements need it.");
+    }
 
     {
         IniFile ini;
@@ -135,6 +237,31 @@ void Settings::load(const std::string& dir)
         IniFile ini;
         if (ini.load(dir + "\\overlay.star")) {
             overlay_enabled = ini.get_bool("", "enabled", true);
+            overlay_scale = ini.get_float("", "scale", 1.25f);
+            if (overlay_scale < 0.75f) overlay_scale = 0.75f;
+            if (overlay_scale > 2.0f) overlay_scale = 2.0f;
+            overlay_accent = ini.get("", "accent", "blue");
+            std::transform(overlay_accent.begin(), overlay_accent.end(), overlay_accent.begin(),
+                [](unsigned char c) { return (char)tolower(c); });
+            overlay_show_fps = ini.get_bool("", "show_fps", false);
+            overlay_show_playtime = ini.get_bool("", "show_playtime", false);
+            overlay_play_sound = ini.get_bool("", "play_sound", true);
+            overlay_dx12_render = ini.get_bool("", "dx12_render", true);
+            overlay_font = ini.get("", "font", "");
+            overlay_mode = ini.get("", "mode", "auto");
+            std::transform(overlay_mode.begin(), overlay_mode.end(), overlay_mode.begin(),
+                [](unsigned char c) { return (char)tolower(c); });
+            if (overlay_mode != "hook" && overlay_mode != "external") overlay_mode = "auto";
+            overlay_notify_pos = ini.get("", "notify_pos", "bottom_right");
+            std::transform(overlay_notify_pos.begin(), overlay_notify_pos.end(), overlay_notify_pos.begin(),
+                [](unsigned char c) { return (char)tolower(c); });
+            if (overlay_notify_pos == "tl") overlay_notify_pos = "top_left";
+            else if (overlay_notify_pos == "tr") overlay_notify_pos = "top_right";
+            else if (overlay_notify_pos == "bl") overlay_notify_pos = "bottom_left";
+            else if (overlay_notify_pos == "br") overlay_notify_pos = "bottom_right";
+            else if (overlay_notify_pos != "top_left" && overlay_notify_pos != "top_right" &&
+                     overlay_notify_pos != "bottom_left" && overlay_notify_pos != "bottom_right")
+                overlay_notify_pos = "bottom_right";
         }
     }
 

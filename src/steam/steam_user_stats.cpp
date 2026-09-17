@@ -141,6 +141,21 @@ bool StarSteamUserStats::GetAchievement(const char* pchName, bool* pbAchieved)
     return (it != achievements_.end());
 }
 
+static void play_sound_file(const std::string& full_path);
+static void play_completion_file();
+
+// Sounds/achievement.<mp3|wav> - .mp3 wins when both exist.
+static std::string resolve_sound(const std::string& stem)
+{
+    for (const char* ext : { ".mp3", ".wav" }) {
+        std::string p = Settings::get().settings_dir + "\\Sounds\\" + stem + ext;
+        DWORD attr = GetFileAttributesA(p.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
+            return p;
+    }
+    return {};
+}
+
 bool StarSteamUserStats::SetAchievement(const char* pchName)
 {
     if (!pchName) return false;
@@ -156,6 +171,7 @@ bool StarSteamUserStats::SetAchievement(const char* pchName)
         }
     }
     if (was_newly_achieved) {
+        StarOverlay::get().note_session_unlock();
         {
             nlohmann::json ach_json = nlohmann::json::object();
             std::lock_guard<std::mutex> lock(mutex_);
@@ -176,28 +192,108 @@ bool StarSteamUserStats::SetAchievement(const char* pchName)
         cb.m_nMaxProgress = 0;
         STAR_DispatchCallback(UserAchievementStored_t::k_iCallback, &cb, sizeof(cb));
 
-        notify_achievement_unlock(pchName);
+        bool silent = false;
+        { std::lock_guard<std::mutex> lock(mutex_); silent = bulk_silent_; }
+        if (!silent) {
+            // Completing the set gets the dedicated jingle + summary instead
+            // of the normal unlock sound.
+            auto& defs = Settings::get().achievements;
+            bool completes = false;
+            if (!defs.empty()) {
+                int done = 0;
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (auto& d : defs) {
+                    auto it = achievements_.find(d.name);
+                    if (it != achievements_.end() && it->second.achieved) done++;
+                }
+                completes = (done == (int)defs.size());
+            }
+            notify_achievement_unlock(pchName, !completes);
+            if (completes) {
+                play_completion_file();
+                char msg[64];
+                snprintf(msg, sizeof(msg), "%d achievements", (int)Settings::get().achievements.size());
+                std::vector<uint8_t> sum_rgba; int sum_w = 0, sum_h = 0;
+                StarSteamUtils::get().LoadSummaryIcon(sum_rgba, sum_w, sum_h);
+                StarOverlay::get().push_achievement(
+                    "All achievements unlocked", msg, sum_rgba, sum_w, sum_h,
+                    "100% COMPLETE", true);
+            }
+        }
         STAR_LOG("Achievement unlocked: %s", pchName);
     }
     return true;
 }
 
-static void play_achievement_sound()
+static void play_sound_file(const std::string& sound_path)
 {
-    std::string sound_path = Settings::get().settings_dir + "\\Sounds\\achievement.mp3";
-    DWORD attr = GetFileAttributesA(sound_path.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+    if (sound_path.empty()) return;
 
-    std::thread([sound_path]() {
-        std::string open_cmd = "open \"" + sound_path + "\" type mpegvideo alias star_ach";
-        if (mciSendStringA(open_cmd.c_str(), nullptr, 0, nullptr) == 0) {
-            mciSendStringA("play star_ach wait", nullptr, 0, nullptr);
+    // Content sniff: misnamed files are common (e.g. WAV saved as .mp3).
+    // Try the matching MCI device first, fall back to the other one.
+    bool looks_wav = false;
+    {
+        std::ifstream f(utf8_to_wstring(sound_path), std::ios::binary);
+        char magic[12] = {};
+        if (f.is_open()) {
+            f.read(magic, sizeof(magic));
+            if (f.gcount() >= 12 && memcmp(magic, "RIFF", 4) == 0 && memcmp(magic + 8, "WAVE", 4) == 0)
+                looks_wav = true;
+        }
+    }
+    std::thread([sound_path, looks_wav]() {
+        const char* order[2] = { looks_wav ? "waveaudio" : "mpegvideo",
+                                 looks_wav ? "mpegvideo" : "waveaudio" };
+        for (int i = 0; i < 2; i++) {
+            char open_cmd[MAX_PATH + 64];
+            snprintf(open_cmd, sizeof(open_cmd), "open \"%s\" type %s alias star_ach",
+                sound_path.c_str(), order[i]);
+            MCIERROR err = mciSendStringA(open_cmd, nullptr, 0, nullptr);
+            if (err != 0) {
+                char ebuf[128] = {};
+                mciGetErrorStringA(err, ebuf, (UINT)sizeof(ebuf));
+                STAR_LOG("Sound: open as %s failed (%lu/%s): %s",
+                    order[i], (unsigned long)err, ebuf, sound_path.c_str());
+                continue;
+            }
+            err = mciSendStringA("play star_ach wait", nullptr, 0, nullptr);
             mciSendStringA("close star_ach", nullptr, 0, nullptr);
+            if (err != 0) {
+                char ebuf[128] = {};
+                mciGetErrorStringA(err, ebuf, (UINT)sizeof(ebuf));
+                STAR_LOG("Sound: play failed (%lu/%s): %s",
+                    (unsigned long)err, ebuf, sound_path.c_str());
+            }
+            return;
         }
     }).detach();
 }
 
-void StarSteamUserStats::notify_achievement_unlock(const std::string& name)
+static void play_achievement_sound()
+{
+    if (!Settings::get().overlay_play_sound) return;
+    play_sound_file(resolve_sound("achievement"));
+}
+
+static void play_completion_file()
+{
+    if (!Settings::get().overlay_play_sound) return;
+    // Dedicated completion jingle, falling back to the normal unlock sound.
+    std::string comp = resolve_sound("completion");
+    play_sound_file(comp.empty() ? resolve_sound("achievement") : comp);
+}
+
+void StarSteamUserStats::play_unlock_sound()
+{
+    play_achievement_sound();
+}
+
+void StarSteamUserStats::play_completion_sound()
+{
+    play_completion_file();
+}
+
+void StarSteamUserStats::notify_achievement_unlock(const std::string& name, bool with_sound)
 {
 
     auto& defs = Settings::get().achievements;
@@ -210,23 +306,15 @@ void StarSteamUserStats::notify_achievement_unlock(const std::string& name)
                 std::string full_path = Settings::get().settings_dir + "\\" + def.icon_path;
 
                 for (char& c : full_path) if (c == '/') c = '\\';
-                int handle = StarSteamUtils::get().LoadImageFromFile(full_path);
-                if (handle > 0) {
-                    uint32 uw = 0, uh = 0;
-                    StarSteamUtils::get().GetImageSize(handle, &uw, &uh);
-                    icon_w = (int)uw;
-                    icon_h = (int)uh;
-                    icon_rgba.resize(uw * uh * 4);
-                    StarSteamUtils::get().GetImageRGBA(handle, icon_rgba.data(), (int)icon_rgba.size());
-                }
+                StarSteamUtils::get().LoadIconFile(full_path, icon_rgba, icon_w, icon_h);
             }
-            play_achievement_sound();
+            if (with_sound) play_achievement_sound();
             StarOverlay::get().push_achievement(def.display_name, def.description, icon_rgba, icon_w, icon_h);
             return;
         }
     }
 
-    play_achievement_sound();
+    if (with_sound) play_achievement_sound();
     StarOverlay::get().push_achievement(name, "", {}, 0, 0);
 }
 
@@ -238,6 +326,7 @@ bool StarSteamUserStats::ClearAchievement(const char* pchName)
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = achievements_.find(pchName);
         if (it != achievements_.end()) {
+            if (it->second.achieved) StarOverlay::get().note_session_revoke();
             it->second.achieved = false;
             it->second.unlock_time = 0;
         }

@@ -199,47 +199,143 @@ int StarSteamUtils::StoreImage(uint32_t w, uint32_t h, const std::vector<uint8_t
     return (int)images_.size();
 }
 
-int StarSteamUtils::LoadImageFromFile(const std::string& path)
-{
+namespace {
+// WIC needs COM on THIS thread; overlay Present hooks run on the game's
+// render thread, which may never have called CoInitialize.
+struct WicFrame {
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    bool com_here = false;
+    ~WicFrame() {
+        if (frame) frame->Release();
+        if (decoder) decoder->Release();
+        if (factory) factory->Release();
+        if (com_here) CoUninitialize();
+    }
+    bool open(const std::string& path) {
+        HRESULT cohr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if (cohr == S_OK) com_here = true;
+        else if (FAILED(cohr) && cohr != RPC_E_CHANGED_MODE) {
+            STAR_LOG("WIC: CoInitializeEx failed hr=0x%08x for %s", (unsigned)cohr, path.c_str());
+            return false;
+        }
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_IWICImagingFactory, (void**)&factory);
+        if (FAILED(hr) || !factory) {
+            STAR_LOG("WIC: factory failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
+            return false;
+        }
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        if (wlen <= 0) {
+            STAR_LOG("WIC: bad path %s", path.c_str());
+            return false;
+        }
+        std::wstring wpath((size_t)wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
+        hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+        if (FAILED(hr) || !decoder) {
+            STAR_LOG("WIC: no decoder hr=0x%08x for %s", (unsigned)hr, path.c_str());
+            return false;
+        }
+        hr = decoder->GetFrame(0, &frame);
+        if (FAILED(hr) || !frame) {
+            STAR_LOG("WIC: no frame hr=0x%08x for %s", (unsigned)hr, path.c_str());
+            return false;
+        }
+        return true;
+    }
+};
+} // namespace
+
+int StarSteamUtils::LoadImageFromFile(const std::string& path){
     if (path.empty()) return 0;
 
-    IWICImagingFactory* factory = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-        IID_IWICImagingFactory, (void**)&factory);
-    if (FAILED(hr) || !factory) return 0;
-
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    std::wstring wpath(wlen, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
-
-    IWICBitmapDecoder* decoder = nullptr;
-    hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
-    if (FAILED(hr) || !decoder) { factory->Release(); return 0; }
-
-    IWICBitmapFrameDecode* frame = nullptr;
-    hr = decoder->GetFrame(0, &frame);
-    if (FAILED(hr) || !frame) { decoder->Release(); factory->Release(); return 0; }
+    WicFrame fr;
+    if (!fr.open(path)) return 0;
 
     IWICFormatConverter* converter = nullptr;
-    factory->CreateFormatConverter(&converter);
-    if (!converter) { frame->Release(); decoder->Release(); factory->Release(); return 0; }
+    fr.factory->CreateFormatConverter(&converter);
+    if (!converter) {
+        STAR_LOG("WIC: no converter for %s", path.c_str());
+        return 0;
+    }
 
-    converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
+    HRESULT hr = converter->Initialize(fr.frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
         nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        STAR_LOG("WIC: convert failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
+        converter->Release();
+        return 0;
+    }
 
     UINT w = 0, h = 0;
     converter->GetSize(&w, &h);
+    if (w == 0 || h == 0 || w > 4096 || h > 4096) {
+        STAR_LOG("WIC: bad size %ux%u for %s", w, h, path.c_str());
+        converter->Release();
+        return 0;
+    }
 
-    std::vector<uint8_t> rgba(w * h * 4);
-    UINT stride = w * 4;
-    converter->CopyPixels(nullptr, stride, (UINT)rgba.size(), rgba.data());
-
+    std::vector<uint8_t> rgba((size_t)w * h * 4);
+    hr = converter->CopyPixels(nullptr, w * 4, (UINT)rgba.size(), rgba.data());
     converter->Release();
-    frame->Release();
-    decoder->Release();
-    factory->Release();
+    if (FAILED(hr)) {
+        STAR_LOG("WIC: CopyPixels failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
+        return 0;
+    }
 
     return StoreImage(w, h, rgba);
+}
+
+bool StarSteamUtils::GetImageFileSize(const std::string& path, uint32* w, uint32* h){
+    if (path.empty()) return false;
+    WicFrame fr;
+    if (!fr.open(path)) return false;
+    UINT fw = 0, fh = 0;
+    if (FAILED(fr.frame->GetSize(&fw, &fh)) || fw == 0 || fh == 0) return false;
+    if (w) *w = fw;
+    if (h) *h = fh;
+    return true;
+}
+
+bool StarSteamUtils::LoadIconFile(const std::string& full_path, std::vector<uint8_t>& rgba, int& w, int& h)
+{
+    rgba.clear(); w = 0; h = 0;
+    int handle = LoadImageFromFile(full_path);
+    if (handle <= 0) return false;
+    uint32 uw = 0, uh = 0;
+    if (!GetImageSize(handle, &uw, &uh) || uw == 0 || uh == 0) return false;
+    w = (int)uw; h = (int)uh;
+    rgba.resize((size_t)uw * uh * 4);
+    return GetImageRGBA(handle, rgba.data(), (int)rgba.size());
+}
+
+bool StarSteamUtils::LoadSummaryIcon(std::vector<uint8_t>& rgba, int& w, int& h)
+{
+    rgba.clear(); w = 0; h = 0;
+    std::string full = Settings::get().settings_dir + "\\Icons\\summary.png";
+    if (!LoadIconFile(full, rgba, w, h)) return false;
+    // Monochrome mask art (e.g. a black glyph): tint gold, keep per-pixel
+    // alpha for smooth edges. Colored art passes through untouched.
+    long spread = 0;
+    size_t n = 0;
+    for (size_t i = 0; i < (size_t)w * h; i += 7) {
+        if (rgba[i * 4 + 3] > 20) {
+            int r = rgba[i * 4 + 0], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+            int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+            spread += (mx - mn); n++;
+        }
+    }
+    if (n > 0 && spread / (long)n < 48) {
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            rgba[i * 4 + 0] = 255;
+            rgba[i * 4 + 1] = 205;
+            rgba[i * 4 + 2] = 70;
+        }
+    }
+    return true;
 }
 
 bool StarSteamUtils::ShowGamepadTextInput(EGamepadTextInputMode eInputMode, EGamepadTextInputLineMode eLineInputMode, const char* pchDescription, uint32 unCharMax)

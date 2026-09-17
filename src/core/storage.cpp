@@ -87,19 +87,85 @@ bool Storage::save_stats(const nlohmann::json& data)
     return write_json(base_path_ + "\\stats.json", data);
 }
 
+bool Storage::load_playtime(uint64_t& total_seconds)
+{
+    total_seconds = 0;
+    nlohmann::json j;
+    if (!read_json(base_path_ + "\\playtime.json", j)) return false;
+    try {
+        total_seconds = j.value("total_seconds", 0ULL);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool Storage::save_playtime(uint64_t total_seconds)
+{
+    nlohmann::json j = nlohmann::json::object();
+    j["total_seconds"] = total_seconds;
+    return write_json(base_path_ + "\\playtime.json", j);
+}
+
 std::string Storage::remote_path(const std::string& filename)
 {
+    // Cloud names may carry subdirectories ("characters/x.fch") - preserve
+    // them like real Steam/Goldberg do. Anything that would escape the
+    // remote dir (drive letters, UNC, "..") is folded back inside.
+    std::string rel = filename;
+    for (char& c : rel) {
+        if (c == '/') c = '\\';
+    }
+    std::vector<std::string> parts;
+    std::string cur;
+    auto push = [&]() {
+        if (cur.empty() || cur == ".") { cur.clear(); return; }
+        if (cur == "..") { if (!parts.empty()) parts.pop_back(); cur.clear(); return; }
+        // Strip drive colon + illegal Windows name chars, keep the rest.
+        std::string clean;
+        for (char c : cur) {
+            if (c == ':' || c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*' ||
+                (unsigned char)c < 0x20)
+                clean += '_';
+            else
+                clean += c;
+        }
+        // A bare drive letter ("C") becomes a plain folder, keeping C: vs D: distinct.
+        if (!clean.empty()) parts.push_back(clean);
+        cur.clear();
+    };
+    for (char c : rel) {
+        if (c == '\\') push();
+        else cur += c;
+    }
+    push();
+    std::string path = remote_dir_;
+    for (auto& p : parts) path += "\\" + p;
+    return path;
+}
 
+// Pre-subdirectory layout: every separator became '_'. Read-side fallback
+// so files written by older builds (e.g. "_option.sav") stay reachable.
+static std::string remote_path_legacy(const std::string& remote_dir, const std::string& filename)
+{
     std::string safe = filename;
     for (char& c : safe) {
         if (c == '/' || c == '\\') c = '_';
     }
-    return remote_dir_ + "\\" + safe;
+    return remote_dir + "\\" + safe;
+}
+
+static bool file_exists_w(const std::string& path)
+{
+    DWORD attr = GetFileAttributesW(utf8_to_wstring(path).c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
 bool Storage::write_remote_file(const std::string& filename, const void* data, size_t size)
 {
     std::string path = remote_path(filename);
+    size_t last_slash = path.find_last_of("\\/");
+    if (last_slash != std::string::npos) ensure_dir(path.substr(0, last_slash));
     std::ofstream f(utf8_to_wstring(path), std::ios::binary);
     if (!f.is_open()) return false;
     if (data && size > 0) {
@@ -111,6 +177,7 @@ bool Storage::write_remote_file(const std::string& filename, const void* data, s
 bool Storage::read_remote_file(const std::string& filename, std::vector<uint8_t>& out)
 {
     std::string path = remote_path(filename);
+    if (!file_exists_w(path)) path = remote_path_legacy(remote_dir_, filename);
     std::ifstream f(utf8_to_wstring(path), std::ios::binary | std::ios::ate);
     if (!f.is_open()) return false;
     size_t sz = (size_t)f.tellg();
@@ -122,39 +189,44 @@ bool Storage::read_remote_file(const std::string& filename, std::vector<uint8_t>
 
 bool Storage::remote_file_exists(const std::string& filename)
 {
-    std::wstring wpath = utf8_to_wstring(remote_path(filename));
-    DWORD attr = GetFileAttributesW(wpath.c_str());
-    return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+    if (file_exists_w(remote_path(filename))) return true;
+    return file_exists_w(remote_path_legacy(remote_dir_, filename));
 }
 
 bool Storage::delete_remote_file(const std::string& filename)
 {
-    std::wstring wpath = utf8_to_wstring(remote_path(filename));
-    return DeleteFileW(wpath.c_str()) != 0;
+    bool ok = DeleteFileW(utf8_to_wstring(remote_path(filename)).c_str()) != 0;
+    // Also clear a legacy flattened twin so it can't ghost in listings.
+    DeleteFileW(utf8_to_wstring(remote_path_legacy(remote_dir_, filename)).c_str());
+    return ok;
 }
+
+#include "core/storage.h"
+#include <filesystem>
 
 std::vector<std::string> Storage::list_remote_files()
 {
+    // Names relative to the remote dir with '/' separators (the form games
+    // pass back into FileRead/FileDelete).
     std::vector<std::string> files;
-    std::wstring search_path = utf8_to_wstring(remote_dir_) + L"\\*";
-    WIN32_FIND_DATAW find_data;
-    HANDLE hFind = FindFirstFileW(search_path.c_str(), &find_data);
-    if (hFind == INVALID_HANDLE_VALUE) return files;
-
-    do {
-        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        files.push_back(wstring_to_utf8(find_data.cFileName));
-    } while (FindNextFileW(hFind, &find_data));
-
-    FindClose(hFind);
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator it(remote_dir_, ec), end;
+    for (; it != end; it.increment(ec)) {
+        if (ec || !it->is_regular_file(ec)) continue;
+        // generic_wstring keeps '\\'; convert to UTF-8 with '/' like before.
+        std::string rel = wstring_to_utf8(it->path().lexically_relative(remote_dir_).generic_wstring());
+        for (char& c : rel) if (c == '\\') c = '/';
+        files.push_back(rel);
+    }
     return files;
 }
 
 int64_t Storage::remote_file_size(const std::string& filename)
 {
-    std::wstring wpath = utf8_to_wstring(remote_path(filename));
+    std::string path = remote_path(filename);
+    if (!file_exists_w(path)) path = remote_path_legacy(remote_dir_, filename);
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad)) {
+    if (GetFileAttributesExW(utf8_to_wstring(path).c_str(), GetFileExInfoStandard, &fad)) {
         LARGE_INTEGER size;
         size.HighPart = fad.nFileSizeHigh;
         size.LowPart = fad.nFileSizeLow;

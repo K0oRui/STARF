@@ -81,6 +81,9 @@ public:
 
     int StoreImage(uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba);
     int LoadImageFromFile(const std::string& path);
+    bool GetImageFileSize(const std::string& path, uint32* w, uint32* h);
+    bool LoadSummaryIcon(std::vector<uint8_t>& rgba, int& w, int& h);
+    bool LoadIconFile(const std::string& full_path, std::vector<uint8_t>& rgba, int& w, int& h);
 
 private:
     StarSteamUtils();

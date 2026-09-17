@@ -1,6 +1,9 @@
 #pragma once
 #include "core/star_common.h"
 #include "steam/isteaminput.h"
+#include <Xinput.h>
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
 
 class StarSteamInput : public ISteamInput {
 public:
@@ -55,6 +58,54 @@ public:
     uint16 GetSessionInputConfigurationSettings() override;
     void SetDualSenseTriggerEffect(InputHandle_t inputHandle, const ScePadTriggerEffectParam* pParam) override;
 
+    // Unified pad state, shared with the free mapping helper in the .cpp.
+    struct PadState {
+        bool connected = false;
+        bool sony = false;
+        bool ps5 = false;
+        WORD buttons = 0;
+        BYTE lt = 0, rt = 0;
+        SHORT lx = 0, ly = 0, rx = 0, ry = 0;
+    };
+    static BOOL CALLBACK di_enum_cb(const DIDEVICEINSTANCEA* d, void* ctx);
+
 private:
     StarSteamInput() = default;
+
+    // XInput bridge: real pads surface as one Steam handle each (index+1).
+    // Action bindings come from STAR/controller/<ACTION_SET>.txt files
+    // (Goldberg format: ACTION=BUTTON[,BUTTON] or ACTION=ANALOG=MODE).
+    struct DigitalBind { std::vector<std::string> buttons; };
+    struct AnalogBind { std::string source; std::string mode; };
+    struct ActionSetBind {
+        std::map<std::string, DigitalBind> digital;
+        std::map<std::string, AnalogBind> analog;
+    };
+    // Unified pads: slots 0-3 XInput, 4-7 DirectInput (Sony BT pads).
+    // Buttons use XINPUT_GAMEPAD_* bits whatever the source, so binding
+    // evaluation never cares where the pad came from.
+    PadState pads_[8]{};
+    InputActionSetHandle_t active_set_[8]{};
+    std::map<uint64_t, std::string> handle_names_; // action/set handle -> name
+    std::map<std::string, ActionSetBind> set_cache_;
+    bool sets_scanned_ = false;
+    void poll_pads();
+    bool valid_pad(InputHandle_t h) const;
+    uint64_t action_handle(const char* n);
+    const std::string* action_name(uint64_t h) const;
+    const char* register_name(uint64_t h, const char* n);
+    const ActionSetBind* bindings_for(InputHandle_t h, const char* action, bool analog);
+    bool eval_button(int pad, const std::string& btn);
+    void eval_stick(int pad, const std::string& src, float& x, float& y);
+    // DirectInput (non-XInput pads: DualSense/DS4 over Bluetooth).
+    // Only Sony layouts are claimed; anything else is logged and skipped.
+    IDirectInput8A* di_ = nullptr;
+    IDirectInputDevice8A* di_dev_[4] = {};
+    bool di_sony_[4]{}, di_ps5_[4]{}, di_dead_[4]{};
+    LONG di_rest_[4][6]{};
+    bool di_rest_ok_[4]{};
+    LPDIRECTINPUTEFFECT di_fx_[4]{};
+    bool di_enum_done_ = false;
+    void poll_di();
+    void rumble_di(int idx, unsigned short l, unsigned short r);
 };
