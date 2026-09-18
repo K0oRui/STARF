@@ -101,7 +101,7 @@ Requires MSVC and CMake 3.16+. All dependencies pull in automatically via FetchC
 
 **Both architectures, packaged to `dist/`:**
 ```
-.\scripts\build_dist.ps1
+.\build.ps1
 ```
 
 **x64 (steam_api64.dll):**
