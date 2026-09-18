@@ -1,12 +1,14 @@
 // External overlay window: own transparent topmost window + own D3D11 device
-// on its own thread. Zero hooks into game rendering, for hostile titles
-// (e.g. engines whose backbuffers fault on foreign access). Reuses the same
-// panel/toast/HUD/icon code as the hook path.
+// (or D3D9 for DX9 games) on its own thread. Zero hooks into game rendering,
+// for hostile titles (e.g. engines whose backbuffers fault on foreign access).
+// Reuses the same panel/toast/HUD/icon code as the hook path.
 #include "overlay.h"
 #include "core/settings.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
+#include "imgui_impl_dx9.h"
+#include <d3d9.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
@@ -115,6 +117,8 @@ void StarOverlay::external_free_surfaces()
         ext_dib_dc_ = nullptr;
     }
     ext_dib_bits_ = nullptr;
+    if (ext_d3d9_sys_) { ext_d3d9_sys_->Release(); ext_d3d9_sys_ = nullptr; }
+    if (ext_d3d9_rt_) { ext_d3d9_rt_->Release(); ext_d3d9_rt_ = nullptr; }
     if (ext_stage_tex_) { ext_stage_tex_->Release(); ext_stage_tex_ = nullptr; }
     if (ext_rt_tex_) { ext_rt_tex_->Release(); ext_rt_tex_ = nullptr; }
 }
@@ -124,23 +128,38 @@ bool StarOverlay::external_alloc_surfaces(int w, int h)
     external_free_surfaces();
     if (w <= 0 || h <= 0 || w > 16384 || h > 16384) return false;
 
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = (UINT)w; td.Height = (UINT)h;
-    td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET;
-    if (FAILED(device_->CreateTexture2D(&td, nullptr, &ext_rt_tex_)) || !ext_rt_tex_)
-        return false;
+    if (ext_use_d3d9_) {
+        if (!ext_d3d9_dev_) return false;
+        // Offscreen RT + system-memory readback surface. A8R8G8B8 keeps the
+        // premultiplied-alpha output UpdateLayeredWindow expects (AC_SRC_ALPHA).
+        if (FAILED(ext_d3d9_dev_->CreateRenderTarget((UINT)w, (UINT)h, D3DFMT_A8R8G8B8,
+                D3DMULTISAMPLE_NONE, 0, FALSE, &ext_d3d9_rt_, nullptr)) || !ext_d3d9_rt_)
+            return false;
+        if (FAILED(ext_d3d9_dev_->CreateOffscreenPlainSurface((UINT)w, (UINT)h,
+                D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &ext_d3d9_sys_, nullptr)) || !ext_d3d9_sys_) {
+            external_free_surfaces();
+            return false;
+        }
+    } else {
+        if (!device_) return false;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = (UINT)w; td.Height = (UINT)h;
+        td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(device_->CreateTexture2D(&td, nullptr, &ext_rt_tex_)) || !ext_rt_tex_)
+            return false;
 
-    D3D11_TEXTURE2D_DESC sd = td;
-    sd.Usage = D3D11_USAGE_STAGING;
-    sd.BindFlags = 0;
-    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(device_->CreateTexture2D(&sd, nullptr, &ext_stage_tex_)) || !ext_stage_tex_) {
-        external_free_surfaces();
-        return false;
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(device_->CreateTexture2D(&sd, nullptr, &ext_stage_tex_)) || !ext_stage_tex_) {
+            external_free_surfaces();
+            return false;
+        }
     }
 
     BITMAPINFO bi{};
@@ -166,12 +185,58 @@ bool StarOverlay::external_alloc_surfaces(int w, int h)
 
 bool StarOverlay::external_create_device()
 {
+    // Match the game's API when known: DX9 games get a D3D9 overlay window
+    // (lighter on old machines). Everything else uses D3D11 with feature
+    // level fallback (11_0 -> 9_3, then WARP software rendering).
+    if (game_api_ == GraphicsAPI::DX9) {
+        IDirect3D9* d3d9 = Direct3DCreate9(D3D_SDK_VERSION);
+        if (d3d9) {
+            D3DPRESENT_PARAMETERS pp{};
+            pp.Windowed = TRUE;
+            pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+            pp.BackBufferFormat = D3DFMT_UNKNOWN;
+            pp.BackBufferCount = 1;
+            pp.hDeviceWindow = ext_hwnd_;
+            IDirect3DDevice9* dev = nullptr;
+            HRESULT hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, ext_hwnd_,
+                D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &dev);
+            if (FAILED(hr) || !dev) {
+                hr = d3d9->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, ext_hwnd_,
+                    D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &dev);
+            }
+            d3d9->Release();
+            if (SUCCEEDED(hr) && dev) {
+                ext_use_d3d9_ = true;
+                ext_d3d9_dev_ = dev;
+                if (!external_alloc_surfaces(ext_w_, ext_h_)) {
+                    STAR_LOG("External: D3D9 surface alloc failed");
+                    dev->Release(); ext_d3d9_dev_ = nullptr;
+                    ext_use_d3d9_ = false;
+                    return false;
+                }
+                STAR_LOG("External: D3D9 device ready (%dx%d)", ext_w_, ext_h_);
+                return true;
+            }
+            STAR_LOG("External: D3D9 device failed hr=0x%08x, falling back to D3D11", (unsigned)hr);
+        }
+    }
+
+    D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3
+    };
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 4, D3D11_SDK_VERSION,
         &dev, &fl, &ctx);
+    if (FAILED(hr) || !dev) {
+        STAR_LOG("External: D3D11 hardware failed hr=0x%08x, trying WARP", (unsigned)hr);
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 4, D3D11_SDK_VERSION,
+            &dev, &fl, &ctx);
+    }
     if (FAILED(hr) || !dev) {
         STAR_LOG("External: D3D11CreateDevice failed hr=0x%08x", (unsigned)hr);
         return false;
@@ -307,7 +372,12 @@ void StarOverlay::external_render_frame()
             SetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE, ex);
         }
     }
-    if (!imgui_initialized_ || !device_ || !context_ || !ext_rt_tex_ || !ext_dib_bits_) return;
+    if (!imgui_initialized_ || !ext_dib_bits_) return;
+    if (ext_use_d3d9_) {
+        if (!ext_d3d9_dev_ || !ext_d3d9_rt_ || !ext_d3d9_sys_) return;
+    } else {
+        if (!device_ || !context_ || !ext_rt_tex_) return;
+    }
 
     RECT rc{};
     GetClientRect(ext_hwnd_, &rc);
@@ -319,16 +389,24 @@ void StarOverlay::external_render_frame()
         ext_w_ = w;
         ext_h_ = h;
     }
-    if (!rtv_) {
-        device_->CreateRenderTargetView(ext_rt_tex_, nullptr, &rtv_);
+
+    IDirect3DSurface9* old_rt = nullptr;
+    if (ext_use_d3d9_) {
+        ext_d3d9_dev_->GetRenderTarget(0, &old_rt);
+        ext_d3d9_dev_->SetRenderTarget(0, ext_d3d9_rt_);
+        ext_d3d9_dev_->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
+        ImGui_ImplDX9_NewFrame();
+    } else {
+        if (!rtv_) {
+            device_->CreateRenderTargetView(ext_rt_tex_, nullptr, &rtv_);
+        }
+        if (!rtv_) return;
+        float clear[4] = { 0.f, 0.f, 0.f, 0.f };
+        context_->OMSetRenderTargets(1, &rtv_, nullptr);
+        context_->ClearRenderTargetView(rtv_, clear);
+        ImGui_ImplDX11_NewFrame();
     }
-    if (!rtv_) return;
 
-    float clear[4] = { 0.f, 0.f, 0.f, 0.f };
-    context_->OMSetRenderTargets(1, &rtv_, nullptr);
-    context_->ClearRenderTargetView(rtv_, clear);
-
-    ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     if (!open_) {
         if (ext_cur_init_) external_cursor_close();
@@ -356,58 +434,86 @@ void StarOverlay::external_render_frame()
         if (!logged_frame) {
             logged_frame = true;
             ImDrawData* dd = ImGui::GetDrawData();
-            STAR_LOG("External: first frame open=%d anim=%.3f disp=%.0fx%.0f lists=%d totalvtx=%d rtv=%p",
+            STAR_LOG("External: first frame open=%d anim=%.3f disp=%.0fx%.0f lists=%d totalvtx=%d backend=%s",
                 (int)open_, panel_anim_,
                 ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y,
                 dd ? dd->CmdListsCount : -1,
-                dd ? dd->TotalVtxCount : -1, rtv_);
+                dd ? dd->TotalVtxCount : -1,
+                ext_use_d3d9_ ? "d3d9" : "d3d11");
         }
     }
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-    // CPU readback into the layered-window DIB (premultiplied alpha output
-    // matches what UpdateLayeredWindow expects with AC_SRC_ALPHA).
-    context_->CopyResource(ext_stage_tex_, ext_rt_tex_);
-    D3D11_MAPPED_SUBRESOURCE map{};
-    if (SUCCEEDED(context_->Map(ext_stage_tex_, 0, D3D11_MAP_READ, 0, &map))) {
-        const uint8_t* src = (const uint8_t*)map.pData;
-        uint8_t* dst = (uint8_t*)ext_dib_bits_;
-        size_t row = (size_t)w * 4;
-        for (int y = 0; y < h; y++)
-            memcpy(dst + (size_t)y * row, src + (size_t)y * map.RowPitch, row);
-        context_->Unmap(ext_stage_tex_, 0);
-
-        // Identical pixels = skip the upload. A static HUD then costs no
-        // DWM recomposite at all, which is what visibly flickered.
-        size_t bytes = row * (size_t)h;
-        if (ext_prev_.size() == bytes &&
-            memcmp(ext_prev_.data(), dst, bytes) == 0)
-            return;
-        if (ext_prev_.size() != bytes) ext_prev_.resize(bytes);
-        memcpy(ext_prev_.data(), dst, bytes);
-
-        POINT dst_pt{};
-        GetWindowRect(ext_hwnd_, &rc);
-        dst_pt.x = rc.left;
-        dst_pt.y = rc.top;
-        SIZE sz{ w, h };
-        POINT src_pt{ 0, 0 };
-        BLENDFUNCTION bf{};
-        bf.BlendOp = AC_SRC_OVER;
-        bf.SourceConstantAlpha = 255;
-        bf.AlphaFormat = AC_SRC_ALPHA;
-        HDC screen = GetDC(nullptr);
-        BOOL ulw = UpdateLayeredWindow(ext_hwnd_, screen, &dst_pt, &sz, ext_dib_dc_,
-            &src_pt, 0, &bf, ULW_ALPHA);
-        DWORD ulw_err = ulw ? 0 : GetLastError();
-        ReleaseDC(nullptr, screen);
-        {
-            static bool logged_ulw = false;
-            if (!logged_ulw) {
-                logged_ulw = true;
-                STAR_LOG("External: first ULW ok=%d err=%lu (%dx%d)", (int)ulw,
-                    (unsigned long)ulw_err, w, h);
+    if (ext_use_d3d9_) {
+        ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+        ext_d3d9_dev_->SetRenderTarget(0, old_rt);
+        if (old_rt) old_rt->Release();
+        // Readback into the layered-window DIB (premultiplied alpha output
+        // matches what UpdateLayeredWindow expects with AC_SRC_ALPHA).
+        if (SUCCEEDED(ext_d3d9_dev_->GetRenderTargetData(ext_d3d9_rt_, ext_d3d9_sys_))) {
+            D3DLOCKED_RECT lr{};
+            if (SUCCEEDED(ext_d3d9_sys_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+                const uint8_t* src = (const uint8_t*)lr.pBits;
+                uint8_t* dst = (uint8_t*)ext_dib_bits_;
+                size_t row = (size_t)w * 4;
+                for (int y = 0; y < h; y++)
+                    memcpy(dst + (size_t)y * row, src + (size_t)y * lr.Pitch, row);
+                ext_d3d9_sys_->UnlockRect();
+                external_upload_layered(w, h);
             }
+        }
+    } else {
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        // CPU readback into the layered-window DIB (premultiplied alpha output
+        // matches what UpdateLayeredWindow expects with AC_SRC_ALPHA).
+        context_->CopyResource(ext_stage_tex_, ext_rt_tex_);
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if (SUCCEEDED(context_->Map(ext_stage_tex_, 0, D3D11_MAP_READ, 0, &map))) {
+            const uint8_t* src = (const uint8_t*)map.pData;
+            uint8_t* dst = (uint8_t*)ext_dib_bits_;
+            size_t row = (size_t)w * 4;
+            for (int y = 0; y < h; y++)
+                memcpy(dst + (size_t)y * row, src + (size_t)y * map.RowPitch, row);
+            context_->Unmap(ext_stage_tex_, 0);
+            external_upload_layered(w, h);
+        }
+    }
+}
+
+void StarOverlay::external_upload_layered(int w, int h)
+{
+    // Identical pixels = skip the upload. A static HUD then costs no
+    // DWM recomposite at all, which is what visibly flickered.
+    uint8_t* dst = (uint8_t*)ext_dib_bits_;
+    size_t row = (size_t)w * 4;
+    size_t bytes = row * (size_t)h;
+    if (ext_prev_.size() == bytes &&
+        memcmp(ext_prev_.data(), dst, bytes) == 0)
+        return;
+    if (ext_prev_.size() != bytes) ext_prev_.resize(bytes);
+    memcpy(ext_prev_.data(), dst, bytes);
+
+    RECT rc{};
+    POINT dst_pt{};
+    GetWindowRect(ext_hwnd_, &rc);
+    dst_pt.x = rc.left;
+    dst_pt.y = rc.top;
+    SIZE sz{ w, h };
+    POINT src_pt{ 0, 0 };
+    BLENDFUNCTION bf{};
+    bf.BlendOp = AC_SRC_OVER;
+    bf.SourceConstantAlpha = 255;
+    bf.AlphaFormat = AC_SRC_ALPHA;
+    HDC screen = GetDC(nullptr);
+    BOOL ulw = UpdateLayeredWindow(ext_hwnd_, screen, &dst_pt, &sz, ext_dib_dc_,
+        &src_pt, 0, &bf, ULW_ALPHA);
+    DWORD ulw_err = ulw ? 0 : GetLastError();
+    ReleaseDC(nullptr, screen);
+    {
+        static bool logged_ulw = false;
+        if (!logged_ulw) {
+            logged_ulw = true;
+            STAR_LOG("External: first ULW ok=%d err=%lu (%dx%d)", (int)ulw,
+                (unsigned long)ulw_err, w, h);
         }
     }
 }
@@ -423,6 +529,11 @@ void StarOverlay::external_thread_proc()
         CoUninitialize();
         return;
     }
+    // Wait briefly for the game's first present so the external window can
+    // match its API: DX9 games get a lighter D3D9 backend, everything else
+    // D3D11. The present hooks sniff the API even in external mode.
+    for (int i = 0; i < 30 && game_api_ == GraphicsAPI::None; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (!external_create_device()) {
         STAR_LOG("External overlay: device failed, giving up");
         DestroyWindow(ext_hwnd_);
@@ -435,12 +546,20 @@ void StarOverlay::external_thread_proc()
     ImGui::CreateContext();
     setup_imgui_style_and_fonts();
     ImGui_ImplWin32_Init(ext_hwnd_);
-    if (!ImGui_ImplDX11_Init(device_, context_)) {
-        STAR_LOG("External overlay: ImGui DX11 init failed");
+    bool imgui_ok = ext_use_d3d9_
+        ? ImGui_ImplDX9_Init(ext_d3d9_dev_)
+        : ImGui_ImplDX11_Init(device_, context_);
+    if (!imgui_ok) {
+        STAR_LOG("External overlay: ImGui %s init failed", ext_use_d3d9_ ? "DX9" : "DX11");
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
-        context_->Release(); context_ = nullptr;
-        device_->Release(); device_ = nullptr;
+        if (ext_use_d3d9_) {
+            ext_d3d9_dev_->Release(); ext_d3d9_dev_ = nullptr;
+            ext_use_d3d9_ = false;
+        } else {
+            context_->Release(); context_ = nullptr;
+            device_->Release(); device_ = nullptr;
+        }
         external_free_surfaces();
         DestroyWindow(ext_hwnd_);
         ext_hwnd_ = nullptr;
@@ -448,10 +567,11 @@ void StarOverlay::external_thread_proc()
         return;
     }
     imgui_initialized_ = true;
-    active_api_ = GraphicsAPI::DX11;
+    active_api_ = ext_use_d3d9_ ? GraphicsAPI::DX9 : GraphicsAPI::DX11;
     ext_visible_ = false;
     ShowWindow(ext_hwnd_, SW_HIDE);
-    STAR_LOG("External overlay ready (%dx%d)", ext_w_, ext_h_);
+    STAR_LOG("External overlay ready (%dx%d, %s)", ext_w_, ext_h_,
+        ext_use_d3d9_ ? "d3d9" : "d3d11");
 
     MSG msg{};
     int frame = 0;
@@ -501,7 +621,8 @@ void StarOverlay::external_thread_proc()
     }
 
     if (imgui_initialized_) {
-        ImGui_ImplDX11_Shutdown();
+        if (ext_use_d3d9_) ImGui_ImplDX9_Shutdown();
+        else ImGui_ImplDX11_Shutdown();
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
         imgui_initialized_ = false;
@@ -511,8 +632,13 @@ void StarOverlay::external_thread_proc()
     for (auto& [k, v] : icon_textures_) if (v) ((ID3D11ShaderResourceView*)v)->Release();
     icon_textures_.clear();
     gl_icon_textures_.clear();
-    if (context_) { context_->Release(); context_ = nullptr; }
-    if (device_) { device_->Release(); device_ = nullptr; }
+    if (ext_use_d3d9_) {
+        if (ext_d3d9_dev_) { ext_d3d9_dev_->Release(); ext_d3d9_dev_ = nullptr; }
+        ext_use_d3d9_ = false;
+    } else {
+        if (context_) { context_->Release(); context_ = nullptr; }
+        if (device_) { device_->Release(); device_ = nullptr; }
+    }
     external_free_surfaces();
     if (ext_cur_init_) external_cursor_close(); // never leave the OS cursor parked hidden
     if (ext_hwnd_) { DestroyWindow(ext_hwnd_); ext_hwnd_ = nullptr; }

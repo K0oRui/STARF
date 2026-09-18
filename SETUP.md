@@ -84,9 +84,38 @@ Controls what `GetAvailableGameLanguages()` returns. If the locale in `identity.
 
 ```ini
 enabled = true
+mode = auto
+scale = 1.25
+accent = blue
+show_fps = false
+show_playtime = false
+play_sound = true
+notify_pos = bottom_right
+dx12_render = true
+font =
 ```
 
 `false` disables the overlay completely. No hooks, no ImGui, nothing. Useful if the game crashes on inject or you just don't need it.
+
+| key | default | notes |
+|-----|---------|-------|
+| `enabled` | `true` | master switch |
+| `mode` | `auto` | `auto` tries hooks, falls back to the external window if the title is hostile; `hook` never auto-falls back; `external` always uses the window |
+| `scale` | `1.25` | UI size multiplier (0.75-2.0), needs restart |
+| `accent` | `blue` | `blue` `red` `green` `purple` `orange` `yellow` |
+| `show_fps` | `false` | FPS pill, top-left |
+| `show_playtime` | `false` | session clock next to FPS |
+| `play_sound` | `true` | achievement unlock jingle |
+| `notify_pos` | `bottom_right` | `top_left` `top_right` `bottom_left` `bottom_right` |
+| `dx12_render` | `true` | DX12 in-backbuffer drawing; auto mode disables it on hostile titles and restores it when hooks are retried |
+| `font` | *(empty)* | custom TTF in `STAR/Fonts`, needs restart |
+
+**Auto-fallback backoff.** When `mode = auto` and a title is hostile (crashes, device loss, fence timeouts), STAR switches to the external window and writes two keys into `overlay.star`:
+
+- `fallback_level` — how many times it has fallen back in a row (0-6).
+- `fallback_count` — sessions left to skip before retrying hooks (`2^level - 1`: 1, 3, 7, 15, 31, 63).
+
+Each launch with `fallback_count > 0` skips hooks and decrements it. When it reaches 0, STAR retries hooks; if that session ends cleanly, both keys are cleared and `mode` returns to `auto`. If it crashes again, the backoff restarts from the next level. If you set `mode = external` by hand, delete `fallback_count` too so it doesn't surprise you by retrying hooks later.
 
 ---
 

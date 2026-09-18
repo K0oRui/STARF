@@ -67,6 +67,8 @@ static void bootstrap_star_folder(const std::string& dir)
         "# enabled: true | false - master switch. false = no hooks, no window.\n"
         "enabled = true\n"
         "# mode: auto | hook | external - auto tries hooks, falls back to external window if title hostile.\n"
+        "#       The fallback is temporary: STAR retries hooks after a few launches (exponential backoff).\n"
+        "#       hook = never auto-fall back. external = always use the window (delete fallback_count too).\n"
         "mode = auto\n"
         "# scale: 0.75 - 2.0 - UI size multiplier. Needs game restart.\n"
         "scale = 1.25\n"
@@ -80,7 +82,8 @@ static void bootstrap_star_folder(const std::string& dir)
         "play_sound = true\n"
         "# notify_pos: top_left | top_right | bottom_left | bottom_right (tl | tr | bl | br work too)\n"
         "notify_pos = bottom_right\n"
-        "# dx12_render: true | false - DX12 in-backbuffer drawing. Leave true; auto disables on hostile titles.\n"
+        "# dx12_render: true | false - DX12 in-backbuffer drawing. Leave true; auto mode disables it\n"
+        "#       on hostile titles and restores it when the fallback backoff retries hooks.\n"
         "dx12_render = true\n"
         "# font: custom TTF for the overlay. Put the file in STAR/Fonts and name it here (e.g. poppins.ttf).\n"
         "# Absolute paths work too. Empty = system font. Needs game restart.\n"
@@ -252,6 +255,11 @@ void Settings::load(const std::string& dir)
             std::transform(overlay_mode.begin(), overlay_mode.end(), overlay_mode.begin(),
                 [](unsigned char c) { return (char)tolower(c); });
             if (overlay_mode != "hook" && overlay_mode != "external") overlay_mode = "auto";
+            overlay_fallback_count = ini.get_int("", "fallback_count", 0);
+            overlay_fallback_level = ini.get_int("", "fallback_level", 0);
+            if (overlay_fallback_count < 0) overlay_fallback_count = 0;
+            if (overlay_fallback_level < 0) overlay_fallback_level = 0;
+            if (overlay_fallback_level > 6) overlay_fallback_level = 6;
             overlay_notify_pos = ini.get("", "notify_pos", "bottom_right");
             std::transform(overlay_notify_pos.begin(), overlay_notify_pos.end(), overlay_notify_pos.begin(),
                 [](unsigned char c) { return (char)tolower(c); });

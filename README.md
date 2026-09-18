@@ -91,7 +91,7 @@ Icon paths are relative to the `STAR/` directory. You can unlock and reset achie
 
 Shows your account info, achievement progress, and a scrollable list of every achievement with Unlock/Reset buttons per row. Hit "Test notify" to fire a fake achievement notification so you can see how it looks without actually unlocking anything.
 
-Supports DX9, DX11, DX12, OpenGL, and Vulkan. Hooks the present call via MinHook, no game cooperation needed.
+Supports DX9, DX11, DX12, OpenGL, and Vulkan. Hooks the present call via MinHook, no game cooperation needed. Hostile titles (crashes, device loss, fence timeouts) automatically fall back to a separate external overlay window; STAR retries hooks after a few launches with exponential backoff and heals itself when a retry succeeds. See `SETUP.md` for the `mode`, `fallback_count`, and `fallback_level` keys.
 
 ---
 

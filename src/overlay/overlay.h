@@ -41,6 +41,14 @@ public:
 
     enum class OverlayMode { Hook, External };
     OverlayMode mode_ = OverlayMode::Hook;
+    // Auto-fallback backoff (see switch_to_external): fallback_count_ is the
+    // number of sessions to skip before retrying hook mode; fallback_level_
+    // grows the skip window on repeated failures (1,3,7,15,31,63). Persisted
+    // in overlay.star; cleared when a retry session ends without falling back.
+    int fallback_count_ = 0;
+    int fallback_level_ = 0;
+    bool retry_session_ = false;
+    bool fell_back_this_session_ = false;
 
     // ---- external window mode (no game hooks; own transparent window) ----
     HWND ext_hwnd_ = nullptr;
@@ -55,6 +63,12 @@ public:
     // Previous uploaded frame: skip UpdateLayeredWindow when pixels are
     // identical (static HUD = no DWM recomposite = no flicker).
     std::vector<uint8_t> ext_prev_;
+    // D3D9 external backend (DX9 games, lighter on old machines): offscreen
+    // render target + system-memory readback surface, same DIB/ULW path.
+    bool ext_use_d3d9_ = false;
+    struct IDirect3DDevice9* ext_d3d9_dev_ = nullptr;
+    struct IDirect3DSurface9* ext_d3d9_rt_ = nullptr;
+    struct IDirect3DSurface9* ext_d3d9_sys_ = nullptr;
     HANDLE ext_thread_ = nullptr;
     std::atomic<bool> ext_stop_{ false };
     int ext_track_tick_ = 0;
@@ -84,6 +98,7 @@ public:
     void external_track_game_window();
     static HWND find_game_window();
     void external_render_frame();
+    void external_upload_layered(int w, int h);
     static LRESULT CALLBACK ext_wnd_proc(HWND, UINT, WPARAM, LPARAM);
 
 private:
@@ -134,6 +149,7 @@ private:
     void* vk_instance_ = nullptr;
     void* vk_physical_device_ = nullptr;
     void* vk_device_ = nullptr;
+    void* vk_swapchain_ = nullptr;
     void* vk_queue_ = nullptr;
     uint32_t vk_queue_family_ = 0;
     int vk_swapchain_format_ = 0;
@@ -143,12 +159,15 @@ private:
     void* orig_vkCreateDevice_ = nullptr;
     void* orig_vkCreateSwapchainKHR_ = nullptr;
     void* orig_vkQueuePresentKHR_ = nullptr;
+    void* orig_vkAcquireNextImageKHR_ = nullptr;
     static int hooked_vkCreateInstance(const void*, const void*, void**);
     static int hooked_vkCreateDevice(void*, const void*, const void*, void**);
     static int hooked_vkCreateSwapchainKHR(void*, const void*, const void*, uint64_t*);
     static int hooked_vkQueuePresentKHR(void*, const void*);
+    static int hooked_vkAcquireNextImageKHR(void*, uint64_t, uint64_t, void*, void*, uint32_t*);
     void hook_vulkan();
     void on_present_vulkan(void* queue, const void* pPresentInfo);
+    void recover_vulkan_late();
     void init_imgui_vulkan(void* queue, const void* pPresentInfo);
     void render_frame_vulkan(void* queue, const void* pPresentInfo);
     void cleanup_vulkan();
@@ -159,7 +178,18 @@ private:
     void render_hud();
     // Software cursor while open: guarantees a visible panel cursor even if
     // the game buried the OS cursor. Off when closed (game draws its own).
-    void apply_cursor_mode() { ImGui::GetIO().MouseDrawCursor = open_; }
+    // While open, also keep the OS cursor visible: gameplay titles re-hide it
+    // every frame, and without this the count drifts so close can't restore it.
+    void apply_cursor_mode() {
+        ImGui::GetIO().MouseDrawCursor = open_;
+        if (open_ && mode_ != OverlayMode::External) {
+            int c = orig_show_cursor_ ? orig_show_cursor_(TRUE) : ShowCursor(TRUE);
+            if (orig_show_cursor_) orig_show_cursor_(FALSE); else ShowCursor(FALSE);
+            if (c - 1 < 1) {
+                if (orig_show_cursor_) orig_show_cursor_(TRUE); else ShowCursor(TRUE);
+            }
+        }
+    }
     bool save_rgba_png(const std::string& path, const uint8_t* rgba, int w, int h);
     std::string next_screenshot_path();
     static std::string screenshots_dir();
@@ -180,7 +210,7 @@ private:
     void hook_window_for(HWND h);
     void toggle_overlay();
     void start_external_thread();
-    void switch_to_external(const char* reason);
+    void switch_to_external(const char* reason, bool dx12_hostile = false);
     void poll_hotkey();
     void poll_keyboard();
     void ensure_hooks();

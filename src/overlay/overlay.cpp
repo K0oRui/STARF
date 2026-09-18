@@ -217,9 +217,16 @@ void StarOverlay::toggle_overlay()
             STAR_LOG("Overlay opened");
     } else {
         save_notes(); // flush unsaved notes text
-        while (cursor_show_count_offset_ > 0) {
-            if (orig_show_cursor_) orig_show_cursor_(FALSE); else ShowCursor(FALSE);
-            cursor_show_count_offset_--;
+        // Leave the OS cursor visible. The game re-asserts its own cursor
+        // state (hidden in gameplay, shown in menus) on its next ShowCursor
+        // call; restoring the pre-open count here hides the cursor even when
+        // the game now wants it shown.
+        int current = orig_show_cursor_ ? orig_show_cursor_(TRUE) : ShowCursor(TRUE);
+        if (orig_show_cursor_) orig_show_cursor_(FALSE); else ShowCursor(FALSE);
+        current--;
+        while (current < 1) {
+            if (orig_show_cursor_) orig_show_cursor_(TRUE); else ShowCursor(TRUE);
+            current++;
         }
         STAR_LOG("Overlay closed");
     }
@@ -426,6 +433,25 @@ void StarOverlay::init()
     // "auto" (default) starts on hooks and falls back to external if the
     // title proves hostile (see switch_to_external).
     if (!enabled_) return;
+    fallback_count_ = Settings::get().overlay_fallback_count;
+    fallback_level_ = Settings::get().overlay_fallback_level;
+    retry_session_ = false;
+    fell_back_this_session_ = false;
+    if (mode_ == OverlayMode::External && fallback_count_ > 0) {
+        // A previous session fell back to external. Skip this one too, then
+        // retry hooks once the skip window runs out (exponential backoff).
+        // The persisted mode stays "external" until a retry session either
+        // ends cleanly (shutdown clears it) or falls back again (which grows
+        // the window), so a crash mid-retry just skips again next launch.
+        if (--fallback_count_ == 0) {
+            mode_ = OverlayMode::Hook;
+            retry_session_ = true;
+            STAR_LOG("Overlay backoff done - retrying hook mode this session");
+        } else {
+            save_overlay_key("fallback_count", std::to_string(fallback_count_));
+            STAR_LOG("Overlay staying external (backoff %d sessions left)", fallback_count_);
+        }
+    }
     if (hooks_installed_) return;
     MH_STATUS mh_init = MH_Initialize();
     if (mh_init != MH_OK && mh_init != MH_ERROR_ALREADY_INITIALIZED) STAR_LOG("MinHook init failed status=%d", (int)mh_init);
@@ -543,15 +569,33 @@ void StarOverlay::start_external_thread()
     else STAR_LOG("External overlay started");
 }
 
-void StarOverlay::switch_to_external(const char* reason)
+void StarOverlay::switch_to_external(const char* reason, bool dx12_hostile)
 {
-    // One-way trip: hook rendering proved hostile (GPU fault / endless fence
-    // timeouts). Remember "external" itself (not just render-off) so the next
-    // launch goes straight to the working UI. API emulation + input hooks stay.
+    // Hook rendering proved hostile (GPU fault / endless fence timeouts).
+    // Remember "external" itself (not just render-off) so the next launch
+    // goes straight to the working UI. API emulation + input hooks stay.
+    // The fallback is not permanent: an exponential backoff (1,3,7,15,31,63
+    // skipped sessions) retries hook mode on later launches, so a transient
+    // GPU hiccup heals itself. Explicit "hook" mode never auto-falls back.
     if (mode_ == OverlayMode::External) return;
+    if (Settings::get().overlay_mode == "hook") {
+        STAR_LOG("Hook mode hostile (%s) - staying on hooks (mode=hook is explicit)", reason);
+        return;
+    }
     mode_ = OverlayMode::External;
+    fell_back_this_session_ = true;
+    fallback_level_ = std::min(fallback_level_ + 1, 6);
+    fallback_count_ = (1 << fallback_level_) - 1;
     save_overlay_key("mode", "external");
-    STAR_LOG("Switching to external overlay (%s)", reason);
+    save_overlay_key("fallback_count", std::to_string(fallback_count_));
+    save_overlay_key("fallback_level", std::to_string(fallback_level_));
+    if (dx12_hostile) {
+        // The title faults on DX12 in-backbuffer drawing: keep drawing off
+        // so the retry (and any manual hook mode) stays safe.
+        save_overlay_key("dx12_render", "false");
+    }
+    STAR_LOG("Switching to external overlay (%s) - backoff level %d (%d sessions)",
+        reason, fallback_level_, fallback_count_);
     start_external_thread();
 }
 
@@ -648,6 +692,14 @@ std::string StarOverlay::format_playtime(uint64_t secs)
 
 void StarOverlay::shutdown()
 {
+    // A retry session that survived without falling back again means the
+    // hostile title healed: clear the backoff so future launches use hooks.
+    if (retry_session_ && !fell_back_this_session_) {
+        save_overlay_key("mode", "auto");
+        save_overlay_key("fallback_count", "0");
+        save_overlay_key("fallback_level", "0");
+        STAR_LOG("Overlay retry session clean - backoff cleared");
+    }
     if (mode_ == OverlayMode::External && ext_thread_) {
         ext_stop_ = true;
         WaitForSingleObject(ext_thread_, 5000);
@@ -2679,6 +2731,12 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
     // in the external window. Hook rendering stays off entirely.
     if (mode_ == OverlayMode::External) return;
 
+    // Vulkan games also present via DXGI (flip model) but render via Vulkan.
+    // The DX12 path would draw into the same backbuffer Unity presents via
+    // Vulkan with no shared sync -> GPU hang / game freeze. The Vulkan
+    // present hook owns rendering for these games.
+    if (game_api_ == GraphicsAPI::Vulkan) return;
+
     if (!imgui_initialized_) {
         static bool logged_attempt = false;
         if (!logged_attempt) { logged_attempt = true; STAR_LOG("on_present: attempting imgui init"); }
@@ -3040,7 +3098,7 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
             }
             if (++dx12_timeout_streak_ >= 30) {
                 dx12_timeout_streak_ = 0;
-                switch_to_external("DX12 frame fence never completes");
+                switch_to_external("DX12 frame fence never completes", true);
                 return;
             }
             return;
@@ -3111,7 +3169,7 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
             HRESULT removed = dev->GetDeviceRemovedReason();
             STAR_LOG("DX12 first frame submitted (removed=0x%08x)", (unsigned)removed);
             if (FAILED(removed))
-                switch_to_external("DX12 device removed after first submit");
+                switch_to_external("DX12 device removed after first submit", true);
         }
     }
 }
@@ -3421,6 +3479,7 @@ void StarOverlay::on_present_opengl(HDC hdc)
     VK_FUNC(vkCreateDevice) \
     VK_FUNC(vkDestroyDevice) \
     VK_FUNC(vkEnumeratePhysicalDevices) \
+    VK_FUNC(vkGetPhysicalDeviceProperties) \
     VK_FUNC(vkGetPhysicalDeviceQueueFamilyProperties) \
     VK_FUNC(vkGetPhysicalDeviceMemoryProperties) \
     VK_FUNC(vkGetDeviceQueue) \
@@ -3514,6 +3573,7 @@ struct VulkanOverlayData {
     std::vector<VkCommandBuffer> command_buffers;
     std::vector<VkFramebuffer> framebuffers;
     std::vector<VkImageView> image_views;
+    std::vector<VkImage> images;
     uint32_t image_count = 0;
     VkSampler icon_sampler = VK_NULL_HANDLE;
     std::vector<VkImage>        icon_images;
@@ -3645,6 +3705,20 @@ int StarOverlay::hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo)
     return orig(queue, pPresentInfo);
 }
 
+int StarOverlay::hooked_vkAcquireNextImageKHR(void* device, uint64_t swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex)
+{
+    if (g_overlay) {
+        // Called every frame with the game's device + swapchain. This is the
+        // recovery path for games that init Vulkan before SteamAPI_Init: the
+        // create hooks never fire, but this still gives us the VkDevice.
+        if (!g_overlay->vk_device_) g_overlay->vk_device_ = device;
+        g_overlay->vk_swapchain_ = (void*)swapchain;
+    }
+    typedef VkResult(VKAPI_PTR* PFN_vkAcquireNextImageKHR)(void*, uint64_t, uint64_t, void*, void*, uint32_t*);
+    auto orig = (PFN_vkAcquireNextImageKHR)g_overlay->orig_vkAcquireNextImageKHR_;
+    return orig(device, swapchain, timeout, semaphore, fence, pImageIndex);
+}
+
 void StarOverlay::hook_vulkan()
 {
     if (orig_vkQueuePresentKHR_ && orig_vkCreateDevice_ && orig_vkCreateInstance_) { vulkan_hooked_ = true; return; }
@@ -3656,6 +3730,7 @@ void StarOverlay::hook_vulkan()
     void* pCreateDevice = (void*)GetProcAddress(vulkan, "vkCreateDevice");
     void* pQueuePresent = (void*)GetProcAddress(vulkan, "vkQueuePresentKHR");
     void* pCreateSwapchain = (void*)GetProcAddress(vulkan, "vkCreateSwapchainKHR");
+    void* pAcquireNextImage = (void*)GetProcAddress(vulkan, "vkAcquireNextImageKHR");
 
     if (pCreateInstance && !orig_vkCreateInstance_) {
         if (MH_CreateHook(pCreateInstance, &hooked_vkCreateInstance, (void**)&orig_vkCreateInstance_) == MH_OK)
@@ -3678,29 +3753,54 @@ void StarOverlay::hook_vulkan()
             STAR_LOG("Vulkan CreateSwapchain hooked (loader)");
         }
     }
+    // Loader export: fires every frame with the game's device + swapchain.
+    // Recovery for games that init Vulkan before SteamAPI_Init (the create
+    // hooks are missed); on_present_vulkan uses the captured device to
+    // rebuild the instance/physical device at present time.
+    if (pAcquireNextImage && !orig_vkAcquireNextImageKHR_) {
+        if (MH_CreateHook(pAcquireNextImage, &hooked_vkAcquireNextImageKHR, (void**)&orig_vkAcquireNextImageKHR_) == MH_OK) {
+            MH_EnableHook(pAcquireNextImage);
+            STAR_LOG("Vulkan AcquireNextImage hooked (loader)");
+        }
+    }
     if (orig_vkQueuePresentKHR_) { vulkan_hooked_ = true; STAR_LOG("Vulkan hooked"); }
 }
 
 void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
 {
     if (!enabled_) return;
-    if (game_api_ == GraphicsAPI::None) {
+    // Claim the game unconditionally: a Vulkan present means the game renders
+    // via Vulkan, even if a DXGI present fired first and mis-detected DX12.
+    // on_present() gates the DX12 path on this so it never fights the Vulkan
+    // present on the same backbuffer (GPU hang / game freeze).
+    if (game_api_ != GraphicsAPI::Vulkan) {
         game_api_ = GraphicsAPI::Vulkan;
         STAR_LOG("Game graphics API: Vulkan");
         // In-backbuffer Vulkan drawing submits without the game's present
-        // semaphores and a lying initialLayout - a GPU-hang vector this
-        // session cannot validate. Auto mode takes the external window
-        // (proven path); explicit "hook" keeps the old behavior.
-        if (Settings::get().overlay_mode == "auto") {
-            switch_to_external("Vulkan in-backbuffer drawing disabled (hang risk)");
-            return;
-        }
+        // semaphores (same-queue ordering covers that) and now transitions
+        // the image explicitly instead of lying about initialLayout, so the
+        // old GPU-hang vector is gone. If a title still faults, the auto
+        // fallback (switch_to_external) takes over.
     }
     if (mode_ == OverlayMode::External) return;
     if (!vk_device_ || !vk_instance_) {
-        static bool logged = false;
-        if (!logged) { logged = true; STAR_LOG("Vulkan present: waiting for device/instance (device=%p instance=%p) - game may have init before SteamAPI_Init, will recover on swapchain recreate", vk_device_, vk_instance_); }
-        return;
+        // Late-init recovery: the game created its Vulkan instance/device
+        // before SteamAPI_Init, so the create hooks were missed. The
+        // vkCreateSwapchainKHR / vkAcquireNextImageKHR hooks captured the
+        // device; rebuild the instance + physical device here so the overlay
+        // can init.
+        if (!vk_instance_ && vk_device_) {
+            recover_vulkan_late();
+            // The recovery's format/count are unknown until the swapchain
+            // hook fires; init on a later present so the real values are used.
+            vk_swapchain_recreated_ = true;
+            return;
+        }
+        if (!vk_device_ || !vk_instance_) {
+            static bool logged = false;
+            if (!logged) { logged = true; STAR_LOG("Vulkan present: waiting for device/instance (device=%p instance=%p)", vk_device_, vk_instance_); }
+            return;
+        }
     }
 
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
@@ -3721,7 +3821,7 @@ void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
     uint32_t image_index = pi->pImageIndices[0];
     vk_queue_ = queue;
 
-    if (vk_swapchain_recreated_ || !imgui_initialized_) {
+    if ((vk_swapchain_recreated_ || !imgui_initialized_) && vk_swapchain_format_ != 0) {
         cleanup_vulkan();
         init_imgui_vulkan(queue, pPresentInfo);
         vk_swapchain_recreated_ = false;
@@ -3729,6 +3829,65 @@ void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
 
     if (imgui_initialized_ && active_api_ == GraphicsAPI::Vulkan) {
         render_frame_vulkan(queue, pPresentInfo);
+    }
+}
+
+void StarOverlay::recover_vulkan_late()
+{
+    HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkan) return;
+    if (!resolve_vulkan_funcs(vulkan)) return;
+
+    // The game's instance was created before we hooked, so we can't capture
+    // it. Create a throwaway instance to enumerate the physical device and
+    // satisfy ImGui's backend (which asserts Instance + PhysicalDevice).
+    VkApplicationInfo app_info = {};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "STAR";
+    app_info.apiVersion = VK_API_VERSION_1_0;
+
+    VkInstanceCreateInfo inst_info = {};
+    inst_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    inst_info.pApplicationInfo = &app_info;
+
+    VkInstance dummy = VK_NULL_HANDLE;
+    if (vkCreateInstance(&inst_info, nullptr, &dummy) != VK_SUCCESS) return;
+
+    uint32_t count = 0;
+    vkEnumeratePhysicalDevices(dummy, &count, nullptr);
+    if (count == 0) { vkDestroyInstance(dummy, nullptr); return; }
+    std::vector<VkPhysicalDevice> devices(count);
+    vkEnumeratePhysicalDevices(dummy, &count, devices.data());
+
+    VkPhysicalDevice chosen = VK_NULL_HANDLE;
+    for (auto pd : devices) {
+        VkPhysicalDeviceProperties props = {};
+        vkGetPhysicalDeviceProperties(pd, &props);
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { chosen = pd; break; }
+    }
+    if (!chosen && !devices.empty()) chosen = devices[0];
+
+    vk_instance_ = dummy;
+    vk_physical_device_ = chosen;
+    g_vk_instance = dummy;
+    STAR_LOG("Vulkan late recovery: device=%p instance=%p physical=%p fmt=%d count=%u",
+        vk_device_, vk_instance_, vk_physical_device_, vk_swapchain_format_, (unsigned)vk_min_image_count_);
+}
+
+// The game's swapchain is often sRGB (e.g. R8G8B8A8_SRGB). ImGui's shader
+// outputs colors as-is, so an sRGB render pass would re-encode them and wash
+// the overlay out. Render through a UNORM view of the same image instead: the
+// formats are view-compatible, the game's sRGB content is preserved by
+// LOAD_OP_LOAD, and ImGui's colors hit the screen unmodified.
+static VkFormat unorm_view_format(VkFormat fmt)
+{
+    switch (fmt) {
+        case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_R8G8B8_SRGB:    return VK_FORMAT_R8G8B8_UNORM;
+        case VK_FORMAT_B8G8R8_SRGB:    return VK_FORMAT_B8G8R8_UNORM;
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+        default: return fmt;
     }
 }
 
@@ -3740,7 +3899,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     if (!resolve_vulkan_funcs(vulkan)) return;
 
     VkAttachmentDescription attachment = {};
-    attachment.format = (VkFormat)vk_swapchain_format_;
+    attachment.format = unorm_view_format((VkFormat)vk_swapchain_format_);
     attachment.samples = VK_SAMPLE_COUNT_1_BIT;
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -3827,7 +3986,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         view_info.image = images[i];
         view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view_info.format = (VkFormat)vk_swapchain_format_;
+        view_info.format = unorm_view_format((VkFormat)vk_swapchain_format_);
         view_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
         view_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
         view_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -3904,6 +4063,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         data->command_buffers = cbs;
         data->framebuffers = fbs;
         data->image_views = views;
+        data->images = images;
         data->image_count = count;
 
         VkSamplerCreateInfo samp_info = {};
@@ -3955,8 +4115,8 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
         if (rect.bottom - rect.top > 0) h = (uint32_t)(rect.bottom - rect.top);
     }
     VkFormat fmt = (VkFormat)vk_swapchain_format_;
-    bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM);
-    if (fmt != VK_FORMAT_R8G8B8A8_UNORM && !bgra) {
+    bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+    if (fmt != VK_FORMAT_R8G8B8A8_UNORM && fmt != VK_FORMAT_R8G8B8A8_SRGB && !bgra) {
         STAR_LOG("Screenshot: unsupported Vulkan format %d", (int)fmt);
         return;
     }
@@ -4109,6 +4269,31 @@ void StarOverlay::render_frame_vulkan(void* queue, const void* pPresentInfo)
     VkCommandBuffer cb = data->command_buffers[image_index];
     vkResetCommandBuffer(cb, 0);
     vkBeginCommandBuffer(cb, &begin_info);
+
+    // The game presents this image, so it sits in PRESENT_SRC_KHR. The render
+    // pass expects COLOR_ATTACHMENT_OPTIMAL (its finalLayout transitions back
+    // to PRESENT_SRC_KHR on end). Transition explicitly instead of lying about
+    // initialLayout - a lying initialLayout is a GPU-hang vector on strict
+    // drivers. Same-queue ordering (no semaphores) keeps this safe: our submit
+    // runs after the game's present work on the same queue.
+    if (image_index < data->images.size() && data->images[image_index]) {
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = data->images[image_index];
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(cb,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
 
     RECT rect{};
     if (hwnd_) GetClientRect(hwnd_, &rect);
@@ -4317,6 +4502,11 @@ void StarOverlay::cleanup_vulkan()
         data->cleanup();
         delete data;
         context_ = nullptr;
+        // data->cleanup() destroys the descriptor pool and icon views, which
+        // invalidates every cached ImTextureID. Drop the cache so icons are
+        // re-uploaded after a swapchain recreation (e.g. fullscreen toggle).
+        gl_icon_textures_.clear();
+        icon_textures_.clear();
     }
 }
 
