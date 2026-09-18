@@ -201,7 +201,6 @@ bool Storage::delete_remote_file(const std::string& filename)
     return ok;
 }
 
-#include "core/storage.h"
 #include <filesystem>
 
 std::vector<std::string> Storage::list_remote_files()

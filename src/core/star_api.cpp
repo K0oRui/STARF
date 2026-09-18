@@ -29,7 +29,6 @@
 #include "steam/steam_html_surface.h"
 #include "steam/steam_inventory.h"
 #include "steam/steam_video.h"
-#include "steam/steam_unified_messages.h"
 #include "steam/steam_game_server.h"
 #include "steam/steam_game_server_stats.h"
 #include "steam/steam_input.h"

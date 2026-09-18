@@ -1,28 +1,17 @@
 #include "overlay/overlay_internal.h"
 #include "core/settings.h"
 #include "core/storage.h"
-#include "core/callbacks.h"
-#include "steam/steam_user_stats.h"
-#include "steam/steam_utils.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx9.h"
+#include "imgui_impl_dx10.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_vulkan.h"
 #include <MinHook.h>
 #include <d3d9.h>
-#include <d3d12.h>
-#include <cmath>
-#include <wincodec.h>
-#pragma comment(lib, "WindowsCodecs.lib")
-#include <shlobj.h>
-#include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
-#include <vulkan/vulkan.h>
-#include <cctype>
-#include <ctime>
+#include <d3d10.h>
 #include <algorithm>
 
 StarOverlay* g_overlay = nullptr;
@@ -161,7 +150,7 @@ void StarOverlay::init()
     }
 
     hook_dx9();
-    hook_dx11();
+hook_dxgi();
     hook_opengl();
     hook_vulkan();
     hooks_installed_ = true;
@@ -173,7 +162,7 @@ void StarOverlay::init()
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (retry_stop_.load() || !g_overlay) break;
             ensure_hooks();
-            if (dx11_hooked_ && dx9_hooked_ && opengl_hooked_ && vulkan_hooked_) break;
+            if (dxgi_hooked_ && dx9_hooked_ && opengl_hooked_ && vulkan_hooked_) break;
             if (imgui_initialized_) break;
         }
     }).detach();
@@ -222,7 +211,7 @@ void StarOverlay::ensure_hooks()
 {
     if (!enabled_ || !g_overlay) return;
     // Each hook fn is now idempotent (checks orig_* / hooked flag), so safe to retry.
-    if (!dx11_hooked_) hook_dx11();
+    if (!dxgi_hooked_) hook_dxgi();
     if (!dx9_hooked_) hook_dx9();
     if (!opengl_hooked_) hook_opengl();
     if (!vulkan_hooked_) hook_vulkan();
@@ -319,6 +308,8 @@ void StarOverlay::shutdown()
     if (imgui_initialized_) {
         if (active_api_ == GraphicsAPI::DX11) {
             ImGui_ImplDX11_Shutdown();
+        } else if (active_api_ == GraphicsAPI::DX10) {
+            ImGui_ImplDX10_Shutdown();
 #ifdef _WIN64
         } else if (active_api_ == GraphicsAPI::DX12) {
             ImGui_ImplDX12_Shutdown();
@@ -337,6 +328,7 @@ void StarOverlay::shutdown()
     }
 
     cleanup_rtv();
+    cleanup_dx10_rtv();
 #ifdef _WIN64
     cleanup_dx12();
 #endif
@@ -344,6 +336,8 @@ void StarOverlay::shutdown()
 
     if (api_snapshot == GraphicsAPI::DX11) {
         icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
+    } else if (api_snapshot == GraphicsAPI::DX10) {
+        icons_.release_all([](ImTextureID v) { ((ID3D10ShaderResourceView*)v)->Release(); });
     } else if (api_snapshot == GraphicsAPI::DX9) {
         // MANAGED-pool IDirect3DTexture9* icons.
         icons_.release_all([](ImTextureID v) { ((IDirect3DTexture9*)v)->Release(); });
@@ -355,6 +349,7 @@ void StarOverlay::shutdown()
     icons_.clear();
     if (context_) { context_->Release(); context_ = nullptr; }
     if (device_)  { device_->Release();  device_  = nullptr; }
+    if (dx10_device_) { dx10_device_->Release(); dx10_device_ = nullptr; }
     hooks_installed_ = false;
     // NOTE: do NOT MH_DisableHook(MH_ALL_HOOKS)/Remove/Uninitialize here.
     // MinHook is shared with integrity hooks (STAR_install_integrity_hooks).

@@ -112,21 +112,25 @@ public:
 private:
     StarOverlay() = default;
 
-    enum class GraphicsAPI { None, DX9, DX11, DX12, OpenGL, Vulkan };
+    enum class GraphicsAPI { None, DX9, DX10, DX11, DX12, OpenGL, Vulkan };
     GraphicsAPI active_api_ = GraphicsAPI::None;
     GraphicsAPI game_api_ = GraphicsAPI::None; // what the GAME renders with
 
-    void hook_dx11();
+    void hook_dxgi();
     void on_present(IDXGISwapChain* chain, UINT sync_interval, UINT flags);
     void on_resize_buffers(IDXGISwapChain* chain, UINT bc, UINT w, UINT h, DXGI_FORMAT fmt, UINT fl);
     void render_frame(IDXGISwapChain* chain);
     void init_imgui(IDXGISwapChain* chain);
     void cleanup_rtv();
+    void init_imgui_dx10(IDXGISwapChain* chain, struct ID3D10Device* device);
+    void render_frame_dx10(IDXGISwapChain* chain);
+    void cleanup_dx10_rtv();
     ImTextureID get_or_create_icon(const std::string& key,
                                    const std::vector<uint8_t>& rgba, int w, int h);
 
 #ifdef _WIN64
     void on_present_dx12(IDXGISwapChain* chain);
+    void try_init_dx12(IDXGISwapChain* chain);
     void init_imgui_dx12(IDXGISwapChain* chain, void* device, void* command_queue);
     void render_frame_dx12(IDXGISwapChain* chain);
     void cleanup_dx12();
@@ -145,6 +149,7 @@ private:
     void on_present_dx9(struct IDirect3DDevice9* device);
     void on_reset_dx9();
     ImTextureID upload_icon_dx9(const std::vector<uint8_t>& rgba, int w, int h);
+    ImTextureID upload_icon_dx10(const std::vector<uint8_t>& rgba, int w, int h);
     ImTextureID upload_icon_opengl(const std::vector<uint8_t>& rgba, int w, int h);
 
     using wglSwapBuffersFn = BOOL(WINAPI*)(HDC);
@@ -208,6 +213,7 @@ private:
     }
     void notify_screenshot(const std::string& file, bool dark = false);
     void maybe_capture_dx11(IDXGISwapChain* chain);
+    void maybe_capture_dx10(IDXGISwapChain* chain);
     void maybe_capture_dx9(struct IDirect3DDevice9* device);
     void maybe_capture_opengl();
 #ifdef _WIN64
@@ -227,7 +233,7 @@ private:
     bool  enabled_           = true;
     bool  imgui_initialized_ = false;
     bool  hooks_installed_   = false;
-    bool  dx11_hooked_       = false;
+    bool  dxgi_hooked_       = false;
     bool  dx9_hooked_        = false;
     bool  opengl_hooked_     = false;
     bool  vulkan_hooked_     = false;
@@ -271,6 +277,8 @@ private:
     ID3D11Device*           device_        = nullptr;
     ID3D11DeviceContext*    context_       = nullptr;
     ID3D11RenderTargetView* rtv_           = nullptr;
+    struct ID3D10Device*           dx10_device_ = nullptr;
+    struct ID3D10RenderTargetView* dx10_rtv_   = nullptr;
     HWND                    hwnd_          = nullptr;
     WNDPROC                 wnd_proc_orig_ = nullptr;
 

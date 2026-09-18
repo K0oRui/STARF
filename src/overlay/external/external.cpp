@@ -10,7 +10,6 @@
 #include "imgui_impl_dx9.h"
 #include <d3d9.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 

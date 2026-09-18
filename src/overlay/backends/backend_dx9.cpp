@@ -1,29 +1,8 @@
 #include "overlay/overlay_internal.h"
-#include "core/settings.h"
-#include "core/storage.h"
-#include "core/callbacks.h"
-#include "steam/steam_user_stats.h"
-#include "steam/steam_utils.h"
-#include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx9.h"
-#include "imgui_impl_dx11.h"
-#include "imgui_impl_dx12.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_vulkan.h"
 #include <MinHook.h>
 #include <d3d9.h>
-#include <d3d12.h>
-#include <cmath>
-#include <wincodec.h>
-#pragma comment(lib, "WindowsCodecs.lib")
-#include <shlobj.h>
-#include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
-#include <vulkan/vulkan.h>
-#include <cctype>
-#include <ctime>
-#include <algorithm>
 
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_DX9Present(IDirect3DDevice9* device, const RECT* src, const RECT* dst, HWND window, const RGNDATA* rgn)

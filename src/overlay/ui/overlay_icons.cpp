@@ -1,29 +1,8 @@
 #include "overlay/overlay_internal.h"
-#include "core/settings.h"
-#include "core/storage.h"
-#include "core/callbacks.h"
-#include "steam/steam_user_stats.h"
 #include "steam/steam_utils.h"
 #include "imgui.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx9.h"
-#include "imgui_impl_dx11.h"
-#include "imgui_impl_dx12.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_vulkan.h"
-#include <MinHook.h>
 #include <d3d9.h>
-#include <d3d12.h>
-#include <cmath>
-#include <wincodec.h>
-#pragma comment(lib, "WindowsCodecs.lib")
-#include <shlobj.h>
-#include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
-#include <vulkan/vulkan.h>
-#include <cctype>
-#include <ctime>
-#include <algorithm>
+#include <d3d10.h>
 
 ImTextureID StarOverlay::get_or_create_icon(
     const std::string& key, const std::vector<uint8_t>& rgba, int w, int h)
@@ -39,6 +18,8 @@ ImTextureID StarOverlay::get_or_create_icon(
             return upload_icon_vulkan(rgba, w, h);
         } else if (active_api_ == GraphicsAPI::DX9) {
             return upload_icon_dx9(rgba, w, h);
+        } else if (active_api_ == GraphicsAPI::DX10) {
+            return upload_icon_dx10(rgba, w, h);
         } else if (active_api_ == GraphicsAPI::OpenGL) {
             return upload_icon_opengl(rgba, w, h);
         } else if (device_) {
@@ -88,6 +69,22 @@ ImTextureID StarOverlay::upload_icon_dx9(const std::vector<uint8_t>& rgba, int w
     }
     tex->Release();
     return nullptr;
+}
+
+ImTextureID StarOverlay::upload_icon_dx10(const std::vector<uint8_t>& rgba, int w, int h)
+{
+    if (!dx10_device_) return nullptr;
+    D3D10_TEXTURE2D_DESC td{};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D10_USAGE_DEFAULT; td.BindFlags = D3D10_BIND_SHADER_RESOURCE;
+    D3D10_SUBRESOURCE_DATA srd{ rgba.data(), (UINT)(w * 4), 0 };
+    ID3D10Texture2D* tex = nullptr;
+    if (FAILED(dx10_device_->CreateTexture2D(&td, &srd, &tex)) || !tex) return nullptr;
+    ID3D10ShaderResourceView* srv = nullptr;
+    dx10_device_->CreateShaderResourceView(tex, nullptr, &srv);
+    tex->Release();
+    return (ImTextureID)(void*)srv;
 }
 
 ImTextureID StarOverlay::upload_icon_opengl(const std::vector<uint8_t>& rgba, int w, int h)

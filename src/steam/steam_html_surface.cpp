@@ -1,6 +1,5 @@
 #include "steam/steam_html_surface.h"
 #include "core/callbacks.h"
-#include "steam/isteamhtmlsurface.h"
 
 StarSteamHTMLSurface& StarSteamHTMLSurface::get() { static StarSteamHTMLSurface i; return i; }
 bool StarSteamHTMLSurface::Init() { return true; }

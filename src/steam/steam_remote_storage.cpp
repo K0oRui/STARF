@@ -1,8 +1,6 @@
 #include "steam/steam_remote_storage.h"
 #include "core/storage.h"
 #include "core/callbacks.h"
-#include "core/settings.h"
-#include "steam/isteamremotestorage.h"
 #include <time.h>
 
 StarSteamRemoteStorage& StarSteamRemoteStorage::get()

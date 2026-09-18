@@ -1,29 +1,7 @@
 #include "overlay/overlay_internal.h"
-#include "core/settings.h"
-#include "core/storage.h"
-#include "core/callbacks.h"
-#include "steam/steam_user_stats.h"
-#include "steam/steam_utils.h"
-#include "imgui.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx9.h"
-#include "imgui_impl_dx11.h"
-#include "imgui_impl_dx12.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_vulkan.h"
-#include <MinHook.h>
 #include <d3d9.h>
-#include <d3d12.h>
-#include <cmath>
-#include <wincodec.h>
-#pragma comment(lib, "WindowsCodecs.lib")
-#include <shlobj.h>
-#include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
-#include <vulkan/vulkan.h>
-#include <cctype>
-#include <ctime>
-#include <algorithm>
+#include <d3d10.h>
+#include <d3d11.h>
 
 void StarOverlay::maybe_capture_dx11(IDXGISwapChain* chain)
 {
@@ -82,6 +60,72 @@ void StarOverlay::maybe_capture_dx11(IDXGISwapChain* chain)
             }
         }
         context_->Unmap(staging, 0);
+        path = ScreenshotService::next_path();
+        if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
+            notify_screenshot(path);
+    }
+    staging->Release();
+    if (resolved) resolved->Release();
+    bb->Release();
+}
+
+void StarOverlay::maybe_capture_dx10(IDXGISwapChain* chain)
+{
+    if (!screenshots_.consume()) return;
+    if (!enabled_ || !dx10_device_) return;
+    ID3D10Texture2D* bb = nullptr;
+    if (FAILED(chain->GetBuffer(0, __uuidof(ID3D10Texture2D), (void**)&bb)) || !bb) return;
+    D3D10_TEXTURE2D_DESC desc{};
+    bb->GetDesc(&desc);
+    bool bgra = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+    if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM && !bgra) {
+        STAR_LOG("Screenshot: unsupported DX10 format %u", (unsigned)desc.Format);
+        bb->Release();
+        return;
+    }
+    ID3D10Texture2D* src = bb;
+    ID3D10Texture2D* resolved = nullptr;
+    if (desc.SampleDesc.Count > 1) {
+        D3D10_TEXTURE2D_DESC rd = desc;
+        rd.SampleDesc.Count = 1; rd.SampleDesc.Quality = 0;
+        rd.Usage = D3D10_USAGE_DEFAULT; rd.BindFlags = 0; rd.CPUAccessFlags = 0;
+        if (FAILED(dx10_device_->CreateTexture2D(&rd, nullptr, &resolved)) || !resolved) {
+            STAR_LOG("Screenshot: DX10 resolve target failed");
+            bb->Release();
+            return;
+        }
+        dx10_device_->ResolveSubresource(resolved, 0, bb, 0, desc.Format);
+        src = resolved;
+    }
+    D3D10_TEXTURE2D_DESC sd = desc;
+    sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0;
+    sd.Usage = D3D10_USAGE_STAGING; sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D10_CPU_ACCESS_READ; sd.MiscFlags = 0;
+    ID3D10Texture2D* staging = nullptr;
+    if (FAILED(dx10_device_->CreateTexture2D(&sd, nullptr, &staging)) || !staging) {
+        if (resolved) resolved->Release();
+        bb->Release();
+        return;
+    }
+    dx10_device_->CopyResource(staging, src);
+    D3D10_MAPPED_TEXTURE2D map{};
+    std::string path;
+    if (SUCCEEDED(staging->Map(0, D3D10_MAP_READ, 0, &map))) {
+        std::vector<uint8_t> rgba((size_t)desc.Width * desc.Height * 4);
+        const uint8_t* srow = (const uint8_t*)map.pData;
+        for (UINT y = 0; y < desc.Height; y++) {
+            uint8_t* d = rgba.data() + (size_t)y * desc.Width * 4;
+            if (bgra) {
+                const uint8_t* s = srow + (size_t)y * map.RowPitch;
+                for (UINT x = 0; x < desc.Width; x++) {
+                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
+                    s += 4; d += 4;
+                }
+            } else {
+                memcpy(d, srow + (size_t)y * map.RowPitch, (size_t)desc.Width * 4);
+            }
+        }
+        staging->Unmap(0);
         path = ScreenshotService::next_path();
         if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
             notify_screenshot(path);

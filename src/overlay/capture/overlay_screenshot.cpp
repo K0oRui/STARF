@@ -1,6 +1,5 @@
 #include "overlay/overlay_internal.h"
 #include "overlay/capture/screenshot_service.h"
-#include "steam/steam_utils.h"
 
 void StarOverlay::request_screenshot()
 {

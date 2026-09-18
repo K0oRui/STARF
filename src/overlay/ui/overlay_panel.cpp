@@ -1,28 +1,13 @@
 #include "overlay/overlay_internal.h"
 #include "core/settings.h"
-#include "core/storage.h"
-#include "core/callbacks.h"
 #include "steam/steam_user_stats.h"
 #include "steam/steam_utils.h"
 #include "imgui.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx9.h"
-#include "imgui_impl_dx11.h"
-#include "imgui_impl_dx12.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_vulkan.h"
-#include <MinHook.h>
 #include <d3d9.h>
-#include <d3d12.h>
-#include <cmath>
-#include <wincodec.h>
-#pragma comment(lib, "WindowsCodecs.lib")
-#include <shlobj.h>
+#include <d3d10.h>
+#include <cctype>
 #include <shellapi.h>
 #pragma comment(lib, "shell32.lib")
-#include <vulkan/vulkan.h>
-#include <cctype>
-#include <ctime>
 #include <algorithm>
 
 void StarOverlay::render_panel()
@@ -107,6 +92,7 @@ void StarOverlay::panel_header(ImFont* fsmall, ImFont* ftitle, float pw)
     const char* gfx = "detecting…";
     switch (game_api_) {
     case GraphicsAPI::DX9:    gfx = "DirectX 9"; break;
+    case GraphicsAPI::DX10:   gfx = "DirectX 10"; break;
     case GraphicsAPI::DX11:   gfx = "DirectX 11"; break;
     case GraphicsAPI::DX12:   gfx = "DirectX 12"; break;
     case GraphicsAPI::OpenGL: gfx = "OpenGL"; break;
@@ -298,6 +284,8 @@ void StarOverlay::panel_screenshots(ImFont* fsmall, float sw, float sh)
                 if (dit) {
                     if (active_api_ == GraphicsAPI::DX11)
                         ((ID3D11ShaderResourceView*)dit)->Release();
+                    else if (active_api_ == GraphicsAPI::DX10)
+                        ((ID3D10ShaderResourceView*)dit)->Release();
                     else if (active_api_ == GraphicsAPI::DX9)
                         ((IDirect3DTexture9*)dit)->Release();
                 }

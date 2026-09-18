@@ -1,7 +1,6 @@
 #include "steam/steam_utils.h"
 #include "core/callbacks.h"
 #include "core/settings.h"
-#include "steam/isteamutils.h"
 #include <wincodec.h>
 #pragma comment(lib, "WindowsCodecs.lib")
 

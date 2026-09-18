@@ -45,6 +45,7 @@ set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx9.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx10.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
@@ -94,8 +95,10 @@ set(STAR_SOURCES
     overlay/capture/screenshot_service.cpp
     overlay/capture/overlay_capture.cpp
     overlay/backends/backend_dx9.cpp
+    overlay/backends/backend_dx10.cpp
     overlay/backends/backend_dx11.cpp
     overlay/backends/backend_dx12.cpp
+    overlay/backends/backend_dxgi.cpp
     overlay/backends/backend_opengl.cpp
     overlay/backends/backend_vulkan.cpp
     overlay/external/external.cpp
@@ -156,6 +159,7 @@ target_link_libraries(star PRIVATE
     nlohmann_json::nlohmann_json
     d3d11
     d3d12
+    d3d10
     dxgi
     d3dcompiler
     d3d9

@@ -1,29 +1,9 @@
 #include "overlay/overlay_internal.h"
 #include "core/settings.h"
-#include "core/storage.h"
-#include "core/callbacks.h"
-#include "steam/steam_user_stats.h"
-#include "steam/steam_utils.h"
-#include "imgui.h"
 #include "imgui_impl_win32.h"
-#include "imgui_impl_dx9.h"
-#include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
-#include "imgui_impl_opengl3.h"
-#include "imgui_impl_vulkan.h"
 #include <MinHook.h>
-#include <d3d9.h>
 #include <d3d12.h>
-#include <cmath>
-#include <wincodec.h>
-#pragma comment(lib, "WindowsCodecs.lib")
-#include <shlobj.h>
-#include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
-#include <vulkan/vulkan.h>
-#include <cctype>
-#include <ctime>
-#include <algorithm>
 
 #ifdef _WIN64
 void* StarOverlay::g_dx12_captured_queue_ = nullptr;
@@ -63,6 +43,25 @@ void StarOverlay::hook_dx12_ecl()
         STAR_LOG("DX12 ECL: CreateCommandQueue failed");
     }
     dummy_dev->Release();
+}
+
+void StarOverlay::try_init_dx12(IDXGISwapChain* chain)
+{
+    if (!orig_execute_command_lists_) {
+        hook_dx12_ecl();
+        return;
+    }
+    if (g_dx12_captured_queue_) {
+        ID3D12Device* d3d12_device = nullptr;
+        auto* queue = (ID3D12CommandQueue*)g_dx12_captured_queue_;
+        if (SUCCEEDED(queue->GetDevice(__uuidof(ID3D12Device), (void**)&d3d12_device))) {
+            init_imgui_dx12(chain, d3d12_device, g_dx12_captured_queue_);
+            d3d12_device->Release();
+        } else {
+            static bool logged_queue_fail = false;
+            if (!logged_queue_fail) { logged_queue_fail = true; STAR_LOG("try_init_dx12: queue->GetDevice failed"); }
+        }
+    }
 }
 #endif
 

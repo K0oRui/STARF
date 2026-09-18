@@ -1,6 +1,5 @@
 #include "steam/steam_ugc.h"
 #include "core/callbacks.h"
-#include "steam/isteamugc.h"
 
 StarSteamUGC& StarSteamUGC::get() { static StarSteamUGC i; return i; }
 UGCQueryHandle_t StarSteamUGC::CreateQueryUserUGCRequest(AccountID_t a, EUserUGCList b, EUGCMatchingUGCType c, EUserUGCListSortOrder d, AppId_t e, AppId_t f, uint32 g) { STAR_UNREFERENCED(a); STAR_UNREFERENCED(b); STAR_UNREFERENCED(c); STAR_UNREFERENCED(d); STAR_UNREFERENCED(e); STAR_UNREFERENCED(f); STAR_UNREFERENCED(g); return k_UGCQueryHandleInvalid; }

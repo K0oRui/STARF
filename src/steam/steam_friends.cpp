@@ -1,7 +1,6 @@
 #include "steam/steam_friends.h"
 #include "core/callbacks.h"
 #include "core/settings.h"
-#include "steam/isteamfriends.h"
 #include "overlay/overlay.h"
 
 // Game asked for an overlay page (Achievements, Stats, ...): open our panel.

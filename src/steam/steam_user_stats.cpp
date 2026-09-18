@@ -4,7 +4,6 @@
 #include "core/storage.h"
 #include "steam/steam_utils.h"
 #include "overlay/overlay.h"
-#include "steam/isteamuserstats.h"
 #include <thread>
 #include <mmsystem.h>
 
