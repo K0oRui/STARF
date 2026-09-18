@@ -35,8 +35,7 @@ void StarOverlay::render_panel()
 
     ImGuiWindowFlags wf = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
         | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar
-        | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar
-        | ImGuiWindowFlags_NoScrollWithMouse;
+        | ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     ImGui::Begin("##star_sidebar", nullptr, wf);
 
