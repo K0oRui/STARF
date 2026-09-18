@@ -99,19 +99,24 @@ Supports DX9, DX11, DX12, OpenGL, and Vulkan. Hooks the present call via MinHook
 
 Requires MSVC and CMake 3.16+. All dependencies pull in automatically via FetchContent.
 
+**Both architectures, packaged to `dist/`:**
+```
+.\scripts\build_dist.ps1
+```
+
 **x64 (steam_api64.dll):**
 ```
-cmake -B build64 -A x64
-cmake --build build64 --config Release
+cmake --preset x64
+cmake --build --preset x64-release
 ```
 
 **x86 (steam_api.dll):**
 ```
-cmake -B build -A Win32
-cmake --build build --config Release
+cmake --preset x86
+cmake --build --preset x86-release
 ```
 
-Output lands in `build64/Release/steam_api64.dll` or `build/Release/steam_api.dll`.
+Output lands in `build/x64/Release/steam_api64.dll` or `build/x86/Release/steam_api.dll`. `cmake --install build/x64 --config Release --prefix dist` copies it to `dist/`.
 
 ---
 

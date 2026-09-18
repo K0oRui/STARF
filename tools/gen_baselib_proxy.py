@@ -80,8 +80,8 @@ def main():
                     help="output .def path (default: src/proxy/baselib.def)")
     ap.add_argument("--build", action="store_true",
                     help="after writing the .def, build the baselib_proxy target")
-    ap.add_argument("--build-dir", default=os.path.join(repo_root, "build"),
-                    help="CMake build dir to use with --build (default: build)")
+    ap.add_argument("--build-dir", default=os.path.join(repo_root, "build", "x64"),
+                    help="CMake build dir to use with --build (default: build/x64)")
     ap.add_argument("--config", default="Release", help="CMake config for --build (default: Release)")
     args = ap.parse_args()
 

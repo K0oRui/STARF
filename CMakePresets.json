@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "x86",
+      "displayName": "x86 (32-bit)",
+      "description": "32-bit build producing steam_api.dll",
+      "binaryDir": "${sourceDir}/build/x86",
+      "architecture": "Win32"
+    },
+    {
+      "name": "x64",
+      "displayName": "x64 (64-bit)",
+      "description": "64-bit build producing steam_api64.dll",
+      "binaryDir": "${sourceDir}/build/x64",
+      "architecture": "x64"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "x86-release",
+      "configurePreset": "x86",
+      "configuration": "Release"
+    },
+    {
+      "name": "x86-debug",
+      "configurePreset": "x86",
+      "configuration": "Debug"
+    },
+    {
+      "name": "x64-release",
+      "configurePreset": "x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "x64-debug",
+      "configurePreset": "x64",
+      "configuration": "Debug"
+    }
+  ]
+}
