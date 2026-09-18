@@ -9,7 +9,7 @@
 static void open_overlay_panel(const char* what)
 {
     STAR_LOG("ActivateGameOverlay: %s", what ? what : "(null)");
-    auto& o = StarOverlay::get();
+    auto& o = Overlay::get();
     if (o.is_enabled()) o.open_panel();
 }
 

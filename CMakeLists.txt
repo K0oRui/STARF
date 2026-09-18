@@ -86,8 +86,25 @@ set(STAR_SOURCES
     src/core/star_api.cpp
     src/core/star_flat_stubs.cpp
     src/core/storage.cpp
-    src/overlay/overlay.cpp
-    src/overlay/external.cpp
+    src/overlay/core/overlay.cpp
+    src/overlay/core/notes_store.cpp
+    src/overlay/core/overlay_window.cpp
+    src/overlay/core/overlay_input.cpp
+    src/overlay/core/overlay_util.cpp
+    src/overlay/ui/overlay_ui.cpp
+    src/overlay/ui/overlay_style.cpp
+    src/overlay/ui/overlay_icons.cpp
+    src/overlay/ui/icon_cache.cpp
+    src/overlay/ui/overlay_panel.cpp
+    src/overlay/capture/overlay_screenshot.cpp
+    src/overlay/capture/screenshot_service.cpp
+    src/overlay/capture/overlay_capture.cpp
+    src/overlay/backends/backend_dx9.cpp
+    src/overlay/backends/backend_dx11.cpp
+    src/overlay/backends/backend_dx12.cpp
+    src/overlay/backends/backend_opengl.cpp
+    src/overlay/backends/backend_vulkan.cpp
+    src/overlay/external/external.cpp
     src/steam/steam_applist.cpp
     src/steam/steam_apps.cpp
     src/steam/steam_client.cpp

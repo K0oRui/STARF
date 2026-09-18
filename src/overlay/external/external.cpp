@@ -2,7 +2,7 @@
 // (or D3D9 for DX9 games) on its own thread. Zero hooks into game rendering,
 // for hostile titles (e.g. engines whose backbuffers fault on foreign access).
 // Reuses the same panel/toast/HUD/icon code as the hook path.
-#include "overlay.h"
+#include "overlay/overlay_internal.h"
 #include "core/settings.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -15,8 +15,6 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
-static float ext_clamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
-
 struct FindGameCtx {    DWORD pid = 0;
     HWND self = nullptr;
     HWND best = nullptr;
@@ -417,18 +415,7 @@ void StarOverlay::external_render_frame()
     ImGui::NewFrame();
     apply_cursor_mode();
 
-    float dt = ImGui::GetIO().DeltaTime;
-    if (dt <= 0.f) dt = 0.0167f;
-
-    float target = open_ ? 1.f : 0.f;
-    panel_anim_ += (target - panel_anim_) * ext_clamp01(12.f * dt);
-    panel_anim_  = ext_clamp01(panel_anim_);
-
-    if (panel_anim_ > 0.001f) render_panel();
-    render_notifications(dt);
-    render_hud();
-
-    ImGui::Render();
+    build_frame_ui();
     {
         static bool logged_frame = false;
         if (!logged_frame) {
@@ -544,7 +531,7 @@ void StarOverlay::external_thread_proc()
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    setup_imgui_style_and_fonts();
+    style_.setup();
     ImGui_ImplWin32_Init(ext_hwnd_);
     bool imgui_ok = ext_use_d3d9_
         ? ImGui_ImplDX9_Init(ext_d3d9_dev_)
@@ -590,16 +577,14 @@ void StarOverlay::external_thread_proc()
 
         // Screenshots have no present hook to ride on here: consume directly.
         // Duplication never touches game state, so this is always safe.
-        if (screenshot_requested_.exchange(false))
+        if (screenshots_.consume())
             capture_desktop_duplication();
 
         if ((frame++ % 30) == 0) external_track_game_window();
 
         bool want = fg_ok_ && open_;
         if (!want && fg_ok_) {
-            std::unique_lock<std::mutex> nlock(notif_mutex_, std::try_to_lock);
-            if (nlock.owns_lock()) want = !notifications_.empty();
-            else want = true;
+            want = notifications_.has_pending();
             if (!want)
                 want = Settings::get().overlay_show_fps || Settings::get().overlay_show_playtime;
         }
@@ -629,9 +614,8 @@ void StarOverlay::external_thread_proc()
         active_api_ = GraphicsAPI::None;
     }
     cleanup_rtv();
-    for (auto& [k, v] : icon_textures_) if (v) ((ID3D11ShaderResourceView*)v)->Release();
-    icon_textures_.clear();
-    gl_icon_textures_.clear();
+    icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
+    icons_.clear_gl();
     if (ext_use_d3d9_) {
         if (ext_d3d9_dev_) { ext_d3d9_dev_->Release(); ext_d3d9_dev_ = nullptr; }
         ext_use_d3d9_ = false;

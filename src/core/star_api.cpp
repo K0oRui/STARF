@@ -136,7 +136,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         break;
     case DLL_PROCESS_DETACH:
         if (lpReserved == nullptr && g_initialized) {
-            StarOverlay::get().shutdown();
+            Overlay::get().shutdown();
             CoUninitialize();
             g_initialized = false;
         }
@@ -196,7 +196,7 @@ static bool star_init_internal()
     stats_recv.m_steamIDUser = CSteamID(Settings::get().steam_id);
     STAR_PostCallback(UserStatsReceived_t::k_iCallback, &stats_recv, sizeof(stats_recv));
 
-    StarOverlay::get().init();
+    Overlay::get().init();
 
     g_initialized = true;
     STAR_LOG("STAR initialized: AppID=%u SteamID=%llu Name=%s",
@@ -245,7 +245,7 @@ STAR_EXPORT ESteamAPIInitResult SteamInternal_SteamAPI_Init(const char* pszInter
 STAR_EXPORT void SteamAPI_Shutdown()
 {
     if (!g_initialized) return;
-    StarOverlay::get().shutdown();
+    Overlay::get().shutdown();
     CoUninitialize();
     g_initialized = false;
     STAR_LOG("SteamAPI_Shutdown");
