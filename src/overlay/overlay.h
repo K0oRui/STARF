@@ -254,8 +254,6 @@ private:
     std::atomic<bool> retry_stop_{ false };
     bool  open_              = false;
     float panel_anim_        = 0.0f;
-    float scroll_target_y_   = -1.0f;
-    float scroll_current_y_  = 0.0f;
     int   cursor_show_count_offset_ = 0;
 
     char  achievement_filter_[64] = {};

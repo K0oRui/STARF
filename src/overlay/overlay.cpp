@@ -1371,11 +1371,10 @@ void StarOverlay::render_panel()
 
     ImGuiWindowFlags wf = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
         | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar
-        | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoScrollbar
-        | ImGuiWindowFlags_NoScrollWithMouse;
+        | ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     ImGui::Begin("##star_sidebar", nullptr, wf);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
     ImVec2      wp = ImGui::GetWindowPos();
 
     ImGui::PushFont(ftitle);
@@ -1672,8 +1671,8 @@ void StarOverlay::render_panel()
         float pct = (float)done / (float)total;
         ImVec2 cur = ImGui::GetCursorScreenPos();
         float  bw  = PW - 28.f;
-        dl->AddRectFilled(cur, {cur.x+bw, cur.y+3.f}, col(P_SEP, 0.6f), 2.f);
-        dl->AddRectFilled(cur, {cur.x+bw*pct, cur.y+3.f}, acc(0.9f), 2.f);
+        wdl->AddRectFilled(cur, {cur.x+bw, cur.y+3.f}, col(P_SEP, 0.6f), 2.f);
+        wdl->AddRectFilled(cur, {cur.x+bw*pct, cur.y+3.f}, acc(0.9f), 2.f);
         ImGui::Dummy({bw, 5.f});
 
         // Bulk actions (confirmation modal guards misclicks).
@@ -1810,7 +1809,7 @@ void StarOverlay::render_panel()
                 STAR_LOG("Overlay accent -> %s", s.overlay_accent.c_str());
             }
             if (s.overlay_accent == swatches[i].name)
-                dl->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), acc(1.f), 4.f, 0, 2.f);
+                wdl->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), acc(1.f), 4.f, 0, 2.f);
             ImGui::PopID();
         }
 
@@ -1865,7 +1864,7 @@ void StarOverlay::render_panel()
                 ImGui::PopStyleVar();
                 ImGui::PopStyleColor(4);
                 if (active)
-                    dl->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), acc(0.7f), 3.f, 0, 1.5f);
+                    wdl->AddRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), acc(0.7f), 3.f, 0, 1.5f);
             }
         }
     }
@@ -1933,39 +1932,9 @@ void StarOverlay::render_panel()
     ImGui::Spacing();
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.f, 0.f});
-    ImGui::BeginChild("##ach", {0, 0}, false, 0);
-    {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-
-        float actual_scroll_y = ImGui::GetScrollY();
-        if (scroll_target_y_ < 0.f) {
-            scroll_target_y_ = actual_scroll_y;
-            scroll_current_y_ = actual_scroll_y;
-        }
-        float diff_scroll = actual_scroll_y - scroll_current_y_;
-        if (diff_scroll < 0.f) diff_scroll = -diff_scroll;
-        if (diff_scroll > 2.f) {
-            scroll_target_y_ = actual_scroll_y;
-            scroll_current_y_ = actual_scroll_y;
-        }
-        float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.f && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows)) {
-            scroll_target_y_ -= wheel * 100.f;
-            float max_scroll_y = ImGui::GetScrollMaxY();
-            if (scroll_target_y_ < 0.f) scroll_target_y_ = 0.f;
-            if (scroll_target_y_ > max_scroll_y) scroll_target_y_ = max_scroll_y;
-        }
-        float dt = ImGui::GetIO().DeltaTime;
-        if (dt <= 0.f) dt = 0.0167f;
-        scroll_current_y_ += (scroll_target_y_ - scroll_current_y_) * clamp01(12.f * dt);
-        float diff_target = scroll_current_y_ - scroll_target_y_;
-        if (diff_target < 0.f) diff_target = -diff_target;
-        if (diff_target > 0.1f) {
-            ImGui::SetScrollY(scroll_current_y_);
-        } else {
-            ImGui::SetScrollY(scroll_target_y_);
-            scroll_current_y_ = scroll_target_y_;
-        }
+    float ach_max_h = 400.f * ui_scale_;
+    ImGui::BeginChild("##ach", {0, ach_max_h}, false, 0);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
 
     const float S = ui_scale_;
     const float ROW_BASE = 64.f;
@@ -2121,7 +2090,6 @@ void StarOverlay::render_panel()
         ImGui::PopFont();
     }
 
-    }
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::End();
