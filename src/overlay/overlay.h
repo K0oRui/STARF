@@ -2,6 +2,8 @@
 #include "core/star_common.h"
 #include <atomic>
 #include <thread>
+#include <condition_variable>
+#include <unordered_set>
 #include <dxgi1_4.h>
 #include "imgui.h"
 
@@ -30,6 +32,9 @@ public:
                            bool summary = false);
 
     void request_screenshot();
+
+    void enqueue_icon_decode(const std::string& path, const std::string& key,
+                             const std::string& toast_title = "");
 
     void note_session_unlock() { session_unlocks_++; }
     void note_session_revoke() { if (session_unlocks_ > 0) session_unlocks_--; }
@@ -306,6 +311,27 @@ private:
     std::mutex                        notif_mutex_;
     std::vector<AchievementNotification> notifications_;
     std::unordered_map<std::string, ImTextureID> icon_textures_;
+
+    struct IconDecodeRequest {
+        std::string path;
+        std::string key;
+        std::string toast_title;
+    };
+    struct IconDecodeResult {
+        std::string key;
+        std::string toast_title;
+        std::vector<uint8_t> rgba;
+        int w = 0, h = 0;
+    };
+    std::deque<IconDecodeRequest> icon_decode_queue_;
+    std::vector<IconDecodeResult> icon_decode_ready_;
+    std::unordered_set<std::string> icon_decode_pending_;
+    std::mutex                    icon_decode_mutex_;
+    std::condition_variable       icon_decode_cv_;
+    std::thread                   icon_decode_thread_;
+    bool                          icon_decode_stop_ = false;
+    void drain_icon_decodes();
+    void icon_decode_worker();
 
     using PresentFn       = HRESULT (STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
     using Present1Fn      = HRESULT (STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);

@@ -433,6 +433,8 @@ void StarOverlay::init()
     // "auto" (default) starts on hooks and falls back to external if the
     // title proves hostile (see switch_to_external).
     if (!enabled_) return;
+    icon_decode_stop_ = false;
+    icon_decode_thread_ = std::thread(&StarOverlay::icon_decode_worker, this);
     fallback_count_ = Settings::get().overlay_fallback_count;
     fallback_level_ = Settings::get().overlay_fallback_level;
     retry_session_ = false;
@@ -699,6 +701,14 @@ void StarOverlay::shutdown()
         save_overlay_key("fallback_count", "0");
         save_overlay_key("fallback_level", "0");
         STAR_LOG("Overlay retry session clean - backoff cleared");
+    }
+    if (icon_decode_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+            icon_decode_stop_ = true;
+        }
+        icon_decode_cv_.notify_all();
+        icon_decode_thread_.join();
     }
     if (mode_ == OverlayMode::External && ext_thread_) {
         ext_stop_ = true;
@@ -1053,7 +1063,7 @@ ImTextureID StarOverlay::get_or_create_icon(
             }
         }
     }
-    icon_textures_[key] = tex_id;
+    if (tex_id) icon_textures_[key] = tex_id;
     return tex_id;
 }
 
@@ -1227,6 +1237,7 @@ void StarOverlay::render_hud()
 
 void StarOverlay::render_notifications(float dt)
 {
+    drain_icon_decodes();
     std::vector<AchievementNotification> notifs;
     {
         std::lock_guard<std::mutex> lock(notif_mutex_);
@@ -1497,9 +1508,7 @@ void StarOverlay::render_panel()
                 }
                 if (e.iw <= 0 || e.ih <= 0) continue;
                 if (icon_textures_.find("shot_" + e.name) != icon_textures_.end()) continue;
-                std::vector<uint8_t> rgba; int iw = 0, ih = 0;
-                if (StarSteamUtils::get().LoadIconFile(e.path, rgba, iw, ih))
-                    get_or_create_icon("shot_" + e.name, rgba, iw, ih);
+                enqueue_icon_decode(e.path, "shot_" + e.name);
             }
         }
 
@@ -2012,7 +2021,6 @@ void StarOverlay::render_panel()
         if (icit != icon_textures_.end()) {
             icon_tex = icit->second;
         } else {
-            std::vector<uint8_t> rgba; int iw = 0, ih = 0;
             // Preferred icon for this state, falling back to the other one so a
             // missing icongray doesn't grey out everything.
             std::string icon_path = got ? def.icon_path : def.icon_gray_path;
@@ -2020,10 +2028,8 @@ void StarOverlay::render_panel()
             if (!icon_path.empty()) {
                 std::string full = Settings::get().settings_dir + "\\" + icon_path;
                 for (char& c : full) if (c == '/') c = '\\';
-                if (!StarSteamUtils::get().LoadIconFile(full, rgba, iw, ih))
-                    STAR_LOG("Overlay: icon load failed: %s", full.c_str());
+                enqueue_icon_decode(full, ikey);
             }
-            icon_tex = get_or_create_icon(ikey, rgba, iw, ih);
         }
         if (icon_tex) {
             dl->AddImageRounded(icon_tex,
@@ -2177,18 +2183,81 @@ void StarOverlay::notify_screenshot(const std::string& file, bool dark)
     std::string name = file;
     size_t slash = name.find_last_of("\\/");
     if (slash != std::string::npos) name = name.substr(slash + 1);
-    // Thumbnail preview so the toast isn't a grey box.
-    std::vector<uint8_t> icon_rgba;
-    int iw = 0, ih = 0;
-    StarSteamUtils::get().LoadIconFile(file, icon_rgba, iw, ih);
+    // Toast shows immediately; the thumbnail arrives when the background
+    // decode finishes.
     push_achievement(name,
         dark ? "All black? Try Borderless mode."
              : "Saved to " + screenshots_dir(),
-        icon_rgba, iw, ih, "SCREENSHOT SAVED");
+        {}, 0, 0, "SCREENSHOT SAVED");
+    enqueue_icon_decode(file, name, name);
     // Pop the viewer so the user gets an instant preview on next panel open.
     viewer_file_ = file;
     viewer_pending_ = true;
     STAR_LOG("Screenshot saved: %s", file.c_str());
+}
+
+void StarOverlay::enqueue_icon_decode(const std::string& path, const std::string& key,
+                                      const std::string& toast_title)
+{
+    if (path.empty() || key.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+        if (!icon_decode_pending_.insert(key).second) return;
+        icon_decode_queue_.push_back({path, key, toast_title});
+    }
+    icon_decode_cv_.notify_one();
+}
+
+void StarOverlay::icon_decode_worker()
+{
+    for (;;) {
+        IconDecodeRequest req;
+        {
+            std::unique_lock<std::mutex> lock(icon_decode_mutex_);
+            icon_decode_cv_.wait(lock, [&] {
+                return icon_decode_stop_ || !icon_decode_queue_.empty();
+            });
+            if (icon_decode_stop_ && icon_decode_queue_.empty()) break;
+            req = std::move(icon_decode_queue_.front());
+            icon_decode_queue_.pop_front();
+        }
+        IconDecodeResult res;
+        res.key = req.key;
+        res.toast_title = req.toast_title;
+        StarSteamUtils::get().LoadIconFile(req.path, res.rgba, res.w, res.h);
+        {
+            std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+            icon_decode_ready_.push_back(std::move(res));
+        }
+    }
+}
+
+void StarOverlay::drain_icon_decodes()
+{
+    std::vector<IconDecodeResult> ready;
+    {
+        std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+        ready.swap(icon_decode_ready_);
+    }
+    for (auto& r : ready) {
+        if (r.w > 0 && r.h > 0 && !r.rgba.empty())
+            get_or_create_icon(r.key, r.rgba, r.w, r.h);
+        if (!r.toast_title.empty()) {
+            std::lock_guard<std::mutex> lock(notif_mutex_);
+            for (auto& n : notifications_) {
+                if (n.title == r.toast_title) {
+                    n.icon_rgba = std::move(r.rgba);
+                    n.icon_width = r.w;
+                    n.icon_height = r.h;
+                    break;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+            icon_decode_pending_.erase(r.key);
+        }
+    }
 }
 
 bool StarOverlay::save_rgba_png(const std::string& path, const uint8_t* rgba, int w, int h)

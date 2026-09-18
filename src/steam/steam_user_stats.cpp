@@ -299,17 +299,15 @@ void StarSteamUserStats::notify_achievement_unlock(const std::string& name, bool
     auto& defs = Settings::get().achievements;
     for (auto& def : defs) {
         if (def.name == name) {
-
-            std::vector<uint8_t> icon_rgba;
-            int icon_w = 0, icon_h = 0;
+            if (with_sound) play_achievement_sound();
             if (!def.icon_path.empty()) {
                 std::string full_path = Settings::get().settings_dir + "\\" + def.icon_path;
-
                 for (char& c : full_path) if (c == '/') c = '\\';
-                StarSteamUtils::get().LoadIconFile(full_path, icon_rgba, icon_w, icon_h);
+                StarOverlay::get().push_achievement(def.display_name, def.description, {}, 0, 0);
+                StarOverlay::get().enqueue_icon_decode(full_path, def.display_name, def.display_name);
+            } else {
+                StarOverlay::get().push_achievement(def.display_name, def.description, {}, 0, 0);
             }
-            if (with_sound) play_achievement_sound();
-            StarOverlay::get().push_achievement(def.display_name, def.description, icon_rgba, icon_w, icon_h);
             return;
         }
     }
