@@ -36,7 +36,7 @@ void StarOverlay::render_frame_dx10(IDXGISwapChain* chain)
 {
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    if (!imgui_initialized_) return;
+    if (!imgui_initialized_ || active_api_ != GraphicsAPI::DX10) return;
 
     if (!dx10_rtv_) {
         ID3D10Texture2D* bb = nullptr;
@@ -47,9 +47,9 @@ void StarOverlay::render_frame_dx10(IDXGISwapChain* chain)
     }
     if (!dx10_rtv_) return;
 
-    ID3D10RenderTargetView* prev_rtv = nullptr;
+    ID3D10RenderTargetView* prev_rtvs[D3D10_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     ID3D10DepthStencilView* prev_dsv = nullptr;
-    dx10_device_->OMGetRenderTargets(1, &prev_rtv, &prev_dsv);
+    dx10_device_->OMGetRenderTargets(D3D10_SIMULTANEOUS_RENDER_TARGET_COUNT, prev_rtvs, &prev_dsv);
 
     dx10_device_->OMSetRenderTargets(1, &dx10_rtv_, nullptr);
 
@@ -61,8 +61,8 @@ void StarOverlay::render_frame_dx10(IDXGISwapChain* chain)
     build_frame_ui();
     ImGui_ImplDX10_RenderDrawData(ImGui::GetDrawData());
 
-    dx10_device_->OMSetRenderTargets(1, &prev_rtv, prev_dsv);
-    if (prev_rtv) prev_rtv->Release();
+    dx10_device_->OMSetRenderTargets(D3D10_SIMULTANEOUS_RENDER_TARGET_COUNT, prev_rtvs, prev_dsv);
+    for (auto* view : prev_rtvs) if (view) view->Release();
     if (prev_dsv) prev_dsv->Release();
 
     maybe_capture_dx10(chain);

@@ -2,6 +2,7 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx10.h"
 #include "imgui_impl_dx11.h"
+#include "imgui_impl_dx12.h"
 #include <MinHook.h>
 #include <d3d10.h>
 #include <d3d11.h>
@@ -139,6 +140,8 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
     // visible window + D3D11 splash/helper). Log EVERY chain once so we can
     // tell which API the visible (foreground) window truly presents.
     {
+        static std::mutex probe_mutex;
+        std::lock_guard<std::mutex> probe_lock(probe_mutex);
         static std::set<IDXGISwapChain*> probed{};
         if (probed.insert(chain).second) {
             DXGI_SWAP_CHAIN_DESC sd{};
@@ -181,6 +184,8 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
     }
 
     if (!imgui_initialized_) {
+        std::unique_lock<std::mutex> init_lock(render_mutex_, std::try_to_lock);
+        if (!init_lock.owns_lock() || imgui_initialized_) return;
         static bool logged_attempt = false;
         if (!logged_attempt) { logged_attempt = true; STAR_LOG("on_present: attempting imgui init"); }
         if (this_api == GraphicsAPI::DX11) {
@@ -232,8 +237,17 @@ void StarOverlay::on_resize_buffers(IDXGISwapChain* sc, UINT bc, UINT w, UINT h,
         cleanup_dx10_rtv();
 #ifdef _WIN64
     } else if (active_api_ == GraphicsAPI::DX12) {
+        if (sc != dx12_chain_) return;
+        wait_dx12_idle();
+        if (imgui_initialized_) {
+            ImGui_ImplDX12_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+        }
+        icons_.clear();
         cleanup_dx12();
         imgui_initialized_ = false;
+        active_api_ = GraphicsAPI::None;
 #endif
     }
 }

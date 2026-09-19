@@ -2,21 +2,14 @@
 #include "dx8/imgui_impl_dx8.h"
 #include "imgui_impl_win32.h"
 #include <MinHook.h>
-#include "d3d8.h"
+#include "dx8/d3d8.h"
 
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_DX8Present(IDirect3DDevice8* device, const RECT* src, const RECT* dst, HWND window, const RGNDATA* rgn)
 {
-    static volatile LONG dbg_hook_calls = 0;
-    LONG n = InterlockedIncrement(&dbg_hook_calls);
-    bool loud = (g_overlay && (g_overlay->open_ || (n % 120) == 1));
-    unsigned long tid = (unsigned long)GetCurrentThreadId();
-    if (loud) STAR_LOG("DX8 hook enter n=%ld tid=%lu", n, tid);
     if (g_overlay) g_overlay->on_present_dx8(device);
-    if (loud) STAR_LOG("DX8 hook pre-orig n=%ld tid=%lu", n, tid);
-    HRESULT hr = g_overlay ? g_overlay->orig_dx8_present_(device, src, dst, window, rgn) : S_OK;
-    if (loud) STAR_LOG("DX8 hook post-orig n=%ld hr=0x%08x tid=%lu", n, (unsigned)hr, tid);
-    return hr;
+    return g_overlay && g_overlay->orig_dx8_present_
+        ? g_overlay->orig_dx8_present_(device, src, dst, window, rgn) : E_FAIL;
 }
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_DX8Reset(IDirect3DDevice8* device, void* params)
@@ -92,17 +85,19 @@ void StarOverlay::on_present_dx8(IDirect3DDevice8* device)
         STAR_LOG("Game graphics API: DirectX 8");
     }
     if (mode_ == OverlayMode::External) return;
-    dx8_device_ = device;
-    {
-        D3DDEVICE_CREATION_PARAMETERS cp{};
-        if (SUCCEEDED(device->GetCreationParameters(&cp))) hook_window_for(cp.hFocusWindow);
-    }
 
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        if (open_) STAR_LOG("DX8 lock busy tid=%lu", (unsigned long)GetCurrentThreadId());
-        return;
+    if (!lock.owns_lock()) return;
+    if (imgui_initialized_ && active_api_ != GraphicsAPI::DX8) return;
+    if (imgui_initialized_ && dx8_device_ != device) {
+        release_icons_dx8();
+        ImGui_ImplDX8_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        imgui_initialized_ = false;
+        active_api_ = GraphicsAPI::None;
     }
+    dx8_device_ = device;
 
     if (!imgui_initialized_) {
         D3DDEVICE_CREATION_PARAMETERS cp{};
@@ -112,7 +107,7 @@ void StarOverlay::on_present_dx8(IDirect3DDevice8* device)
         hook_window_for(new_hwnd);
 
         ImGui::CreateContext();
-        ImGui_ImplWin32_Init(hwnd_);
+        if (!ImGui_ImplWin32_Init(hwnd_)) { ImGui::DestroyContext(); return; }
 
         if (ImGui_ImplDX8_Init(device)) {
             style_.setup();
@@ -120,50 +115,25 @@ void StarOverlay::on_present_dx8(IDirect3DDevice8* device)
             active_api_ = GraphicsAPI::DX8;
             STAR_LOG("ImGui ready (DX8) hwnd=%p", hwnd_);
         } else {
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
             STAR_LOG("ImGui DX8 init FAILED");
         }
     }
 
     if (imgui_initialized_ && active_api_ == GraphicsAPI::DX8) {
-        static volatile LONG dbg_calls = 0;
-        static DWORD dbg_t0 = 0;
-        if (dbg_t0 == 0) dbg_t0 = GetTickCount();
-        LONG call = InterlockedIncrement(&dbg_calls);
-        bool dbg = (open_ || (call % 120) == 1);
-        if (dbg) STAR_LOG("DX8 present call=%ld frame t+%lums tid=%lu", call, (unsigned long)(GetTickCount() - dbg_t0), (unsigned long)GetCurrentThreadId());
-        ImGui_ImplDX8_NewFrame();
+        if (!ImGui_ImplDX8_NewFrame()) return;
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
         apply_cursor_mode();
-        if (dbg) STAR_LOG("DX8 cursor ok tid=%lu", (unsigned long)GetCurrentThreadId());
 
         build_frame_ui();
-        if (dbg) STAR_LOG("DX8 ui ok tid=%lu", (unsigned long)GetCurrentThreadId());
 
-        DWORD state_block = 0;
-        if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &state_block))) {
-            device->CaptureStateBlock(state_block);
-        } else {
-            if (dbg) STAR_LOG("DX8 state block create FAILED");
-        }
-        if (dbg) STAR_LOG("DX8 state block ok tid=%lu", (unsigned long)GetCurrentThreadId());
-
-        HRESULT scene_hr = device->BeginScene();
-        if (SUCCEEDED(scene_hr)) {
-            if (dbg) STAR_LOG("DX8 BeginScene ok tid=%lu", (unsigned long)GetCurrentThreadId());
+        // The renderer saves and restores device state itself.
+        if (SUCCEEDED(device->BeginScene())) {
             ImGui_ImplDX8_RenderDrawData(ImGui::GetDrawData());
-            if (dbg) STAR_LOG("DX8 RenderDrawData ok tid=%lu", (unsigned long)GetCurrentThreadId());
             device->EndScene();
-            if (dbg) STAR_LOG("DX8 EndScene ok tid=%lu", (unsigned long)GetCurrentThreadId());
-        } else {
-            if (dbg) STAR_LOG("DX8 BeginScene FAILED hr=0x%08x", (unsigned)scene_hr);
         }
-
-        if (state_block) {
-            device->ApplyStateBlock(state_block);
-            device->DeleteStateBlock(state_block);
-        }
-        if (dbg) STAR_LOG("DX8 apply ok tid=%lu", (unsigned long)GetCurrentThreadId());
 
         maybe_capture_dx8(device);
     }

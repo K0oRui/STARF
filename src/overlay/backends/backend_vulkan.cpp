@@ -4,6 +4,7 @@
 #include "imgui_impl_vulkan.h"
 #include <MinHook.h>
 #include <vulkan/vulkan.h>
+#include <memory>
 
 #define VULKAN_FUNCS \
     VK_FUNC(vkGetInstanceProcAddr) \
@@ -53,6 +54,9 @@
     VK_FUNC(vkGetImageMemoryRequirements) \
     VK_FUNC(vkCreateSampler) \
     VK_FUNC(vkDestroySampler) \
+    VK_FUNC(vkCreateSemaphore) \
+    VK_FUNC(vkDestroySemaphore) \
+    VK_FUNC(vkResetFences) \
     VK_FUNC(vkCreateFence) \
     VK_FUNC(vkWaitForFences) \
     VK_FUNC(vkDestroyFence) \
@@ -126,6 +130,12 @@ struct VulkanOverlayData {
     std::vector<VkFramebuffer> framebuffers;
     std::vector<VkImageView> image_views;
     uint32_t image_count = 0;
+    uint32_t next_frame = 0;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkExtent2D extent{};
+    std::vector<VkFence> fences;
+    std::vector<VkSemaphore> present_ready;
+    bool failed = false;
     VkSampler icon_sampler = VK_NULL_HANDLE;
     std::vector<VkImage>        icon_images;
     std::vector<VkDeviceMemory> icon_memories;
@@ -134,19 +144,23 @@ struct VulkanOverlayData {
     void cleanup() {
         if (device) {
             if (vkDeviceWaitIdle) vkDeviceWaitIdle(device);
+            for (auto fence : fences) if (fence) vkDestroyFence(device, fence, nullptr);
+            fences.clear();
+            for (auto semaphore : present_ready) if (semaphore) vkDestroySemaphore(device, semaphore, nullptr);
+            present_ready.clear();
             for (auto v : icon_views)    if (v && vkDestroyImageView) vkDestroyImageView(device, v, nullptr);
             icon_views.clear();
-            for (auto m : icon_memories) if (m && vkFreeMemory)       vkFreeMemory(device, m, nullptr);
-            icon_memories.clear();
-            for (auto i : icon_images)   if (i && vkDestroyImage)     vkDestroyImage(device, i, nullptr);
+            for (auto i : icon_images) if (i) vkDestroyImage(device, i, nullptr);
             icon_images.clear();
+            for (auto m : icon_memories) if (m) vkFreeMemory(device, m, nullptr);
+            icon_memories.clear();
             if (icon_sampler && vkDestroySampler) vkDestroySampler(device, icon_sampler, nullptr);
             icon_sampler = VK_NULL_HANDLE;
             for (auto fb : framebuffers) if (fb && vkDestroyFramebuffer) vkDestroyFramebuffer(device, fb, nullptr);
             framebuffers.clear();
             for (auto iv : image_views) if (iv && vkDestroyImageView) vkDestroyImageView(device, iv, nullptr);
             image_views.clear();
-            if (vkFreeCommandBuffers && command_pool) {
+            if (vkFreeCommandBuffers && command_pool && !command_buffers.empty()) {
                 vkFreeCommandBuffers(device, command_pool, (uint32_t)command_buffers.size(), command_buffers.data());
             }
             command_buffers.clear();
@@ -163,44 +177,48 @@ struct VulkanOverlayData {
     }
 };
 
-int StarOverlay::hooked_vkCreateInstance(const void* pCreateInfo, const void* pAllocator, void** pInstance)
+int WINAPI StarOverlay::hooked_vkCreateInstance(const void* pCreateInfo, const void* pAllocator, void** pInstance)
 {
     typedef VkResult(VKAPI_PTR* PFN_vkCreateInstance)(const void*, const void*, void**);
     auto orig = (PFN_vkCreateInstance)g_overlay->orig_vkCreateInstance_;
     VkResult res = orig(pCreateInfo, pAllocator, pInstance);
     if (res == VK_SUCCESS && pInstance && g_overlay) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
         g_overlay->vk_instance_ = *pInstance;
         g_vk_instance = (VkInstance)*pInstance;
     }
     return res;
 }
 
-int StarOverlay::hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice)
+int WINAPI StarOverlay::hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice)
 {
     typedef VkResult(VKAPI_PTR* PFN_vkCreateDevice)(void*, const void*, const void*, void**);
     auto orig = (PFN_vkCreateDevice)g_overlay->orig_vkCreateDevice_;
     VkResult res = orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
     if (res == VK_SUCCESS && pDevice && g_overlay) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
         g_overlay->vk_physical_device_ = physicalDevice;
         g_overlay->vk_device_ = *pDevice;
-        g_overlay->vk_queue_family_ = 0;
 
-        struct FakeQueueCreateInfo {
-            int sType;
-            const void* pNext;
-            int flags;
-            uint32_t queueFamilyIndex;
-        };
-        struct FakeCreateInfo {
-            int sType;
-            const void* pNext;
-            int flags;
-            uint32_t queueCreateInfoCount;
-            const FakeQueueCreateInfo* pQueueCreateInfos;
-        };
-        auto* ci = (const FakeCreateInfo*)pCreateInfo;
-        if (ci && ci->queueCreateInfoCount > 0 && ci->pQueueCreateInfos) {
-            g_overlay->vk_queue_family_ = ci->pQueueCreateInfos[0].queueFamilyIndex;
+        auto* ci = static_cast<const VkDeviceCreateInfo*>(pCreateInfo);
+        g_overlay->vk_queue_family_ = UINT32_MAX;
+        // Only a captured graphics queue is eligible for native rendering.
+        auto module = GetModuleHandleA("vulkan-1.dll");
+        auto get_properties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)GetProcAddress(module, "vkGetPhysicalDeviceQueueFamilyProperties");
+        auto get_queue = (PFN_vkGetDeviceQueue)GetProcAddress(module, "vkGetDeviceQueue");
+        if (ci && get_properties && get_queue && ci->queueCreateInfoCount == 1) {
+            uint32_t count = 0;
+            get_properties((VkPhysicalDevice)physicalDevice, &count, nullptr);
+            std::vector<VkQueueFamilyProperties> families(count);
+            get_properties((VkPhysicalDevice)physicalDevice, &count, families.data());
+            const auto& qci = ci->pQueueCreateInfos[0];
+            if (!qci.flags && qci.queueFamilyIndex < count &&
+                (families[qci.queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                g_overlay->vk_queue_family_ = qci.queueFamilyIndex;
+                VkQueue graphics_queue{};
+                get_queue((VkDevice)*pDevice, qci.queueFamilyIndex, 0, &graphics_queue);
+                g_overlay->vk_queue_ = graphics_queue;
+            }
         }
 
         auto gdpa = (PFN_vkGetDeviceProcAddr)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkGetDeviceProcAddr");
@@ -215,28 +233,25 @@ int StarOverlay::hooked_vkCreateDevice(void* physicalDevice, const void* pCreate
     return res;
 }
 
-int StarOverlay::hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSwapchain)
+int WINAPI StarOverlay::hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSwapchain)
 {
     typedef VkResult(VKAPI_PTR* PFN_vkCreateSwapchainKHR)(void*, const void*, const void*, uint64_t*);
     auto orig = (PFN_vkCreateSwapchainKHR)g_overlay->orig_vkCreateSwapchainKHR_;
     VkResult res = orig ? orig(device, pCreateInfo, pAllocator, pSwapchain)
                         : ((PFN_vkCreateSwapchainKHR)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkCreateSwapchainKHR"))(device, pCreateInfo, pAllocator, pSwapchain);
     if (res == VK_SUCCESS && pSwapchain && g_overlay) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
         // Recovery: if vkCreateDevice was missed (game init before SteamAPI_Init),
         // this still gives us the VkDevice for on_present_vulkan.
         if (device) g_overlay->vk_device_ = device;
-        struct FakeSwapchainCreateInfo {
-            int sType;
-            const void* pNext;
-            int flags;
-            void* surface;
-            uint32_t minImageCount;
-            int imageFormat;
-        };
-        auto* ci = (const FakeSwapchainCreateInfo*)pCreateInfo;
+        auto* ci = static_cast<const VkSwapchainCreateInfoKHR*>(pCreateInfo);
         if (ci) {
             g_overlay->vk_swapchain_format_ = ci->imageFormat;
             g_overlay->vk_min_image_count_ = ci->minImageCount;
+            g_overlay->vk_width_ = ci->imageExtent.width;
+            g_overlay->vk_height_ = ci->imageExtent.height;
+            g_overlay->vk_image_usage_ = ci->imageUsage;
+            g_overlay->vk_swapchain_ = (void*)(uintptr_t)*pSwapchain;
         }
         g_overlay->vk_swapchain_recreated_ = true;
         STAR_LOG("Vulkan swapchain created fmt=%d count=%u device=%p", g_overlay->vk_swapchain_format_, (unsigned)g_overlay->vk_min_image_count_, device);
@@ -244,34 +259,66 @@ int StarOverlay::hooked_vkCreateSwapchainKHR(void* device, const void* pCreateIn
     return res;
 }
 
-int StarOverlay::hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo)
+void WINAPI StarOverlay::hooked_vkDestroySwapchainKHR(void* device, uint64_t swapchain, const void* allocator)
 {
-    if (g_overlay) {
-        g_overlay->poll_hotkey();
-        g_overlay->note_present();
-        g_overlay->on_present_vulkan(queue, pPresentInfo);
+    if (!g_overlay) return;
+    {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        auto* data = (VulkanOverlayData*)g_overlay->vk_data_;
+        if (data && (uintptr_t)data->swapchain == (uintptr_t)swapchain)
+            g_overlay->cleanup_vulkan();
+        if ((uintptr_t)g_overlay->vk_swapchain_ == (uintptr_t)swapchain) {
+            g_overlay->vk_swapchain_ = nullptr;
+            g_overlay->vk_width_ = g_overlay->vk_height_ = 0;
+        }
     }
-    typedef VkResult(VKAPI_PTR* PFN_vkQueuePresentKHR)(void*, const void*);
-    auto orig = (PFN_vkQueuePresentKHR)g_overlay->orig_vkQueuePresentKHR_;
-    return orig(queue, pPresentInfo);
+    auto original = (PFN_vkDestroySwapchainKHR)g_overlay->orig_vkDestroySwapchainKHR_;
+    original((VkDevice)device, (VkSwapchainKHR)swapchain, (const VkAllocationCallbacks*)allocator);
 }
 
-int StarOverlay::hooked_vkAcquireNextImageKHR(void* device, uint64_t swapchain, uint64_t timeout, void* semaphore, void* fence, uint32_t* pImageIndex)
+void WINAPI StarOverlay::hooked_vkDestroyDevice(void* device, const void* allocator)
 {
-    if (g_overlay) {
-        // Called every frame with the game's device + swapchain. This is the
-        // recovery path for games that init Vulkan before SteamAPI_Init: the
-        // create hooks never fire, but this still gives us the VkDevice.
-        if (!g_overlay->vk_device_) g_overlay->vk_device_ = device;
-        g_overlay->vk_swapchain_ = (void*)swapchain;
+    if (!g_overlay) return;
+    {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        if (device == g_overlay->vk_device_) {
+            g_overlay->cleanup_vulkan();
+            g_overlay->vk_device_ = g_overlay->vk_physical_device_ = g_overlay->vk_queue_ = nullptr;
+        }
     }
-    typedef VkResult(VKAPI_PTR* PFN_vkAcquireNextImageKHR)(void*, uint64_t, uint64_t, void*, void*, uint32_t*);
+    auto original = (PFN_vkDestroyDevice)g_overlay->orig_vkDestroyDevice_;
+    original((VkDevice)device, (const VkAllocationCallbacks*)allocator);
+}
+
+int WINAPI StarOverlay::hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo)
+{
+    auto* overlay = g_overlay;
+    typedef VkResult(VKAPI_PTR* PFN_vkQueuePresentKHR)(VkQueue, const VkPresentInfoKHR*);
+    auto orig = overlay ? (PFN_vkQueuePresentKHR)overlay->orig_vkQueuePresentKHR_ : nullptr;
+    if (!orig)
+        orig = (PFN_vkQueuePresentKHR)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkQueuePresentKHR");
+    if (!orig) return VK_ERROR_INITIALIZATION_FAILED;
+    // Never alter behavior for malformed calls: forward them untouched.
+    if (!overlay || !pPresentInfo) return orig((VkQueue)queue, (const VkPresentInfoKHR*)pPresentInfo);
+    // Forward a private copy: render_frame_vulkan replaces only the wait list.
+    VkPresentInfoKHR present = *static_cast<const VkPresentInfoKHR*>(pPresentInfo);
+    overlay->poll_hotkey();
+    overlay->note_present();
+    overlay->on_present_vulkan(queue, &present);
+    return orig((VkQueue)queue, &present);
+}
+
+int WINAPI StarOverlay::hooked_vkAcquireNextImageKHR(void* device, uint64_t swapchain, uint64_t timeout, uint64_t semaphore, uint64_t fence, uint32_t* pImageIndex)
+{
+    typedef VkResult(VKAPI_PTR* PFN_vkAcquireNextImageKHR)(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t*);
     auto orig = (PFN_vkAcquireNextImageKHR)g_overlay->orig_vkAcquireNextImageKHR_;
     return orig(device, swapchain, timeout, semaphore, fence, pImageIndex);
 }
 
 void StarOverlay::hook_vulkan()
 {
+    static std::mutex install_mutex;
+    std::lock_guard<std::mutex> install_lock(install_mutex);
     if (orig_vkQueuePresentKHR_ && orig_vkCreateDevice_ && orig_vkCreateInstance_) { vulkan_hooked_ = true; return; }
     HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
     if (!vulkan) vulkan = LoadLibraryA("vulkan-1.dll");
@@ -314,49 +361,18 @@ void StarOverlay::hook_vulkan()
             STAR_LOG("Vulkan AcquireNextImage hooked (loader)");
         }
     }
+    auto install = [&](const char* name, void* detour, void** original) {
+        if (*original) return;
+        void* target = (void*)GetProcAddress(vulkan, name);
+        if (target && MH_CreateHook(target, detour, original) == MH_OK &&
+            MH_EnableHook(target) != MH_OK) {
+            MH_RemoveHook(target);
+            *original = nullptr;
+        }
+    };
+    install("vkDestroySwapchainKHR", (void*)&hooked_vkDestroySwapchainKHR, &orig_vkDestroySwapchainKHR_);
+    install("vkDestroyDevice", (void*)&hooked_vkDestroyDevice, &orig_vkDestroyDevice_);
     if (orig_vkQueuePresentKHR_) { vulkan_hooked_ = true; STAR_LOG("Vulkan hooked"); }
-}
-
-void StarOverlay::recover_vulkan_late()
-{
-    HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkan) return;
-    if (!resolve_vulkan_funcs(vulkan)) return;
-
-    // The game's instance was created before we hooked, so we can't capture
-    // it. Create a throwaway instance to enumerate the physical device and
-    // satisfy ImGui's backend (which asserts Instance + PhysicalDevice).
-    VkApplicationInfo app_info = {};
-    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app_info.pApplicationName = "STAR";
-    app_info.apiVersion = VK_API_VERSION_1_0;
-
-    VkInstanceCreateInfo inst_info = {};
-    inst_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    inst_info.pApplicationInfo = &app_info;
-
-    VkInstance dummy = VK_NULL_HANDLE;
-    if (vkCreateInstance(&inst_info, nullptr, &dummy) != VK_SUCCESS) return;
-
-    uint32_t count = 0;
-    vkEnumeratePhysicalDevices(dummy, &count, nullptr);
-    if (count == 0) { vkDestroyInstance(dummy, nullptr); return; }
-    std::vector<VkPhysicalDevice> devices(count);
-    vkEnumeratePhysicalDevices(dummy, &count, devices.data());
-
-    VkPhysicalDevice chosen = VK_NULL_HANDLE;
-    for (auto pd : devices) {
-        VkPhysicalDeviceProperties props = {};
-        vkGetPhysicalDeviceProperties(pd, &props);
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { chosen = pd; break; }
-    }
-    if (!chosen && !devices.empty()) chosen = devices[0];
-
-    vk_instance_ = dummy;
-    vk_physical_device_ = chosen;
-    g_vk_instance = dummy;
-    STAR_LOG("Vulkan late recovery: device=%p instance=%p physical=%p fmt=%d count=%u",
-        vk_device_, vk_instance_, vk_physical_device_, vk_swapchain_format_, (unsigned)vk_min_image_count_);
 }
 
 void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
@@ -365,61 +381,42 @@ void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
     if (game_api_ == GraphicsAPI::None) {
         game_api_ = GraphicsAPI::Vulkan;
         STAR_LOG("Game graphics API: Vulkan");
-        // In-backbuffer Vulkan drawing submits without the game's present
-        // semaphores and a lying initialLayout - a GPU-hang vector this
-        // session cannot validate. Auto mode takes the external window
-        // (proven path); explicit "hook" keeps the old behavior.
-        if (Settings::get().overlay_mode == "auto") {
-            switch_to_external("Vulkan in-backbuffer drawing disabled (hang risk)");
-            return;
-        }
     }
     if (mode_ == OverlayMode::External) return;
-    if (!vk_device_ || !vk_instance_) {
-        // Late-init recovery: the game created its Vulkan instance/device
-        // before SteamAPI_Init, so the create hooks were missed. The
-        // vkCreateSwapchainKHR / vkAcquireNextImageKHR hooks captured the
-        // device; rebuild the instance + physical device here so the overlay
-        // can init.
-        if (!vk_instance_ && vk_device_) {
-            recover_vulkan_late();
-            // The recovery's format/count are unknown until the swapchain
-            // hook fires; init on a later present so the real values are used.
-            vk_swapchain_recreated_ = true;
-            return;
-        }
-        static bool logged = false;
-        if (!logged) { logged = true; STAR_LOG("Vulkan present: waiting for device/instance (device=%p instance=%p) - game may have init before SteamAPI_Init, will recover on swapchain recreate", vk_device_, vk_instance_); }
-        return;
-    }
-
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-
-    struct FakePresentInfo {
-        int sType;
-        const void* pNext;
-        uint32_t waitSemaphoreCount;
-        const uint64_t* pWaitSemaphores;
-        uint32_t swapchainCount;
-        const uint64_t* pSwapchains;
-        const uint32_t* pImageIndices;
-    };
-    auto* pi = (const FakePresentInfo*)pPresentInfo;
-    if (!pi || pi->swapchainCount == 0 || !pi->pSwapchains || !pi->pImageIndices) return;
-
-    uint32_t image_index = pi->pImageIndices[0];
-    vk_queue_ = queue;
-
+    const auto* pi = static_cast<const VkPresentInfoKHR*>(pPresentInfo);
+    if (!pi || !pi->swapchainCount || !pi->pSwapchains || !pi->pImageIndices) return;
+    if (!orig_vkDestroySwapchainKHR_ || !orig_vkDestroyDevice_ ||
+        !vk_device_ || !vk_instance_ || !vk_physical_device_ ||
+        !vk_width_ || !vk_height_ || vk_queue_family_ == UINT32_MAX ||
+        queue != vk_queue_ || pi->swapchainCount != 1 ||
+        (uintptr_t)pi->pSwapchains[0] != (uintptr_t)vk_swapchain_ ||
+        !(vk_image_usage_ & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            STAR_LOG("Vulkan native unavailable: creation metadata missing or unsupported queue/swapchain; instance=%p physical=%p device=%p queue=%p captured=%p extent=%ux%u",
+                vk_instance_, vk_physical_device_, vk_device_, queue, vk_queue_, vk_width_, vk_height_);
+        }
+        // There is no Vulkan API to reconstruct a device's physical GPU and
+        // enabled queues. A dummy instance cannot supply that information.
+        if (Settings::get().overlay_mode != "hook") {
+            cleanup_vulkan();
+            mode_ = OverlayMode::External;
+            STAR_LOG("Vulkan: using external overlay for this session (creation metadata unavailable)");
+            start_external_thread();
+        }
+        return;
+    }
+    if (imgui_initialized_ && active_api_ != GraphicsAPI::Vulkan) return;
     if (vk_swapchain_recreated_ || !imgui_initialized_) {
         cleanup_vulkan();
         init_imgui_vulkan(queue, pPresentInfo);
         vk_swapchain_recreated_ = false;
     }
-
-    if (imgui_initialized_ && active_api_ == GraphicsAPI::Vulkan) {
+    if (imgui_initialized_ && active_api_ == GraphicsAPI::Vulkan)
         render_frame_vulkan(queue, pPresentInfo);
-    }
 }
 
 void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
@@ -429,6 +426,15 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 
     if (!resolve_vulkan_funcs(vulkan)) return;
 
+    auto destroy = [](VulkanOverlayData* p) { p->cleanup(); delete p; };
+    std::unique_ptr<VulkanOverlayData, decltype(destroy)> owner(new VulkanOverlayData, destroy);
+    auto* data = owner.get();
+    data->device = (VkDevice)vk_device_;
+    data->physical_device = (VkPhysicalDevice)vk_physical_device_;
+    data->instance = (VkInstance)vk_instance_;
+    data->queue = (VkQueue)queue;
+    data->queue_family = vk_queue_family_;
+    data->extent = {vk_width_, vk_height_};
     VkAttachmentDescription attachment = {};
     attachment.format = unorm_view_format((VkFormat)vk_swapchain_format_);
     attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -436,7 +442,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
     VkAttachmentReference color_attachment = {};
@@ -454,7 +460,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     dependency.srcAccessMask = 0;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
     VkRenderPassCreateInfo rp_info = {};
     rp_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -465,7 +471,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     rp_info.dependencyCount = 1;
     rp_info.pDependencies = &dependency;
 
-    VkRenderPass rp = VK_NULL_HANDLE;
+    auto& rp = data->render_pass;
     if (vkCreateRenderPass((VkDevice)vk_device_, &rp_info, nullptr, &rp) != VK_SUCCESS) return;
 
     VkDescriptorPoolSize pool_sizes[] = {
@@ -478,39 +484,28 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = pool_sizes;
 
-    VkDescriptorPool dp = VK_NULL_HANDLE;
+    auto& dp = data->descriptor_pool;
     if (vkCreateDescriptorPool((VkDevice)vk_device_, &pool_info, nullptr, &dp) != VK_SUCCESS) {
-        vkDestroyRenderPass((VkDevice)vk_device_, rp, nullptr);
         return;
     }
 
-    struct FakePresentInfo {
-        int sType;
-        const void* pNext;
-        uint32_t waitSemaphoreCount;
-        const uint64_t* pWaitSemaphores;
-        uint32_t swapchainCount;
-        const uint64_t* pSwapchains;
-        const uint32_t* pImageIndices;
-    };
-    auto* pi = (const FakePresentInfo*)pPresentInfo;
-    uint64_t swapchain = pi->pSwapchains[0];
+    auto* pi = static_cast<const VkPresentInfoKHR*>(pPresentInfo);
+    VkSwapchainKHR swapchain = pi->pSwapchains[0];
 
     uint32_t count = 0;
-    vkGetSwapchainImagesKHR((VkDevice)vk_device_, (VkSwapchainKHR)swapchain, &count, nullptr);
+    if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, nullptr) != VK_SUCCESS || count < 2) return;
     std::vector<VkImage> images(count);
-    vkGetSwapchainImagesKHR((VkDevice)vk_device_, (VkSwapchainKHR)swapchain, &count, images.data());
+    if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, images.data()) != VK_SUCCESS) return;
+    data->swapchain = swapchain;
+    data->image_count = count;
 
-    std::vector<VkImageView> views(count);
-    std::vector<VkFramebuffer> fbs(count);
+    data->image_views.resize(count);
+    data->framebuffers.resize(count);
+    auto& views = data->image_views;
+    auto& fbs = data->framebuffers;
 
-    if (!hwnd_) hwnd_ = GetActiveWindow();
-    RECT rect{};
-    if (hwnd_) GetClientRect(hwnd_, &rect);
-    uint32_t w = rect.right - rect.left;
-    uint32_t h = rect.bottom - rect.top;
-    if (w == 0) w = 1280;
-    if (h == 0) h = 720;
+    hook_window_for(find_game_window());
+    uint32_t w = vk_width_, h = vk_height_;
 
     for (uint32_t i = 0; i < count; i++) {
         VkImageViewCreateInfo view_info = {};
@@ -547,22 +542,36 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     cp_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cp_info.queueFamilyIndex = vk_queue_family_;
 
-    VkCommandPool cp = VK_NULL_HANDLE;
+    auto& cp = data->command_pool;
     if (vkCreateCommandPool((VkDevice)vk_device_, &cp_info, nullptr, &cp) != VK_SUCCESS) return;
 
-    std::vector<VkCommandBuffer> cbs(count);
+    data->command_buffers.resize(count);
+    auto& cbs = data->command_buffers;
     VkCommandBufferAllocateInfo cb_info = {};
     cb_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cb_info.commandPool = cp;
     cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cb_info.commandBufferCount = count;
-    if (vkAllocateCommandBuffers((VkDevice)vk_device_, &cb_info, cbs.data()) != VK_SUCCESS) return;
+    if (vkAllocateCommandBuffers((VkDevice)vk_device_, &cb_info, cbs.data()) != VK_SUCCESS) {
+        cbs.clear(); return;
+    }
+    data->fences.resize(count);
+    data->present_ready.resize(count);
+    VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    VkSemaphoreCreateInfo sem_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (uint32_t i = 0; i < count; ++i) {
+        if (vkCreateFence(data->device, &fence_info, nullptr, &data->fences[i]) != VK_SUCCESS ||
+            vkCreateSemaphore(data->device, &sem_info, nullptr, &data->present_ready[i]) != VK_SUCCESS) return;
+    }
 
     ImGui::CreateContext();
-    ImGui_ImplWin32_Init(hwnd_);
+    if (!ImGui_ImplWin32_Init(hwnd_)) { ImGui::DestroyContext(); return; }
     hook_window();
 
-    ImGui_ImplVulkan_LoadFunctions(&ImGuiVulkanLoader, vulkan);
+    if (!ImGui_ImplVulkan_LoadFunctions(&ImGuiVulkanLoader, vulkan)) {
+        ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); return;
+    }
 
     ImGui_ImplVulkan_InitInfo init_info = {};
     init_info.Instance = (VkInstance)vk_instance_;
@@ -572,7 +581,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     init_info.Queue = (VkQueue)queue;
     init_info.DescriptorPool = dp;
     init_info.RenderPass = rp;
-    init_info.MinImageCount = vk_min_image_count_;
+    init_info.MinImageCount = std::max(2u, std::min(vk_min_image_count_, count));
     init_info.ImageCount = count;
     init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 
@@ -580,21 +589,6 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         style_.setup();
         imgui_initialized_ = true;
         active_api_ = GraphicsAPI::Vulkan;
-
-        auto* data = new VulkanOverlayData();
-        data->vulkan_dll = vulkan;
-        data->instance = (VkInstance)vk_instance_;
-        data->physical_device = (VkPhysicalDevice)vk_physical_device_;
-        data->device = (VkDevice)vk_device_;
-        data->queue = (VkQueue)queue;
-        data->queue_family = vk_queue_family_;
-        data->render_pass = rp;
-        data->descriptor_pool = dp;
-        data->command_pool = cp;
-        data->command_buffers = cbs;
-        data->framebuffers = fbs;
-        data->image_views = views;
-        data->image_count = count;
 
         VkSamplerCreateInfo samp_info = {};
         samp_info.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -608,7 +602,11 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         if (vkCreateSampler((VkDevice)vk_device_, &samp_info, nullptr, &data->icon_sampler) != VK_SUCCESS)
             data->icon_sampler = VK_NULL_HANDLE;
 
-        context_ = (ID3D11DeviceContext*)data;
+        vk_data_ = owner.release();
+        STAR_LOG("ImGui ready (Vulkan native) images=%u extent=%ux%u", count, w, h);
+    } else {
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
     }
 }
 
@@ -617,16 +615,7 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
     if (!screenshots_.consume()) return;
     if (!enabled_ || !imgui_initialized_ || active_api_ != GraphicsAPI::Vulkan) return;
     if (!vk_device_ || !vk_physical_device_) return;
-    struct FakePresentInfo {
-        int sType;
-        const void* pNext;
-        uint32_t waitSemaphoreCount;
-        const uint64_t* pWaitSemaphores;
-        uint32_t swapchainCount;
-        const uint64_t* pSwapchains;
-        const uint32_t* pImageIndices;
-    };
-    auto* pi = (const FakePresentInfo*)pPresentInfo;
+    auto* pi = static_cast<const VkPresentInfoKHR*>(pPresentInfo);
     if (!pi || pi->swapchainCount == 0 || !pi->pSwapchains || !pi->pImageIndices) return;
     VkDevice dev = (VkDevice)vk_device_;
     VkSwapchainKHR swap = (VkSwapchainKHR)pi->pSwapchains[0];
@@ -638,19 +627,18 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
     if (vkGetSwapchainImagesKHR(dev, swap, &count, images.data()) != VK_SUCCESS) return;
     VkImage image = images[idx];
 
-    RECT rect{};
-    uint32_t w = 1280, h = 720;
-    if (hwnd_ && GetClientRect(hwnd_, &rect)) {
-        if (rect.right - rect.left > 0) w = (uint32_t)(rect.right - rect.left);
-        if (rect.bottom - rect.top > 0) h = (uint32_t)(rect.bottom - rect.top);
+    if (!(vk_image_usage_ & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        capture_desktop_duplication();
+        return;
     }
+    uint32_t w = vk_width_, h = vk_height_;
     VkFormat fmt = (VkFormat)vk_swapchain_format_;
     bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
     if (fmt != VK_FORMAT_R8G8B8A8_UNORM && fmt != VK_FORMAT_R8G8B8A8_SRGB && !bgra) {
         STAR_LOG("Screenshot: unsupported Vulkan format %d", (int)fmt);
         return;
     }
-    auto* data = (VulkanOverlayData*)context_;
+    auto* data = (VulkanOverlayData*)vk_data_;
     if (!data || !data->command_pool) return;
 
     VkBufferCreateInfo buf_info{};
@@ -727,10 +715,11 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
             submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit.commandBufferCount = 1;
             submit.pCommandBuffers = &cb;
-            if (vkQueueSubmit((VkQueue)queue, 1, &submit, fence) == VK_SUCCESS)
-                vkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ULL);
+            VkResult completed = vkQueueSubmit((VkQueue)queue, 1, &submit, fence);
+            if (completed == VK_SUCCESS)
+                completed = vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
             void* mapped = nullptr;
-            if (vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS && mapped) {
+            if (completed == VK_SUCCESS && vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS && mapped) {
                 std::vector<uint8_t> rgba((size_t)w * h * 4);
                 if (bgra) {
                     const uint8_t* s = (const uint8_t*)mapped;
@@ -751,78 +740,69 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
         }
         vkFreeCommandBuffers(dev, data->command_pool, 1, &cb);
     }
-    vkFreeMemory(dev, mem, nullptr);
     vkDestroyBuffer(dev, staging, nullptr);
+    vkFreeMemory(dev, mem, nullptr);
     if (shot_ok) notify_screenshot(shot_path);
 }
 
 void StarOverlay::render_frame_vulkan(void* queue, const void* pPresentInfo)
 {
-    auto* data = (VulkanOverlayData*)context_;
-    if (!data) return;
-
-    struct FakePresentInfo {
-        int sType;
-        const void* pNext;
-        uint32_t waitSemaphoreCount;
-        const uint64_t* pWaitSemaphores;
-        uint32_t swapchainCount;
-        const uint64_t* pSwapchains;
-        const uint32_t* pImageIndices;
-    };
-    auto* pi = (const FakePresentInfo*)pPresentInfo;
+    auto* data = (VulkanOverlayData*)vk_data_;
+    auto* pi = const_cast<VkPresentInfoKHR*>(static_cast<const VkPresentInfoKHR*>(pPresentInfo));
+    if (!data || data->failed || pi->pSwapchains[0] != data->swapchain) return;
     uint32_t image_index = pi->pImageIndices[0];
     if (image_index >= data->image_count) return;
+    uint32_t frame = data->next_frame;
+    VkFence fence = data->fences[frame];
+    if (vkWaitForFences(data->device, 1, &fence, VK_TRUE, 1000000000ULL) != VK_SUCCESS) return;
 
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    ImGui::GetIO().DisplaySize = ImVec2((float)data->extent.width, (float)data->extent.height);
     ImGui::NewFrame();
     apply_cursor_mode();
-
     build_frame_ui();
 
-    VkCommandBufferBeginInfo begin_info = {};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    VkCommandBuffer cb = data->command_buffers[image_index];
-    vkResetCommandBuffer(cb, 0);
-    vkBeginCommandBuffer(cb, &begin_info);
-
-    RECT rect{};
-    if (hwnd_) GetClientRect(hwnd_, &rect);
-    uint32_t w = rect.right - rect.left;
-    uint32_t h = rect.bottom - rect.top;
-    if (w == 0) w = 1280;
-    if (h == 0) h = 720;
-
-    VkRenderPassBeginInfo rp_begin = {};
-    rp_begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp_begin.renderPass = data->render_pass;
-    rp_begin.framebuffer = data->framebuffers[image_index];
-    rp_begin.renderArea.extent.width = w;
-    rp_begin.renderArea.extent.height = h;
-
-    vkCmdBeginRenderPass(cb, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+    VkCommandBuffer cb = data->command_buffers[frame];
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkResetCommandBuffer(cb, 0) != VK_SUCCESS || vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS) return;
+    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp.renderPass = data->render_pass;
+    rp.framebuffer = data->framebuffers[image_index];
+    rp.renderArea.extent = data->extent;
+    vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
     vkCmdEndRenderPass(cb);
-    vkEndCommandBuffer(cb);
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) { data->failed = true; return; }
 
-    VkSubmitInfo submit = {};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    std::vector<VkPipelineStageFlags> stages(pi->waitSemaphoreCount,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = pi->waitSemaphoreCount;
+    submit.pWaitSemaphores = pi->pWaitSemaphores;
+    submit.pWaitDstStageMask = stages.data();
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cb;
-
-    if (vkQueueSubmit) {
-        vkQueueSubmit((VkQueue)queue, 1, &submit, VK_NULL_HANDLE);
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &data->present_ready[image_index];
+    if (vkResetFences(data->device, 1, &fence) != VK_SUCCESS ||
+        vkQueueSubmit((VkQueue)queue, 1, &submit, fence) != VK_SUCCESS) {
+        data->failed = true;
+        STAR_LOG("Vulkan overlay submission failed");
+        return;
     }
-
+    // Consume the game's waits exactly once. Present waits on our completion.
+    // The semaphore is indexed by acquired image, not CPU frame number.
+    pi->waitSemaphoreCount = 1;
+    pi->pWaitSemaphores = &data->present_ready[image_index];
+    data->next_frame = (frame + 1) % data->image_count;
     maybe_capture_vulkan(queue, pPresentInfo);
 }
 
 ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, int w, int h)
 {
-    auto* data = (VulkanOverlayData*)context_;
+    auto* data = (VulkanOverlayData*)vk_data_;
     if (!data || !data->device || !data->icon_sampler || !data->command_pool) return nullptr;
 
     VkDevice dev  = data->device;
@@ -853,7 +833,11 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     vkBindBufferMemory(dev, staging, staging_mem, 0);
 
     void* mapped = nullptr;
-    vkMapMemory(dev, staging_mem, 0, buf_req.size, 0, &mapped);
+    if (vkMapMemory(dev, staging_mem, 0, buf_req.size, 0, &mapped) != VK_SUCCESS) {
+        vkDestroyBuffer(dev, staging, nullptr);
+        vkFreeMemory(dev, staging_mem, nullptr);
+        return nullptr;
+    }
     memcpy(mapped, rgba.data(), (size_t)w * h * 4);
     vkUnmapMemory(dev, staging_mem);
 
@@ -871,7 +855,8 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImage image = VK_NULL_HANDLE;
     if (vkCreateImage(dev, &img_info, nullptr, &image) != VK_SUCCESS) {
-        vkFreeMemory(dev, staging_mem, nullptr); vkDestroyBuffer(dev, staging, nullptr); return nullptr;
+        vkDestroyBuffer(dev, staging, nullptr);
+        vkFreeMemory(dev, staging_mem, nullptr); return nullptr;
     }
 
     VkMemoryRequirements img_req{};
@@ -880,7 +865,8 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (img_mtype == UINT32_MAX) {
         vkDestroyImage(dev, image, nullptr);
-        vkFreeMemory(dev, staging_mem, nullptr); vkDestroyBuffer(dev, staging, nullptr); return nullptr;
+        vkDestroyBuffer(dev, staging, nullptr);
+        vkFreeMemory(dev, staging_mem, nullptr); return nullptr;
     }
     VkMemoryAllocateInfo img_alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     img_alloc.allocationSize  = img_req.size;
@@ -888,8 +874,8 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     VkDeviceMemory img_mem = VK_NULL_HANDLE;
     if (vkAllocateMemory(dev, &img_alloc, nullptr, &img_mem) != VK_SUCCESS) {
         vkDestroyImage(dev, image, nullptr);
-        vkFreeMemory(dev, staging_mem, nullptr);
         vkDestroyBuffer(dev, staging, nullptr);
+        vkFreeMemory(dev, staging_mem, nullptr);
         return nullptr;
     }
     vkBindImageMemory(dev, image, img_mem, 0);
@@ -900,10 +886,10 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     cb_alloc.commandBufferCount = 1;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     if (vkAllocateCommandBuffers(dev, &cb_alloc, &cb) != VK_SUCCESS) {
-        vkFreeMemory(dev, img_mem, nullptr);
         vkDestroyImage(dev, image, nullptr);
-        vkFreeMemory(dev, staging_mem, nullptr);
+        vkFreeMemory(dev, img_mem, nullptr);
         vkDestroyBuffer(dev, staging, nullptr);
+        vkFreeMemory(dev, staging_mem, nullptr);
         return nullptr;
     }
 
@@ -945,10 +931,10 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     VkFence fence = VK_NULL_HANDLE;
     if (vkCreateFence(dev, &fence_info, nullptr, &fence) != VK_SUCCESS) {
         vkFreeCommandBuffers(dev, pool, 1, &cb);
-        vkFreeMemory(dev, img_mem, nullptr);
         vkDestroyImage(dev, image, nullptr);
-        vkFreeMemory(dev, staging_mem, nullptr);
+        vkFreeMemory(dev, img_mem, nullptr);
         vkDestroyBuffer(dev, staging, nullptr);
+        vkFreeMemory(dev, staging_mem, nullptr);
         return nullptr;
     }
 
@@ -958,17 +944,17 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     if (vkQueueSubmit(que, 1, &submit, fence) != VK_SUCCESS) {
         vkDestroyFence(dev, fence, nullptr);
         vkFreeCommandBuffers(dev, pool, 1, &cb);
-        vkFreeMemory(dev, img_mem, nullptr);
         vkDestroyImage(dev, image, nullptr);
-        vkFreeMemory(dev, staging_mem, nullptr);
+        vkFreeMemory(dev, img_mem, nullptr);
         vkDestroyBuffer(dev, staging, nullptr);
+        vkFreeMemory(dev, staging_mem, nullptr);
         return nullptr;
     }
     vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
     vkDestroyFence(dev, fence, nullptr);
     vkFreeCommandBuffers(dev, pool, 1, &cb);
-    vkFreeMemory(dev, staging_mem, nullptr);
     vkDestroyBuffer(dev, staging, nullptr);
+    vkFreeMemory(dev, staging_mem, nullptr);
 
     VkImageViewCreateInfo view_info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     view_info.image            = image;
@@ -977,8 +963,8 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     view_info.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(dev, &view_info, nullptr, &view) != VK_SUCCESS) {
-        vkFreeMemory(dev, img_mem, nullptr);
         vkDestroyImage(dev, image, nullptr);
+        vkFreeMemory(dev, img_mem, nullptr);
         return nullptr;
     }
 
@@ -991,11 +977,18 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
 
 void StarOverlay::cleanup_vulkan()
 {
-    if (active_api_ == GraphicsAPI::Vulkan && context_) {
-        auto* data = (VulkanOverlayData*)context_;
-        data->cleanup();
-        delete data;
-        context_ = nullptr;
+    auto* data = (VulkanOverlayData*)vk_data_;
+    if (!data) return;
+    vkDeviceWaitIdle(data->device);
+    if (imgui_initialized_ && active_api_ == GraphicsAPI::Vulkan) {
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        imgui_initialized_ = false;
+        active_api_ = GraphicsAPI::None;
+        icons_.clear();
     }
+    data->cleanup();
+    delete data;
+    vk_data_ = nullptr;
 }
-

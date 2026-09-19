@@ -56,8 +56,8 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     list(APPEND IMGUI_SOURCES ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp)
 endif()
 add_library(imgui STATIC ${IMGUI_SOURCES})
+target_include_directories(imgui PRIVATE ${PROJECT_SOURCE_DIR}/sdk)
 target_include_directories(imgui PUBLIC
-    ${PROJECT_SOURCE_DIR}/sdk/dx8
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
     ${vulkan_headers_SOURCE_DIR}/include
@@ -107,6 +107,7 @@ set(STAR_SOURCES
     overlay/backends/backend_dxgi.cpp
     overlay/backends/backend_opengl.cpp
     overlay/backends/backend_vulkan.cpp
+    overlay/backends/backend_gdi.cpp
     overlay/external/external.cpp
     steam/steam_applist.cpp
     steam/steam_apps.cpp
@@ -151,7 +152,6 @@ target_compile_definitions(star PRIVATE
 )
 
 target_include_directories(star PRIVATE
-    ${PROJECT_SOURCE_DIR}/sdk/dx8
     ${PROJECT_SOURCE_DIR}/sdk
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/overlay/backends
@@ -176,6 +176,7 @@ target_link_libraries(star PRIVATE
     bcrypt
     ws2_32
     winmm
+    msimg32
 )
 
 # Output name depends on architecture: steam_api64.dll (x64) vs steam_api.dll (x86)

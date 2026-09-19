@@ -26,6 +26,8 @@ ImTextureID StarOverlay::get_or_create_icon(
             return upload_icon_dx10(rgba, w, h);
         } else if (active_api_ == GraphicsAPI::OpenGL) {
             return upload_icon_opengl(rgba, w, h);
+        } else if (active_api_ == GraphicsAPI::GDI) {
+            return upload_icon_gdi(rgba, w, h);
         } else if (device_) {
             D3D11_TEXTURE2D_DESC td{};
             td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;

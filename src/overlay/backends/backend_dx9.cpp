@@ -44,6 +44,12 @@ void StarOverlay::hook_dx9()
     d3dpp.Windowed = TRUE;
     d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
     d3dpp.hDeviceWindow = dummy;
+    // The tiny framed probe window can have a zero-sized client area.
+    // Explicit dimensions keep HAL creation from failing with INVALIDCALL
+    // and falling back to a different renderer's Present implementation.
+    d3dpp.BackBufferWidth = 1;
+    d3dpp.BackBufferHeight = 1;
+    d3dpp.BackBufferFormat = D3DFMT_UNKNOWN;
 
     // We only need the vtable, so try several device flavors (HAL/SW first,
     // NULLREF fallback). XNA/D3D9Ex games share the same vtable layout.
@@ -59,7 +65,10 @@ void StarOverlay::hook_dx9()
     HRESULT hr = E_FAIL;
     for (auto& a : attempts) {
         hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, (D3DDEVTYPE)a.devtype, dummy, a.behavior, &d3dpp, &device);
-        if (SUCCEEDED(hr) && device) break;
+        if (SUCCEEDED(hr) && device) {
+            STAR_LOG("DX9 hook: probe device %s ready", a.name);
+            break;
+        }
         STAR_LOG("DX9 hook: CreateDevice %s failed hr=0x%08x", a.name, (unsigned)hr);
     }
     if (FAILED(hr) || !device) {
@@ -95,14 +104,19 @@ void StarOverlay::on_present_dx9(IDirect3DDevice9* device)
         STAR_LOG("Game graphics API: DirectX 9");
     }
     if (mode_ == OverlayMode::External) return;
-    dx9_device_ = device;
-    {
-        D3DDEVICE_CREATION_PARAMETERS cp{};
-        if (SUCCEEDED(device->GetCreationParameters(&cp))) hook_window_for(cp.hFocusWindow);
-    }
 
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
+    if (imgui_initialized_ && active_api_ != GraphicsAPI::DX9) return;
+    if (imgui_initialized_ && dx9_device_ != device) {
+        icons_.release_all([](ImTextureID v) { ((IDirect3DTexture9*)v)->Release(); });
+        ImGui_ImplDX9_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        imgui_initialized_ = false;
+        active_api_ = GraphicsAPI::None;
+    }
+    dx9_device_ = device;
 
     if (!imgui_initialized_) {
         D3DDEVICE_CREATION_PARAMETERS cp{};
@@ -112,7 +126,7 @@ void StarOverlay::on_present_dx9(IDirect3DDevice9* device)
         hook_window_for(new_hwnd);
 
         ImGui::CreateContext();
-        ImGui_ImplWin32_Init(hwnd_);
+        if (!ImGui_ImplWin32_Init(hwnd_)) { ImGui::DestroyContext(); return; }
         // hook_window already done via hook_window_for
 
         if (ImGui_ImplDX9_Init(device)) {
@@ -121,6 +135,8 @@ void StarOverlay::on_present_dx9(IDirect3DDevice9* device)
             active_api_ = GraphicsAPI::DX9;
             STAR_LOG("ImGui ready (DX9) hwnd=%p", hwnd_);
         } else {
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
             STAR_LOG("ImGui DX9 init FAILED");
         }
     }
@@ -133,20 +149,10 @@ void StarOverlay::on_present_dx9(IDirect3DDevice9* device)
 
         build_frame_ui();
 
-        IDirect3DStateBlock9* state_block = nullptr;
-        if (SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &state_block))) {
-            state_block->Capture();
-        }
-
         HRESULT scene_hr = device->BeginScene();
         if (SUCCEEDED(scene_hr)) {
             ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
             device->EndScene();
-        }
-
-        if (state_block) {
-            state_block->Apply();
-            state_block->Release();
         }
 
         maybe_capture_dx9(device);
@@ -161,4 +167,3 @@ void StarOverlay::on_reset_dx9()
         ImGui_ImplDX9_InvalidateDeviceObjects();
     }
 }
-

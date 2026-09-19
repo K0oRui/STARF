@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <dxgi1_4.h>
 #include "imgui.h"
+#include "overlay/backends/gdi_resources.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -112,7 +113,7 @@ public:
 private:
     StarOverlay() = default;
 
-    enum class GraphicsAPI { None, DX7, DX8, DX9, DX10, DX11, DX12, OpenGL, Vulkan };
+    enum class GraphicsAPI { None, DX7, DX8, DX9, DX10, DX11, DX12, OpenGL, Vulkan, GDI };
     GraphicsAPI active_api_ = GraphicsAPI::None;
     GraphicsAPI game_api_ = GraphicsAPI::None; // what the GAME renders with
 
@@ -134,6 +135,7 @@ private:
     void init_imgui_dx12(IDXGISwapChain* chain, void* device, void* command_queue);
     void render_frame_dx12(IDXGISwapChain* chain);
     void cleanup_dx12();
+    void wait_dx12_idle();
     void hook_dx12_ecl();
     ImTextureID upload_icon_dx12(const std::vector<uint8_t>& rgba, int w, int h);
 #endif
@@ -193,7 +195,9 @@ private:
     void* vk_device_ = nullptr;
     void* vk_swapchain_ = nullptr;
     void* vk_queue_ = nullptr;
-    uint32_t vk_queue_family_ = 0;
+    void* vk_data_ = nullptr;
+    uint32_t vk_width_ = 0, vk_height_ = 0, vk_image_usage_ = 0;
+    uint32_t vk_queue_family_ = UINT32_MAX;
     int vk_swapchain_format_ = 0;
     uint32_t vk_min_image_count_ = 2;
     bool vk_swapchain_recreated_ = false;
@@ -201,19 +205,52 @@ private:
     void* orig_vkCreateDevice_ = nullptr;
     void* orig_vkCreateSwapchainKHR_ = nullptr;
     void* orig_vkQueuePresentKHR_ = nullptr;
+    void* orig_vkDestroySwapchainKHR_ = nullptr;
+    void* orig_vkDestroyDevice_ = nullptr;
+    static void WINAPI hooked_vkDestroySwapchainKHR(void*, uint64_t, const void*);
+    static void WINAPI hooked_vkDestroyDevice(void*, const void*);
     void* orig_vkAcquireNextImageKHR_ = nullptr;
-    static int hooked_vkCreateInstance(const void*, const void*, void**);
-    static int hooked_vkCreateDevice(void*, const void*, const void*, void**);
-    static int hooked_vkCreateSwapchainKHR(void*, const void*, const void*, uint64_t*);
-    static int hooked_vkQueuePresentKHR(void*, const void*);
-    static int hooked_vkAcquireNextImageKHR(void*, uint64_t, uint64_t, void*, void*, uint32_t*);
+    static int WINAPI hooked_vkCreateInstance(const void*, const void*, void**);
+    static int WINAPI hooked_vkCreateDevice(void*, const void*, const void*, void**);
+    static int WINAPI hooked_vkCreateSwapchainKHR(void*, const void*, const void*, uint64_t*);
+    static int WINAPI hooked_vkQueuePresentKHR(void*, const void*);
+    static int WINAPI hooked_vkAcquireNextImageKHR(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t*);
     void hook_vulkan();
     void on_present_vulkan(void* queue, const void* pPresentInfo);
-    void recover_vulkan_late();
     void init_imgui_vulkan(void* queue, const void* pPresentInfo);
     void render_frame_vulkan(void* queue, const void* pPresentInfo);
     void cleanup_vulkan();
     ImTextureID upload_icon_vulkan(const std::vector<uint8_t>& rgba, int w, int h);
+
+    // ---- GDI backend (BitBlt/StretchBlt/StretchDIBits games) ----
+    using BitBltFn            = BOOL(WINAPI*)(HDC, int, int, int, int, HDC, int, int, DWORD);
+    using StretchBltFn        = BOOL(WINAPI*)(HDC, int, int, int, int, HDC, int, int, int, int, DWORD);
+    using StretchDIBitsFn     = int(WINAPI*)(HDC, int, int, int, int, int, int, int, int, const VOID*, const BITMAPINFO*, UINT, DWORD);
+    using SetDIBitsToDeviceFn = int(WINAPI*)(HDC, int, int, DWORD, DWORD, int, int, UINT, UINT, const VOID*, const BITMAPINFO*, UINT);
+
+    BitBltFn            orig_bitblt_            = nullptr;
+    StretchBltFn        orig_stretchblt_        = nullptr;
+    StretchDIBitsFn     orig_stretchdibits_     = nullptr;
+    SetDIBitsToDeviceFn orig_setdibitstodevice_ = nullptr;
+
+    static BOOL WINAPI hooked_BitBlt(HDC, int, int, int, int, HDC, int, int, DWORD);
+    static BOOL WINAPI hooked_StretchBlt(HDC, int, int, int, int, HDC, int, int, int, int, DWORD);
+    static int  WINAPI hooked_StretchDIBits(HDC, int, int, int, int, int, int, int, int, const VOID*, const BITMAPINFO*, UINT, DWORD);
+    static int  WINAPI hooked_SetDIBitsToDevice(HDC, int, int, DWORD, DWORD, int, int, UINT, UINT, const VOID*, const BITMAPINFO*, UINT);
+
+    void hook_gdi();
+    void check_blit_and_present(HDC hdc, int x, int y, int cx, int cy, const char* fn);
+    bool render_gdi(HWND hwnd, HDC dest_dc, int w, int h);
+    bool gdi_init_device();
+    bool gdi_alloc_surfaces(int w, int h);
+    ImTextureID upload_icon_gdi(const std::vector<uint8_t>& rgba, int w, int h);
+    void maybe_capture_gdi(HDC src_dc, int w, int h);
+
+    star_gdi::Resources gdi_;
+    std::mutex gdi_hook_mutex_;
+    DWORD gdi_last_invalidate_ = 0;
+    bool gdi_wants_draw() const;
+    bool prepare_gdi_present(HWND window);
 
     void render_notifications(float dt);
     void render_panel();
@@ -269,6 +306,7 @@ private:
     bool  dx7_hooked_        = false;
     bool  opengl_hooked_     = false;
     bool  vulkan_hooked_     = false;
+    bool  gdi_hooked_        = false;
     bool  hotkey_prev_down_  = false;
     bool  f12_prev_down_     = false;
     ScreenshotService screenshots_;
@@ -323,6 +361,8 @@ private:
     std::vector<void*> dx12_command_allocators_;
     std::vector<void*> dx12_resources_;
     UINT dx12_buffer_count_ = 0;
+    UINT dx12_frame_index_ = 0;
+    IDXGISwapChain* dx12_chain_ = nullptr;
     UINT dx12_srv_next_slot_ = 1;
     std::vector<void*> dx12_icon_resources_;
     // Frame fence: Reset() on an allocator the GPU is still reading is
@@ -337,7 +377,6 @@ private:
     using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(void*, UINT, void* const*);
     ExecuteCommandListsFn orig_execute_command_lists_ = nullptr;
     static void STDMETHODCALLTYPE hooked_ExecuteCommandLists(void* queue, UINT count, void* const* lists);
-    static void* g_dx12_captured_queue_;
 #endif
 
     std::mutex                        render_mutex_;

@@ -98,6 +98,7 @@ void StarOverlay::panel_header(ImFont* fsmall, ImFont* ftitle, float pw)
     case GraphicsAPI::DX12:   gfx = "DirectX 12"; break;
     case GraphicsAPI::OpenGL: gfx = "OpenGL"; break;
     case GraphicsAPI::Vulkan: gfx = "Vulkan"; break;
+case GraphicsAPI::GDI: gfx = "GDI"; break;
     default: break;
     }
     ImGui::Text("Graphics: %s", gfx);

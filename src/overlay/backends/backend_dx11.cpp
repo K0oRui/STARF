@@ -37,7 +37,7 @@ void StarOverlay::render_frame(IDXGISwapChain* chain)
 
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    if (!imgui_initialized_) return;
+    if (!imgui_initialized_ || active_api_ != GraphicsAPI::DX11) return;
 
     if (!rtv_) {
         ID3D11Texture2D* bb = nullptr;
@@ -48,9 +48,9 @@ void StarOverlay::render_frame(IDXGISwapChain* chain)
     }
     if (!rtv_) return;
 
-    ID3D11RenderTargetView* prev_rtv = nullptr;
+    ID3D11RenderTargetView* prev_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
     ID3D11DepthStencilView* prev_dsv = nullptr;
-    context_->OMGetRenderTargets(1, &prev_rtv, &prev_dsv);
+    context_->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, prev_rtvs, &prev_dsv);
 
     context_->OMSetRenderTargets(1, &rtv_, nullptr);
 
@@ -62,8 +62,8 @@ void StarOverlay::render_frame(IDXGISwapChain* chain)
     build_frame_ui();
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-    context_->OMSetRenderTargets(1, &prev_rtv, prev_dsv);
-    if (prev_rtv) prev_rtv->Release();
+    context_->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, prev_rtvs, prev_dsv);
+    for (auto* view : prev_rtvs) if (view) view->Release();
     if (prev_dsv) prev_dsv->Release();
 
     maybe_capture_dx11(chain);

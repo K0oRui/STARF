@@ -13,7 +13,7 @@
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 #include "imgui_impl_dx8.h"
-#include "d3d8.h"
+#include "dx8/d3d8.h"
 
 struct ImGui_ImplDX8_Data
 {
@@ -132,7 +132,7 @@ void ImGui_ImplDX8_RenderDrawData(ImDrawData* draw_data)
     {
         if (bd->pIB) { bd->pIB->Release(); bd->pIB = nullptr; }
         bd->IndexBufferSize = draw_data->TotalIdxCount + 10000;
-        if (bd->pd3dDevice->CreateIndexBuffer(bd->IndexBufferSize * sizeof(ImDrawIdx), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT, &bd->pIB) < 0)
+        if (bd->pd3dDevice->CreateIndexBuffer(bd->IndexBufferSize * sizeof(ImDrawIdx), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, sizeof(ImDrawIdx) == 2 ? D3DFMT_INDEX16 : D3DFMT_INDEX32, D3DPOOL_DEFAULT, &bd->pIB) < 0)
             return;
     }
 
@@ -365,13 +365,12 @@ void ImGui_ImplDX8_InvalidateDeviceObjects()
     if (bd->FontTexture) { bd->FontTexture->Release(); bd->FontTexture = nullptr; ImGui::GetIO().Fonts->SetTexID(0); }
 }
 
-void ImGui_ImplDX8_NewFrame()
+bool ImGui_ImplDX8_NewFrame()
 {
     ImGui_ImplDX8_Data* bd = ImGui_ImplDX8_GetBackendData();
     IM_ASSERT(bd != nullptr && "Did you call ImGui_ImplDX8_Init()?");
 
-    if (!bd->FontTexture)
-        ImGui_ImplDX8_CreateDeviceObjects();
+    return bd->FontTexture || ImGui_ImplDX8_CreateDeviceObjects();
 }
 
 #endif // #ifndef IMGUI_DISABLE

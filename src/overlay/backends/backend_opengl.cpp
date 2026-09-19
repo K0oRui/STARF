@@ -2,6 +2,7 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_opengl3.h"
 #include <MinHook.h>
+#include <GL/gl.h>
 
 BOOL WINAPI StarOverlay::hooked_wglSwapBuffers(HDC hdc)
 {
@@ -31,7 +32,7 @@ void StarOverlay::hook_opengl()
 
 void StarOverlay::on_present_opengl(HDC hdc)
 {
-    if (!enabled_) return;
+    if (!enabled_ || !wglGetCurrentContext() || wglGetCurrentDC() != hdc) return;
     poll_hotkey();
     note_present();
     if (game_api_ == GraphicsAPI::None) {
@@ -50,7 +51,7 @@ void StarOverlay::on_present_opengl(HDC hdc)
         hook_window_for(new_hwnd);
 
         ImGui::CreateContext();
-        ImGui_ImplWin32_Init(hwnd_);
+        if (!ImGui_ImplWin32_Init(hwnd_)) { ImGui::DestroyContext(); return; }
 
         if (ImGui_ImplOpenGL3_Init()) {
             style_.setup();
@@ -58,6 +59,8 @@ void StarOverlay::on_present_opengl(HDC hdc)
             active_api_ = GraphicsAPI::OpenGL;
             STAR_LOG("ImGui ready (OpenGL) hwnd=%p", hwnd_);
         } else {
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
             STAR_LOG("ImGui OpenGL init FAILED");
         }
     }
@@ -70,28 +73,8 @@ void StarOverlay::on_present_opengl(HDC hdc)
 
         build_frame_ui();
 
-        #ifndef GL_ALL_ATTRIB_BITS
-        #define GL_ALL_ATTRIB_BITS 0x000fffff
-        #define GL_CLIENT_ALL_ATTRIB_BITS 0xffffffff
-        #endif
-        typedef void(WINAPI* glPushAttribFn)(uint32_t);
-        typedef void(WINAPI* glPopAttribFn)();
-        typedef void(WINAPI* glPushClientAttribFn)(uint32_t);
-        typedef void(WINAPI* glPopClientAttribFn)();
-
-        HMODULE opengl_dll = GetModuleHandleA("opengl32.dll");
-        auto glPushAttrib = (glPushAttribFn)GetProcAddress(opengl_dll, "glPushAttrib");
-        auto glPopAttrib = (glPopAttribFn)GetProcAddress(opengl_dll, "glPopAttrib");
-        auto glPushClientAttrib = (glPushClientAttribFn)GetProcAddress(opengl_dll, "glPushClientAttrib");
-        auto glPopClientAttrib = (glPopClientAttribFn)GetProcAddress(opengl_dll, "glPopClientAttrib");
-
-        if (glPushAttrib) glPushAttrib(GL_ALL_ATTRIB_BITS);
-        if (glPushClientAttrib) glPushClientAttrib(GL_CLIENT_ALL_ATTRIB_BITS);
-
+        // The ImGui backend preserves GL state, including in core profiles.
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-        if (glPopClientAttrib) glPopClientAttrib();
-        if (glPopAttrib) glPopAttrib();
 
         maybe_capture_opengl();
     }

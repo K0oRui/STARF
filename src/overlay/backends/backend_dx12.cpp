@@ -4,9 +4,13 @@
 #include "imgui_impl_dx12.h"
 #include <MinHook.h>
 #include <d3d12.h>
+#include "dx12_submission.h"
 
 #ifdef _WIN64
-void* StarOverlay::g_dx12_captured_queue_ = nullptr;
+namespace {
+std::mutex queue_mutex;
+auto* captured_queue = new Microsoft::WRL::ComPtr<ID3D12CommandQueue>;
+}
 #endif
 
 #ifdef _WIN64
@@ -51,23 +55,25 @@ void StarOverlay::try_init_dx12(IDXGISwapChain* chain)
         hook_dx12_ecl();
         return;
     }
-    if (g_dx12_captured_queue_) {
-        ID3D12Device* d3d12_device = nullptr;
-        auto* queue = (ID3D12CommandQueue*)g_dx12_captured_queue_;
-        if (SUCCEEDED(queue->GetDevice(__uuidof(ID3D12Device), (void**)&d3d12_device))) {
-            init_imgui_dx12(chain, d3d12_device, g_dx12_captured_queue_);
-            d3d12_device->Release();
-        } else {
-            static bool logged_queue_fail = false;
-            if (!logged_queue_fail) { logged_queue_fail = true; STAR_LOG("try_init_dx12: queue->GetDevice failed"); }
-        }
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        queue = *captured_queue;
     }
+    if (!queue) return;
+    Microsoft::WRL::ComPtr<ID3D12Device> queue_device, chain_device;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&queue_device))) ||
+        FAILED(chain->GetDevice(IID_PPV_ARGS(&chain_device))) ||
+        queue_device.Get() != chain_device.Get()) return;
+    init_imgui_dx12(chain, chain_device.Get(), queue.Get());
 }
 #endif
 
 #ifdef _WIN64
 void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
 {
+    std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || chain != dx12_chain_) return;
     if (!screenshots_.consume()) return;
     if (!enabled_) return;
     // Render is off (hostile titles): read the composed desktop instead of
@@ -139,20 +145,10 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
     b1.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b1.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     list->ResourceBarrier(1, &b1);
-    list->Close();
-    ID3D12CommandList* lists[] = { list };
-    queue->ExecuteCommandLists(1, lists);
-    ID3D12Fence* fence = nullptr;
-    if (SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) && fence) {
-        if (SUCCEEDED(queue->Signal(fence, 1)) && fence->GetCompletedValue() < 1) {
-            HANDLE ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-            if (ev) {
-                fence->SetEventOnCompletion(1, ev);
-                WaitForSingleObject(ev, 3000);
-                CloseHandle(ev);
-            }
-        }
-        fence->Release();
+    if (FAILED(list->Close()) ||
+        !star_dx12::submit_and_wait(dev, queue, list, {alloc, readback, resource})) {
+        list->Release(); alloc->Release(); readback->Release();
+        return;
     }
     void* mapped = nullptr;
     D3D12_RANGE range{};
@@ -191,11 +187,11 @@ void STDMETHODCALLTYPE StarOverlay::hooked_ExecuteCommandLists(void* queue, UINT
     // Only the DIRECT (graphics) queue can do our render-target work. Games
     // routinely execute copy/compute queues first (uploads during loading);
     // capturing one of those and issuing graphics barriers on it faults.
-    if (!g_dx12_captured_queue_) {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
         auto* q = (ID3D12CommandQueue*)queue;
-        D3D12_COMMAND_QUEUE_DESC desc = q->GetDesc();
-        if (desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-            g_dx12_captured_queue_ = queue;
+        if (!*captured_queue && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+            *captured_queue = q;
             STAR_LOG("DX12 command queue captured");
         }
     }
@@ -206,111 +202,78 @@ void STDMETHODCALLTYPE StarOverlay::hooked_ExecuteCommandLists(void* queue, UINT
 #ifdef _WIN64
 void StarOverlay::init_imgui_dx12(IDXGISwapChain* chain, void* device, void* command_queue)
 {
+    using Microsoft::WRL::ComPtr;
     auto* dev = (ID3D12Device*)device;
     auto* queue = (ID3D12CommandQueue*)command_queue;
-
     DXGI_SWAP_CHAIN_DESC sd{};
-    chain->GetDesc(&sd);
+    if (imgui_initialized_ || FAILED(chain->GetDesc(&sd)) || !sd.BufferCount) return;
     hook_window_for(sd.OutputWindow);
-    STAR_LOG("init_imgui_dx12: buffers=%u fmt=%u hwnd=%p", sd.BufferCount, sd.BufferDesc.Format, hwnd_);
 
-    D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
-    rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtv_desc.NumDescriptors = sd.BufferCount;
-    rtv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = sd.BufferCount;
+    ComPtr<ID3D12DescriptorHeap> rtv, srv;
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv)))) return;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 257;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv)))) return;
 
-    ID3D12DescriptorHeap* rtv_heap = nullptr;
-    if (FAILED(dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap)))) { STAR_LOG("init_imgui_dx12: rtv_heap failed"); return; }
-
-    D3D12_DESCRIPTOR_HEAP_DESC srv_desc = {};
-    srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srv_desc.NumDescriptors = 257;
-    srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-
-    ID3D12DescriptorHeap* srv_heap = nullptr;
-    if (FAILED(dev->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&srv_heap)))) {
-        STAR_LOG("init_imgui_dx12: srv_heap failed");
-        rtv_heap->Release();
-        return;
+    std::vector<ComPtr<ID3D12Resource>> resources(sd.BufferCount);
+    std::vector<ComPtr<ID3D12CommandAllocator>> allocators(sd.BufferCount);
+    auto handle = rtv->GetCPUDescriptorHandleForHeapStart();
+    UINT stride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    for (UINT i = 0; i < sd.BufferCount; ++i) {
+        if (FAILED(chain->GetBuffer(i, IID_PPV_ARGS(&resources[i]))) ||
+            FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&allocators[i])))) return;
+        dev->CreateRenderTargetView(resources[i].Get(), nullptr, handle);
+        handle.ptr += stride;
     }
-
-    std::vector<ID3D12Resource*> resources(sd.BufferCount);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
-    UINT rtv_descriptor_size = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-
-    for (UINT i = 0; i < sd.BufferCount; i++) {
-        if (SUCCEEDED(chain->GetBuffer(i, IID_PPV_ARGS(&resources[i])))) {
-            dev->CreateRenderTargetView(resources[i], nullptr, rtv_handle);
-            rtv_handle.ptr += rtv_descriptor_size;
-        }
-    }
-
-    std::vector<ID3D12CommandAllocator*> allocators(sd.BufferCount);
-    for (UINT i = 0; i < sd.BufferCount; i++) {
-        if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators[i])))) { STAR_LOG("init_imgui_dx12: allocator[%u] failed", i); return; }
-    }
-
-    ID3D12GraphicsCommandList* cmd_list = nullptr;
-    if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0], nullptr, IID_PPV_ARGS(&cmd_list)))) { STAR_LOG("init_imgui_dx12: cmd_list failed"); return; }
-    cmd_list->Close();
-
-    ImGui::CreateContext();
-    ImGui_ImplWin32_Init(hwnd_);
-    hook_window();
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;
+    if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            allocators[0].Get(), nullptr, IID_PPV_ARGS(&list))) ||
+        FAILED(list->Close()) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return;
+    HANDLE event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return;
 
     IMGUI_CHECKVERSION();
-    STAR_LOG("init_imgui_dx12: calling ImGui_ImplDX12_Init");
-    if (ImGui_ImplDX12_Init(dev, sd.BufferCount, sd.BufferDesc.Format, srv_heap,
-                            srv_heap->GetCPUDescriptorHandleForHeapStart(),
-                            srv_heap->GetGPUDescriptorHandleForHeapStart())) {
-        style_.setup();
-        dev->AddRef();
-        queue->AddRef();
-        dx12_device_ = dev;
-        dx12_command_queue_ = queue;
-        dx12_rtv_heap_ = rtv_heap;
-        dx12_srv_heap_ = srv_heap;
-        dx12_command_list_ = cmd_list;
-        dx12_buffer_count_ = sd.BufferCount;
-
-        dx12_command_allocators_.resize(sd.BufferCount);
-        for (UINT i = 0; i < sd.BufferCount; i++) dx12_command_allocators_[i] = allocators[i];
-
-        dx12_resources_.resize(sd.BufferCount);
-        for (UINT i = 0; i < sd.BufferCount; i++) dx12_resources_[i] = resources[i];
-
-        ID3D12Fence* frame_fence = nullptr;
-        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&frame_fence))) || !frame_fence) {
-            STAR_LOG("init_imgui_dx12: frame fence failed, cleaning up");
-            cleanup_dx12();
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-            return;
-        }
-        HANDLE fence_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-        if (!fence_event) {
-            STAR_LOG("init_imgui_dx12: fence event failed, cleaning up");
-            frame_fence->Release();
-            cleanup_dx12();
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-            return;
-        }
-        dx12_fence_ = frame_fence;
-        dx12_fence_value_ = 0;
-        dx12_frame_fence_.assign(sd.BufferCount, 0);
-        dx12_fence_event_ = fence_event;
-
-        dx12_srv_next_slot_ = 1;
-        imgui_initialized_ = true;
-        active_api_ = GraphicsAPI::DX12;
-        STAR_LOG("ImGui ready (DX12)");
-    } else {
-        STAR_LOG("init_imgui_dx12: ImGui_ImplDX12_Init FAILED - BackendRendererUserData=%p",
-                 ImGui::GetIO().BackendRendererUserData);
-        ImGui_ImplWin32_Shutdown();
+    ImGui::CreateContext();
+    bool platform_ready = ImGui_ImplWin32_Init(hwnd_);
+    if (!platform_ready || !ImGui_ImplDX12_Init(dev, sd.BufferCount,
+            sd.BufferDesc.Format, srv.Get(), srv->GetCPUDescriptorHandleForHeapStart(),
+            srv->GetGPUDescriptorHandleForHeapStart())) {
+        if (platform_ready) ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
+        CloseHandle(event);
+        return;
     }
+    style_.setup();
+    dev->AddRef(); queue->AddRef();
+    dx12_device_ = dev;
+    dx12_command_queue_ = queue;
+    dx12_rtv_heap_ = rtv.Detach();
+    dx12_srv_heap_ = srv.Detach();
+    dx12_command_list_ = list.Detach();
+    dx12_fence_ = fence.Detach();
+    dx12_fence_event_ = event;
+    dx12_fence_value_ = 0;
+    dx12_buffer_count_ = sd.BufferCount;
+    dx12_frame_index_ = 0;
+    dx12_chain_ = chain;
+    dx12_command_allocators_.resize(sd.BufferCount);
+    dx12_resources_.resize(sd.BufferCount);
+    for (UINT i = 0; i < sd.BufferCount; ++i) {
+        dx12_command_allocators_[i] = allocators[i].Detach();
+        dx12_resources_[i] = resources[i].Detach();
+    }
+    dx12_frame_fence_.assign(sd.BufferCount, 0);
+    dx12_srv_next_slot_ = 1;
+    imgui_initialized_ = true;
+    active_api_ = GraphicsAPI::DX12;
+    STAR_LOG("ImGui ready (DX12) buffers=%u", sd.BufferCount);
 }
 
 ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int w, int h)
@@ -396,31 +359,12 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
     barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     tmp_list->ResourceBarrier(1, &barrier);
-    tmp_list->Close();
-
-    ID3D12CommandList* lists[] = { tmp_list };
-    queue->ExecuteCommandLists(1, lists);
-
-    ID3D12Fence* fence = nullptr;
-    if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
-        tmp_list->Release(); tmp_alloc->Release(); upload_buf->Release();
-        texture->Release(); return nullptr;
-    }
-    if (FAILED(queue->Signal(fence, 1))) {
-        fence->Release();
-        tmp_list->Release(); tmp_alloc->Release(); upload_buf->Release();
-        texture->Release(); return nullptr;
-    }
-    if (fence->GetCompletedValue() < 1) {
-        HANDLE ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-        fence->SetEventOnCompletion(1, ev);
-        WaitForSingleObject(ev, INFINITE);
-        CloseHandle(ev);
-    }
-    fence->Release();
+    bool uploaded = SUCCEEDED(tmp_list->Close()) &&
+        star_dx12::submit_and_wait(dev, queue, tmp_list, {tmp_alloc, upload_buf, texture});
     tmp_list->Release();
     tmp_alloc->Release();
     upload_buf->Release();
+    if (!uploaded) { texture->Release(); return nullptr; }
 
     UINT desc_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
@@ -444,8 +388,8 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
 {
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    if (!imgui_initialized_) return;
-    // Escape hatch: API emulation without any DX12 drawing.    if (!Settings::get().overlay_dx12_render) return;
+    if (!imgui_initialized_ || chain != dx12_chain_) return;
+    if (!Settings::get().overlay_dx12_render || active_api_ != GraphicsAPI::DX12) return;
 
     IDXGISwapChain3* chain3 = nullptr;
     UINT backbuffer_index = 0;
@@ -455,13 +399,6 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
     } else {
         return;
     }
-
-    ImGui_ImplDX12_NewFrame();
-    ImGui_ImplWin32_NewFrame();
-    ImGui::NewFrame();
-    apply_cursor_mode();
-
-    build_frame_ui();
 
     auto* dev = (ID3D12Device*)dx12_device_;
     auto* queue = (ID3D12CommandQueue*)dx12_command_queue_;
@@ -474,17 +411,18 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
         !fence || !fence_event) {
         return;
     }
-    auto* allocator = (ID3D12CommandAllocator*)dx12_command_allocators_[backbuffer_index];
+    UINT frame_index = dx12_frame_index_;
+    auto* allocator = (ID3D12CommandAllocator*)dx12_command_allocators_[frame_index];
     auto* resource = (ID3D12Resource*)dx12_resources_[backbuffer_index];
     auto* rtv_heap = (ID3D12DescriptorHeap*)dx12_rtv_heap_;
     auto* srv_heap = (ID3D12DescriptorHeap*)dx12_srv_heap_;
 
     // Wait until the GPU finished the previous frame recorded with this
     // buffer's allocator. Timeout+skip (instead of hang) on device loss.
-    uint64_t wait_value = dx12_frame_fence_[backbuffer_index];
+    uint64_t wait_value = dx12_frame_fence_[frame_index];
     if (wait_value != 0 && fence->GetCompletedValue() < wait_value) {
-        fence->SetEventOnCompletion(wait_value, fence_event);
-        if (WaitForSingleObject(fence_event, 1000) != WAIT_OBJECT_0) {
+        if (FAILED(fence->SetEventOnCompletion(wait_value, fence_event)) ||
+            WaitForSingleObject(fence_event, 1000) != WAIT_OBJECT_0) {
             static bool logged_timeout = false;
             if (!logged_timeout) {
                 logged_timeout = true;
@@ -499,6 +437,14 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
         }
     }
 
+    ImGui_ImplDX12_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+    apply_cursor_mode();
+
+    build_frame_ui();
+    if (ImGui::GetDrawData()->DisplaySize.x <= 0 || ImGui::GetDrawData()->DisplaySize.y <= 0) return;
+
     // NOTE: on engines with unexpected backbuffer state (e.g. ACEVO), ANY
     // transition of their buffer faults the GPU, so there is a dx12_render
     // escape hatch in overlay.star. When enabled we assume stock flip-model
@@ -512,9 +458,6 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
     {
-        // First-frames diagnostics: pinpoints which D3D call dies, if any.
-        static int dx12_dbg = 0;
-        bool dbg = dx12_dbg < 5;
         HRESULT r1 = allocator->Reset();
         if (FAILED(r1)) {
             STAR_LOG("DX12 allocator Reset failed hr=0x%08x removed=0x%08x",
@@ -527,7 +470,6 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
                 (unsigned)r2, (unsigned)dev->GetDeviceRemovedReason());
             return;
         }
-        if (dbg) STAR_LOG("DX12 frame %d: reset ok (bi=%u)", dx12_dbg, backbuffer_index);
     }
     cmd_list->ResourceBarrier(1, &barrier);
 
@@ -553,8 +495,12 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
 
     ID3D12CommandList* lists[] = { cmd_list };
     queue->ExecuteCommandLists(1, lists);
-    queue->Signal(fence, ++dx12_fence_value_);
-    dx12_frame_fence_[backbuffer_index] = dx12_fence_value_;
+    if (FAILED(queue->Signal(fence, ++dx12_fence_value_))) {
+        STAR_LOG("DX12 frame fence signal failed");
+        return;
+    }
+    dx12_frame_fence_[frame_index] = dx12_fence_value_;
+    dx12_frame_index_ = (frame_index + 1) % dx12_buffer_count_;
     dx12_timeout_streak_ = 0;
     {
         static bool logged_first = false;
@@ -568,8 +514,21 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
     }
 }
 
+void StarOverlay::wait_dx12_idle()
+{
+    auto* fence = (ID3D12Fence*)dx12_fence_;
+    auto* dev = (ID3D12Device*)dx12_device_;
+    if (fence && dev && SUCCEEDED(dev->GetDeviceRemovedReason()) &&
+        fence->GetCompletedValue() < dx12_fence_value_) {
+        fence->SetEventOnCompletion(dx12_fence_value_, nullptr);
+    }
+}
+
 void StarOverlay::cleanup_dx12()
 {
+    wait_dx12_idle();
+    dx12_chain_ = nullptr;
+    dx12_frame_index_ = 0;
     for (auto* res : dx12_icon_resources_) if (res) ((ID3D12Resource*)res)->Release();
     dx12_icon_resources_.clear();
     dx12_srv_next_slot_ = 1;

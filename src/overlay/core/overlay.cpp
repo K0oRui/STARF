@@ -20,8 +20,10 @@ StarOverlay* g_overlay = nullptr;
 
 StarOverlay& StarOverlay::get()
 {
-    static StarOverlay instance;
-    return instance;
+    // Hooks retain this object for the process lifetime. Avoid static destruction
+    // under the loader lock, where joining worker threads is unsafe.
+    static StarOverlay* instance = new StarOverlay;
+    return *instance;
 }
 
 Overlay& Overlay::get()
@@ -157,6 +159,7 @@ void StarOverlay::init()
     hook_dxgi();
     hook_opengl();
     hook_vulkan();
+    hook_gdi();
     hooks_installed_ = true;
 
     // Retry late-loaded gfx modules (game loads d3d12/vulkan/opengl AFTER SteamAPI_Init).
@@ -166,7 +169,7 @@ void StarOverlay::init()
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (retry_stop_.load() || !g_overlay) break;
             ensure_hooks();
-            if (dxgi_hooked_ && dx9_hooked_ && dx8_hooked_ && dx7_hooked_ && opengl_hooked_ && vulkan_hooked_) break;
+            if (dxgi_hooked_ && dx9_hooked_ && dx8_hooked_ && dx7_hooked_ && opengl_hooked_ && vulkan_hooked_ && gdi_hooked_) break;
             if (imgui_initialized_) break;
         }
     }).detach();
@@ -221,6 +224,7 @@ void StarOverlay::ensure_hooks()
     if (!dx7_hooked_) hook_dx7();
     if (!opengl_hooked_) hook_opengl();
     if (!vulkan_hooked_) hook_vulkan();
+    if (!gdi_hooked_) hook_gdi();
 #ifdef _WIN64
     hook_dx12_ecl();
 #endif
@@ -311,6 +315,8 @@ void StarOverlay::shutdown()
         wnd_proc_orig_ = nullptr;
     }
 
+    if (active_api_ == GraphicsAPI::Vulkan) cleanup_vulkan();
+
     if (imgui_initialized_) {
         if (active_api_ == GraphicsAPI::DX11) {
             ImGui_ImplDX11_Shutdown();
@@ -318,6 +324,7 @@ void StarOverlay::shutdown()
             ImGui_ImplDX10_Shutdown();
 #ifdef _WIN64
         } else if (active_api_ == GraphicsAPI::DX12) {
+            wait_dx12_idle();
             ImGui_ImplDX12_Shutdown();
 #endif
         } else if (active_api_ == GraphicsAPI::DX9) {
@@ -330,6 +337,8 @@ void StarOverlay::shutdown()
             ImGui_ImplOpenGL3_Shutdown();
         } else if (active_api_ == GraphicsAPI::Vulkan) {
             ImGui_ImplVulkan_Shutdown();
+        } else if (active_api_ == GraphicsAPI::GDI) {
+            ImGui_ImplDX11_Shutdown();
         }
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
@@ -343,6 +352,7 @@ void StarOverlay::shutdown()
     cleanup_dx12();
 #endif
     cleanup_vulkan();
+    gdi_.reset();
 
     if (api_snapshot == GraphicsAPI::DX11) {
         icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
@@ -356,6 +366,8 @@ void StarOverlay::shutdown()
         release_icons_dx8();
     } else if (api_snapshot == GraphicsAPI::DX7) {
         release_icons_dx7();
+    } else if (api_snapshot == GraphicsAPI::GDI) {
+        icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
     }
     // OpenGL icon textures belong to the game's GL context, which may be gone
     // at shutdown; the OS/driver reclaims them with the context.
