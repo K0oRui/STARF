@@ -161,17 +161,7 @@ ImTextureID StarOverlay::upload_icon_dx8(const std::vector<uint8_t>& rgba, int w
     if (SUCCEEDED(tex->LockRect(0, &locked, nullptr, 0))) {
         // WIC hands us RGBA bytes; D3DFMT_A8R8G8B8 stores BGRA in memory,
         // so swizzle R<->B (otherwise browns render blue/purple).
-        const uint8_t* src = rgba.data();
-        uint8_t* dst = (uint8_t*)locked.pBits;
-        UINT row_bytes = (UINT)w * 4;
-        for (int y = 0; y < h; y++) {
-            const uint8_t* s = src + (size_t)y * row_bytes;
-            uint8_t* d = dst + (size_t)y * locked.Pitch;
-            for (int x = 0; x < w; x++) {
-                d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
-                s += 4; d += 4;
-            }
-        }
+        copy_pixels32(locked.pBits, locked.Pitch, rgba.data(), (size_t)w * 4, w, h, true);
         tex->UnlockRect(0);
         return (ImTextureID)(void*)tex;
     }
@@ -230,14 +220,8 @@ void StarOverlay::maybe_capture_dx8(IDirect3DDevice8* device)
                 }
             }
         } else {
-            for (UINT y = 0; y < desc.Height; y++) {
-                const uint8_t* s = (const uint8_t*)lr.pBits + (size_t)y * lr.Pitch;
-                uint8_t* d = rgba.data() + (size_t)y * desc.Width * 4;
-                for (UINT x = 0; x < desc.Width; x++) {
-                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
-                    s += 4; d += 4;
-                }
-            }
+            copy_pixels32(rgba.data(), (size_t)desc.Width * 4, lr.pBits, lr.Pitch,
+                          desc.Width, desc.Height, true);
         }
         sys->UnlockRect();
         std::string path = ScreenshotService::next_path();

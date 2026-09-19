@@ -1,4 +1,5 @@
 #include "overlay/capture/screenshot_service.h"
+#include "overlay/core/pixel_copy.h"
 #include "core/settings.h"
 #include "core/storage.h"
 #include "core/star_common.h"
@@ -82,12 +83,7 @@ bool ScreenshotService::save_rgba_png(const std::string& path, const uint8_t* rg
                 bool fmt_ok = true;
                 if (IsEqualGUID(fmt, GUID_WICPixelFormat32bppBGRA)) {
                     bgra.resize((size_t)w * h * 4);
-                    for (size_t i = 0; i < (size_t)w * h; i++) {
-                        bgra[i * 4 + 0] = data[i * 4 + 2];
-                        bgra[i * 4 + 1] = data[i * 4 + 1];
-                        bgra[i * 4 + 2] = data[i * 4 + 0];
-                        bgra[i * 4 + 3] = data[i * 4 + 3];
-                    }
+                    copy_pixels32(bgra.data(), (size_t)w * 4, data, (size_t)w * 4, w, h, true);
                     src = bgra.data();
                 } else if (!IsEqualGUID(fmt, GUID_WICPixelFormat32bppRGBA)) {
                     STAR_LOG("Screenshot: unexpected pixel format, aborting %s", path.c_str());

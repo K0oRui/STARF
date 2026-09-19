@@ -7,6 +7,7 @@
 #include "dx12_submission.h"
 
 #ifdef _WIN64
+using Microsoft::WRL::ComPtr;
 namespace {
 std::mutex queue_mutex;
 auto* captured_queue = new Microsoft::WRL::ComPtr<ID3D12CommandQueue>;
@@ -113,19 +114,15 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
     bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
     bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ID3D12Resource* readback = nullptr;
+    ComPtr<ID3D12Resource> readback;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback))) || !readback)
         return;
-    ID3D12CommandAllocator* alloc = nullptr;
-    ID3D12GraphicsCommandList* list = nullptr;
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> list;
     HRESULT ok = dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc));
-    if (SUCCEEDED(ok)) ok = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&list));
-    if (FAILED(ok) || !list) {
-        if (alloc) alloc->Release();
-        readback->Release();
-        return;
-    }
+    if (SUCCEEDED(ok)) ok = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list));
+    if (FAILED(ok) || !list) return;
     D3D12_RESOURCE_BARRIER b0{};
     b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b0.Transition.pResource = resource;
@@ -134,7 +131,7 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
     b0.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     list->ResourceBarrier(1, &b0);
     D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = readback;
+    dst.pResource = readback.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint = fp;
     D3D12_TEXTURE_COPY_LOCATION src{};
@@ -146,28 +143,15 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
     b1.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     list->ResourceBarrier(1, &b1);
     if (FAILED(list->Close()) ||
-        !star_dx12::submit_and_wait(dev, queue, list, {alloc, readback, resource})) {
-        list->Release(); alloc->Release(); readback->Release();
-        return;
-    }
+        !star_dx12::submit_and_wait(dev, queue, list.Get(), {alloc.Get(), readback.Get(), resource})) return;
     void* mapped = nullptr;
     D3D12_RANGE range{};
     range.Begin = 0; range.End = (SIZE_T)total;
     if (SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped) {
         UINT w = (UINT)rd.Width, h = rd.Height;
         std::vector<uint8_t> rgba((size_t)w * h * 4);
-        for (UINT y = 0; y < h; y++) {
-            const uint8_t* s = (const uint8_t*)mapped + fp.Offset + (size_t)y * fp.Footprint.RowPitch;
-            uint8_t* d = rgba.data() + (size_t)y * w * 4;
-            if (bgra) {
-                for (UINT x = 0; x < w; x++) {
-                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
-                    s += 4; d += 4;
-                }
-            } else {
-                memcpy(d, s, (size_t)w * 4);
-            }
-        }
+        copy_pixels32(rgba.data(), (size_t)w * 4, (const uint8_t*)mapped + fp.Offset,
+                      fp.Footprint.RowPitch, w, h, bgra);
         D3D12_RANGE empty{};
         empty.Begin = 0; empty.End = 0;
         readback->Unmap(0, &empty);
@@ -175,9 +159,6 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
         if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)w, (int)h))
             notify_screenshot(path);
     }
-    list->Release();
-    alloc->Release();
-    readback->Release();
 }
 #endif
 
@@ -202,7 +183,6 @@ void STDMETHODCALLTYPE StarOverlay::hooked_ExecuteCommandLists(void* queue, UINT
 #ifdef _WIN64
 void StarOverlay::init_imgui_dx12(IDXGISwapChain* chain, void* device, void* command_queue)
 {
-    using Microsoft::WRL::ComPtr;
     auto* dev = (ID3D12Device*)device;
     auto* queue = (ID3D12CommandQueue*)command_queue;
     DXGI_SWAP_CHAIN_DESC sd{};
@@ -298,14 +278,14 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
     buf_desc.SampleDesc.Count = 1;
     buf_desc.Layout     = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    ID3D12Resource* upload_buf = nullptr;
+    ComPtr<ID3D12Resource> upload_buf;
     if (FAILED(dev->CreateCommittedResource(&upload_props, D3D12_HEAP_FLAG_NONE,
                                             &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ,
                                             nullptr, IID_PPV_ARGS(&upload_buf))))
         return nullptr;
 
     void* mapped = nullptr;
-    if (FAILED(upload_buf->Map(0, nullptr, &mapped))) { upload_buf->Release(); return nullptr; }
+    if (FAILED(upload_buf->Map(0, nullptr, &mapped))) return nullptr;
     for (int row = 0; row < h; row++)
         memcpy((uint8_t*)mapped + (size_t)row * aligned_pitch, rgba.data() + (size_t)row * row_pitch, row_pitch);
     upload_buf->Unmap(0, nullptr);
@@ -321,28 +301,23 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
     tex_desc.SampleDesc.Count   = 1;
     tex_desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
-    ID3D12Resource* texture = nullptr;
+    ComPtr<ID3D12Resource> texture;
     if (FAILED(dev->CreateCommittedResource(&default_props, D3D12_HEAP_FLAG_NONE,
                                             &tex_desc, D3D12_RESOURCE_STATE_COPY_DEST,
-                                            nullptr, IID_PPV_ARGS(&texture)))) {
-        upload_buf->Release(); return nullptr;
-    }
+                                            nullptr, IID_PPV_ARGS(&texture)))) return nullptr;
 
-    ID3D12CommandAllocator*    tmp_alloc = nullptr;
-    ID3D12GraphicsCommandList* tmp_list  = nullptr;
+    ComPtr<ID3D12CommandAllocator> tmp_alloc;
+    ComPtr<ID3D12GraphicsCommandList> tmp_list;
     if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&tmp_alloc))) ||
-        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, tmp_alloc, nullptr, IID_PPV_ARGS(&tmp_list)))) {
-        if (tmp_alloc) tmp_alloc->Release();
-        texture->Release(); upload_buf->Release(); return nullptr;
-    }
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, tmp_alloc.Get(), nullptr, IID_PPV_ARGS(&tmp_list)))) return nullptr;
 
     D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
-    dst_loc.pResource        = texture;
+    dst_loc.pResource        = texture.Get();
     dst_loc.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dst_loc.SubresourceIndex = 0;
 
     D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-    src_loc.pResource                            = upload_buf;
+    src_loc.pResource                            = upload_buf.Get();
     src_loc.Type                                 = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src_loc.PlacedFootprint.Footprint.Format     = DXGI_FORMAT_R8G8B8A8_UNORM;
     src_loc.PlacedFootprint.Footprint.Width      = (UINT)w;
@@ -354,17 +329,14 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
 
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource   = texture;
+    barrier.Transition.pResource   = texture.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     tmp_list->ResourceBarrier(1, &barrier);
     bool uploaded = SUCCEEDED(tmp_list->Close()) &&
-        star_dx12::submit_and_wait(dev, queue, tmp_list, {tmp_alloc, upload_buf, texture});
-    tmp_list->Release();
-    tmp_alloc->Release();
-    upload_buf->Release();
-    if (!uploaded) { texture->Release(); return nullptr; }
+        star_dx12::submit_and_wait(dev, queue, tmp_list.Get(), {tmp_alloc.Get(), upload_buf.Get(), texture.Get()});
+    if (!uploaded) return nullptr;
 
     UINT desc_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
@@ -378,9 +350,9 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
     srv_desc.ViewDimension             = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv_desc.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv_desc.Texture2D.MipLevels       = 1;
-    dev->CreateShaderResourceView(texture, &srv_desc, cpu);
+    dev->CreateShaderResourceView(texture.Get(), &srv_desc, cpu);
 
-    dx12_icon_resources_.push_back(texture);
+    dx12_icon_resources_.push_back(texture.Detach());
     return (ImTextureID)(void*)(UINT64)gpu.ptr;
 }
 

@@ -47,7 +47,7 @@ bool StarOverlay::prepare_gdi_present(HWND window)
     return gdi_wants_draw() || screenshots_.pending();
 }
 
-void StarOverlay::check_blit_and_present(HDC hdc, int x, int y, int cx, int cy, const char* fn)
+void StarOverlay::check_blit_and_present(HDC hdc, int x, int y, int cx, int cy)
 {
     if (in_gdi_present || !enabled_ || cx <= 0 || cy <= 0) return;
     HWND window = WindowFromDC(hdc);
@@ -128,7 +128,7 @@ BOOL WINAPI StarOverlay::hooked_BitBlt(HDC hdcDest, int x, int y, int cx, int cy
     if (!overlay || !overlay->orig_bitblt_) return FALSE;
     BOOL ret = overlay->orig_bitblt_(hdcDest, x, y, cx, cy, hdcSrc, x1, y1, rop);
     if (ret) {
-        overlay->check_blit_and_present(hdcDest, x, y, cx, cy, "BitBlt");
+        overlay->check_blit_and_present(hdcDest, x, y, cx, cy);
     }
     return ret;
 }
@@ -139,7 +139,7 @@ BOOL WINAPI StarOverlay::hooked_StretchBlt(HDC hdcDest, int xDest, int yDest, in
     if (!overlay || !overlay->orig_stretchblt_) return FALSE;
     BOOL ret = overlay->orig_stretchblt_(hdcDest, xDest, yDest, wDest, hDest, hdcSrc, xSrc, ySrc, wSrc, hSrc, rop);
     if (ret) {
-        overlay->check_blit_and_present(hdcDest, xDest, yDest, wDest, hDest, "StretchBlt");
+        overlay->check_blit_and_present(hdcDest, xDest, yDest, wDest, hDest);
     }
     return ret;
 }
@@ -150,7 +150,7 @@ int WINAPI StarOverlay::hooked_StretchDIBits(HDC hdc, int xDest, int yDest, int 
     if (!overlay || !overlay->orig_stretchdibits_) return 0;
     int ret = overlay->orig_stretchdibits_(hdc, xDest, yDest, DestWidth, DestHeight, xSrc, ySrc, SrcWidth, SrcHeight, lpBits, lpbmi, iUsage, rop);
     if (ret > 0) {
-        overlay->check_blit_and_present(hdc, xDest, yDest, DestWidth, DestHeight, "StretchDIBits");
+        overlay->check_blit_and_present(hdc, xDest, yDest, DestWidth, DestHeight);
     }
     return ret;
 }
@@ -161,7 +161,7 @@ int WINAPI StarOverlay::hooked_SetDIBitsToDevice(HDC hdc, int xDest, int yDest, 
     if (!overlay || !overlay->orig_setdibitstodevice_) return 0;
     int ret = overlay->orig_setdibitstodevice_(hdc, xDest, yDest, w, h, xSrc, ySrc, StartScan, cLines, lpvBits, lpbmi, ColorUse);
     if (ret > 0) {
-        overlay->check_blit_and_present(hdc, xDest, yDest, (int)w, (int)h, "SetDIBitsToDevice");
+        overlay->check_blit_and_present(hdc, xDest, yDest, (int)w, (int)h);
     }
     return ret;
 }
@@ -335,25 +335,6 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
         }
     }
     return drawn;
-}
-
-ImTextureID StarOverlay::upload_icon_gdi(const std::vector<uint8_t>& rgba, int w, int h)
-{
-    if (!gdi_.device || w <= 0 || h <= 0 || w > 16384 || h > 16384 ||
-        rgba.size() < (size_t)w * h * 4) return nullptr;
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = w;
-    desc.Height = h;
-    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA data{rgba.data(), (UINT)(w * 4), 0};
-    ComPtr<ID3D11Texture2D> texture;
-    ComPtr<ID3D11ShaderResourceView> view;
-    if (FAILED(gdi_.device->CreateTexture2D(&desc, &data, &texture)) ||
-        FAILED(gdi_.device->CreateShaderResourceView(texture.Get(), nullptr, &view))) return nullptr;
-    return (ImTextureID)(void*)view.Detach(); // IconCache owns the reference.
 }
 
 void StarOverlay::maybe_capture_gdi(HDC src_dc, int w, int h)

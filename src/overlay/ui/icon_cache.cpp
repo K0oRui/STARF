@@ -33,6 +33,4 @@ ImTextureID IconCache::take(const std::string& key)
     return tex;
 }
 
-void IconCache::add_gl_texture(unsigned int tex) { gl_textures_.push_back(tex); }
-void IconCache::clear_gl() { gl_textures_.clear(); }
 void IconCache::clear() { textures_.clear(); }

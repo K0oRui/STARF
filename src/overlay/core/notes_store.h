@@ -23,7 +23,6 @@ public:
 
 private:
     std::string text_;
-    bool loaded_ = false;
     bool dirty_ = false;
     DWORD last_edit_ = 0;
 };

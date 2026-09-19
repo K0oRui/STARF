@@ -104,16 +104,7 @@ bool StarOverlay::external_create_window(int x, int y, int w, int h)
 
 void StarOverlay::external_free_surfaces()
 {
-    if (ext_dib_dc_) {
-        if (ext_dib_bmp_) {
-            SelectObject(ext_dib_dc_, nullptr);
-            DeleteObject(ext_dib_bmp_);
-            ext_dib_bmp_ = nullptr;
-        }
-        DeleteDC(ext_dib_dc_);
-        ext_dib_dc_ = nullptr;
-    }
-    ext_dib_bits_ = nullptr;
+    ext_pixels_.reset();
     if (ext_d3d9_sys_) { ext_d3d9_sys_->Release(); ext_d3d9_sys_ = nullptr; }
     if (ext_d3d9_rt_) { ext_d3d9_rt_->Release(); ext_d3d9_rt_ = nullptr; }
     if (ext_stage_tex_) { ext_stage_tex_->Release(); ext_stage_tex_ = nullptr; }
@@ -159,24 +150,10 @@ bool StarOverlay::external_alloc_surfaces(int w, int h)
         }
     }
 
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h; // top-down: matches D3D row order
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    ext_dib_dc_ = CreateCompatibleDC(nullptr);
-    if (!ext_dib_dc_) {
+    if (!ext_pixels_.create(w, h)) {
         external_free_surfaces();
         return false;
     }
-    ext_dib_bmp_ = CreateDIBSection(ext_dib_dc_, &bi, DIB_RGB_COLORS, &ext_dib_bits_, nullptr, 0);
-    if (!ext_dib_bmp_ || !ext_dib_bits_) {
-        external_free_surfaces();
-        return false;
-    }
-    SelectObject(ext_dib_dc_, ext_dib_bmp_);
     return true;
 }
 
@@ -369,7 +346,7 @@ void StarOverlay::external_render_frame()
             SetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE, ex);
         }
     }
-    if (!imgui_initialized_ || !ext_dib_bits_) return;
+    if (!imgui_initialized_ || !ext_pixels_.bits()) return;
     if (ext_use_d3d9_) {
         if (!ext_d3d9_dev_ || !ext_d3d9_rt_ || !ext_d3d9_sys_) return;
     } else {
@@ -439,7 +416,7 @@ void StarOverlay::external_render_frame()
             D3DLOCKED_RECT lr{};
             if (SUCCEEDED(ext_d3d9_sys_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
                 const uint8_t* src = (const uint8_t*)lr.pBits;
-                uint8_t* dst = (uint8_t*)ext_dib_bits_;
+                uint8_t* dst = (uint8_t*)ext_pixels_.bits();
                 size_t row = (size_t)w * 4;
                 for (int y = 0; y < h; y++)
                     memcpy(dst + (size_t)y * row, src + (size_t)y * lr.Pitch, row);
@@ -455,7 +432,7 @@ void StarOverlay::external_render_frame()
         D3D11_MAPPED_SUBRESOURCE map{};
         if (SUCCEEDED(context_->Map(ext_stage_tex_, 0, D3D11_MAP_READ, 0, &map))) {
             const uint8_t* src = (const uint8_t*)map.pData;
-            uint8_t* dst = (uint8_t*)ext_dib_bits_;
+            uint8_t* dst = (uint8_t*)ext_pixels_.bits();
             size_t row = (size_t)w * 4;
             for (int y = 0; y < h; y++)
                 memcpy(dst + (size_t)y * row, src + (size_t)y * map.RowPitch, row);
@@ -469,7 +446,7 @@ void StarOverlay::external_upload_layered(int w, int h)
 {
     // Identical pixels = skip the upload. A static HUD then costs no
     // DWM recomposite at all, which is what visibly flickered.
-    uint8_t* dst = (uint8_t*)ext_dib_bits_;
+    uint8_t* dst = (uint8_t*)ext_pixels_.bits();
     size_t row = (size_t)w * 4;
     size_t bytes = row * (size_t)h;
     if (ext_prev_.size() == bytes &&
@@ -490,7 +467,7 @@ void StarOverlay::external_upload_layered(int w, int h)
     bf.SourceConstantAlpha = 255;
     bf.AlphaFormat = AC_SRC_ALPHA;
     HDC screen = GetDC(nullptr);
-    BOOL ulw = UpdateLayeredWindow(ext_hwnd_, screen, &dst_pt, &sz, ext_dib_dc_,
+    BOOL ulw = UpdateLayeredWindow(ext_hwnd_, screen, &dst_pt, &sz, ext_pixels_.dc(),
         &src_pt, 0, &bf, ULW_ALPHA);
     DWORD ulw_err = ulw ? 0 : GetLastError();
     ReleaseDC(nullptr, screen);
@@ -614,7 +591,6 @@ void StarOverlay::external_thread_proc()
     }
     cleanup_rtv();
     icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
-    icons_.clear_gl();
     if (ext_use_d3d9_) {
         if (ext_d3d9_dev_) { ext_d3d9_dev_->Release(); ext_d3d9_dev_ = nullptr; }
         ext_use_d3d9_ = false;

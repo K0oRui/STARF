@@ -11,6 +11,7 @@
 #include "overlay/ui/icon_cache.h"
 #include "overlay/ui/overlay_style.h"
 #include "overlay/core/overlay_util.h"
+#include "overlay/core/pixel_copy.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -66,9 +67,7 @@ public:
     // RT texture, copied to staging, blitted via UpdateLayeredWindow.
     ID3D11Texture2D* ext_rt_tex_ = nullptr;
     ID3D11Texture2D* ext_stage_tex_ = nullptr;
-    HDC ext_dib_dc_ = nullptr;
-    HBITMAP ext_dib_bmp_ = nullptr;
-    void* ext_dib_bits_ = nullptr;
+    star_gdi::DibSurface ext_pixels_;
     // Previous uploaded frame: skip UpdateLayeredWindow when pixels are
     // identical (static HUD = no DWM recomposite = no flicker).
     std::vector<uint8_t> ext_prev_;
@@ -80,7 +79,6 @@ public:
     struct IDirect3DSurface9* ext_d3d9_sys_ = nullptr;
     HANDLE ext_thread_ = nullptr;
     std::atomic<bool> ext_stop_{ false };
-    int ext_track_tick_ = 0;
     int ext_w_ = 0, ext_h_ = 0;
     bool ext_visible_ = false;
     bool fg_ok_ = true;
@@ -209,12 +207,10 @@ private:
     void* orig_vkDestroyDevice_ = nullptr;
     static void WINAPI hooked_vkDestroySwapchainKHR(void*, uint64_t, const void*);
     static void WINAPI hooked_vkDestroyDevice(void*, const void*);
-    void* orig_vkAcquireNextImageKHR_ = nullptr;
     static int WINAPI hooked_vkCreateInstance(const void*, const void*, void**);
     static int WINAPI hooked_vkCreateDevice(void*, const void*, const void*, void**);
     static int WINAPI hooked_vkCreateSwapchainKHR(void*, const void*, const void*, uint64_t*);
     static int WINAPI hooked_vkQueuePresentKHR(void*, const void*);
-    static int WINAPI hooked_vkAcquireNextImageKHR(void*, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t*);
     void hook_vulkan();
     void on_present_vulkan(void* queue, const void* pPresentInfo);
     void init_imgui_vulkan(void* queue, const void* pPresentInfo);
@@ -239,11 +235,10 @@ private:
     static int  WINAPI hooked_SetDIBitsToDevice(HDC, int, int, DWORD, DWORD, int, int, UINT, UINT, const VOID*, const BITMAPINFO*, UINT);
 
     void hook_gdi();
-    void check_blit_and_present(HDC hdc, int x, int y, int cx, int cy, const char* fn);
+    void check_blit_and_present(HDC hdc, int x, int y, int cx, int cy);
     bool render_gdi(HWND hwnd, HDC dest_dc, int w, int h);
     bool gdi_init_device();
     bool gdi_alloc_surfaces(int w, int h);
-    ImTextureID upload_icon_gdi(const std::vector<uint8_t>& rgba, int w, int h);
     void maybe_capture_gdi(HDC src_dc, int w, int h);
 
     star_gdi::Resources gdi_;

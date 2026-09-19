@@ -371,7 +371,6 @@ void StarOverlay::shutdown()
     }
     // OpenGL icon textures belong to the game's GL context, which may be gone
     // at shutdown; the OS/driver reclaims them with the context.
-    icons_.clear_gl();
     icons_.clear();
     if (context_) { context_->Release(); context_ = nullptr; }
     if (device_)  { device_->Release();  device_  = nullptr; }

@@ -7,7 +7,6 @@
 void NotesStore::load()
 {
     text_.clear();
-    loaded_ = true;
     dirty_ = false;
     std::string path = Settings::get().settings_dir + "\\notes.txt";
     std::ifstream in(utf8_to_wstring(path), std::ios::binary);

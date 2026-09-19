@@ -2,6 +2,7 @@
 #include <d3d9.h>
 #include <d3d10.h>
 #include <d3d11.h>
+#include <GL/gl.h>
 
 void StarOverlay::maybe_capture_dx11(IDXGISwapChain* chain)
 {
@@ -46,19 +47,8 @@ void StarOverlay::maybe_capture_dx11(IDXGISwapChain* chain)
     std::string path;
     if (SUCCEEDED(context_->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
         std::vector<uint8_t> rgba((size_t)desc.Width * desc.Height * 4);
-        const uint8_t* srow = (const uint8_t*)map.pData;
-        for (UINT y = 0; y < desc.Height; y++) {
-            uint8_t* d = rgba.data() + (size_t)y * desc.Width * 4;
-            if (bgra) {
-                const uint8_t* s = srow + (size_t)y * map.RowPitch;
-                for (UINT x = 0; x < desc.Width; x++) {
-                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
-                    s += 4; d += 4;
-                }
-            } else {
-                memcpy(d, srow + (size_t)y * map.RowPitch, (size_t)desc.Width * 4);
-            }
-        }
+        copy_pixels32(rgba.data(), (size_t)desc.Width * 4, map.pData, map.RowPitch,
+                      desc.Width, desc.Height, bgra);
         context_->Unmap(staging, 0);
         path = ScreenshotService::next_path();
         if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
@@ -112,19 +102,8 @@ void StarOverlay::maybe_capture_dx10(IDXGISwapChain* chain)
     std::string path;
     if (SUCCEEDED(staging->Map(0, D3D10_MAP_READ, 0, &map))) {
         std::vector<uint8_t> rgba((size_t)desc.Width * desc.Height * 4);
-        const uint8_t* srow = (const uint8_t*)map.pData;
-        for (UINT y = 0; y < desc.Height; y++) {
-            uint8_t* d = rgba.data() + (size_t)y * desc.Width * 4;
-            if (bgra) {
-                const uint8_t* s = srow + (size_t)y * map.RowPitch;
-                for (UINT x = 0; x < desc.Width; x++) {
-                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
-                    s += 4; d += 4;
-                }
-            } else {
-                memcpy(d, srow + (size_t)y * map.RowPitch, (size_t)desc.Width * 4);
-            }
-        }
+        copy_pixels32(rgba.data(), (size_t)desc.Width * 4, map.pData, map.RowPitch,
+                      desc.Width, desc.Height, bgra);
         staging->Unmap(0);
         path = ScreenshotService::next_path();
         if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
@@ -163,14 +142,8 @@ void StarOverlay::maybe_capture_dx9(IDirect3DDevice9* device)
     D3DLOCKED_RECT lr{};
     if (SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
         std::vector<uint8_t> rgba((size_t)desc.Width * desc.Height * 4);
-        for (UINT y = 0; y < desc.Height; y++) {
-            const uint8_t* s = (const uint8_t*)lr.pBits + (size_t)y * lr.Pitch;
-            uint8_t* d = rgba.data() + (size_t)y * desc.Width * 4;
-            for (UINT x = 0; x < desc.Width; x++) {
-                d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
-                s += 4; d += 4;
-            }
-        }
+        copy_pixels32(rgba.data(), (size_t)desc.Width * 4, lr.pBits, lr.Pitch,
+                      desc.Width, desc.Height, true);
         sys->UnlockRect();
         std::string path = ScreenshotService::next_path();
         if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
@@ -183,16 +156,6 @@ void StarOverlay::maybe_capture_opengl()
 {
     if (!screenshots_.consume()) return;
     if (!enabled_) return;
-    HMODULE opengl_dll = GetModuleHandleA("opengl32.dll");
-    if (!opengl_dll) return;
-    typedef void(WINAPI* glGetIntegervFn)(unsigned int, int*);
-    typedef void(WINAPI* glReadPixelsFn)(int, int, int, int, unsigned int, unsigned int, void*);
-    auto glGetIntegerv = (glGetIntegervFn)GetProcAddress(opengl_dll, "glGetIntegerv");
-    auto glReadPixels = (glReadPixelsFn)GetProcAddress(opengl_dll, "glReadPixels");
-    if (!glGetIntegerv || !glReadPixels) return;
-    const unsigned int GL_VIEWPORT = 0x0BA2;
-    const unsigned int GL_RGBA = 0x1908;
-    const unsigned int GL_UNSIGNED_BYTE = 0x1401;
     int vp[4] = {};
     glGetIntegerv(GL_VIEWPORT, vp);
     if (vp[2] <= 0 || vp[3] <= 0 || vp[2] > 16384 || vp[3] > 16384) return;
