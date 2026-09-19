@@ -112,7 +112,7 @@ public:
 private:
     StarOverlay() = default;
 
-    enum class GraphicsAPI { None, DX8, DX9, DX10, DX11, DX12, OpenGL, Vulkan };
+    enum class GraphicsAPI { None, DX7, DX8, DX9, DX10, DX11, DX12, OpenGL, Vulkan };
     GraphicsAPI active_api_ = GraphicsAPI::None;
     GraphicsAPI game_api_ = GraphicsAPI::None; // what the GAME renders with
 
@@ -151,6 +151,16 @@ private:
     ImTextureID upload_icon_dx9(const std::vector<uint8_t>& rgba, int w, int h);
     ImTextureID upload_icon_dx10(const std::vector<uint8_t>& rgba, int w, int h);
     ImTextureID upload_icon_opengl(const std::vector<uint8_t>& rgba, int w, int h);
+
+    using DX7EndSceneFn = HRESULT(STDMETHODCALLTYPE*)(struct IDirect3DDevice7*);
+    DX7EndSceneFn orig_dx7_end_scene_ = nullptr;
+    struct IDirect3DDevice7* dx7_device_ = nullptr;
+    static HRESULT STDMETHODCALLTYPE hooked_DX7EndScene(struct IDirect3DDevice7*);
+    void hook_dx7();
+    void on_end_scene_dx7(struct IDirect3DDevice7*);
+    ImTextureID upload_icon_dx7(const std::vector<uint8_t>& rgba, int w, int h);
+    void release_icons_dx7();
+    void maybe_capture_dx7(struct IDirect3DDevice7*);
 
     using DX8PresentFn = HRESULT(STDMETHODCALLTYPE*)(struct IDirect3DDevice8*, const RECT*, const RECT*, HWND, const struct RGNDATA*);
     using DX8ResetFn   = HRESULT(STDMETHODCALLTYPE*)(struct IDirect3DDevice8*, void*);
@@ -256,6 +266,7 @@ private:
     bool  dxgi_hooked_       = false;
     bool  dx9_hooked_        = false;
     bool  dx8_hooked_        = false;
+    bool  dx7_hooked_        = false;
     bool  opengl_hooked_     = false;
     bool  vulkan_hooked_     = false;
     bool  hotkey_prev_down_  = false;

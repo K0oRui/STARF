@@ -5,6 +5,7 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx9.h"
 #include "dx8/imgui_impl_dx8.h"
+#include "dx7/imgui_impl_dx7.h"
 #include "imgui_impl_dx10.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
@@ -152,6 +153,7 @@ void StarOverlay::init()
 
     hook_dx9();
     hook_dx8();
+    hook_dx7();
     hook_dxgi();
     hook_opengl();
     hook_vulkan();
@@ -164,7 +166,7 @@ void StarOverlay::init()
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (retry_stop_.load() || !g_overlay) break;
             ensure_hooks();
-            if (dxgi_hooked_ && dx9_hooked_ && dx8_hooked_ && opengl_hooked_ && vulkan_hooked_) break;
+            if (dxgi_hooked_ && dx9_hooked_ && dx8_hooked_ && dx7_hooked_ && opengl_hooked_ && vulkan_hooked_) break;
             if (imgui_initialized_) break;
         }
     }).detach();
@@ -216,6 +218,7 @@ void StarOverlay::ensure_hooks()
     if (!dxgi_hooked_) hook_dxgi();
     if (!dx9_hooked_) hook_dx9();
     if (!dx8_hooked_) hook_dx8();
+    if (!dx7_hooked_) hook_dx7();
     if (!opengl_hooked_) hook_opengl();
     if (!vulkan_hooked_) hook_vulkan();
 #ifdef _WIN64
@@ -321,6 +324,8 @@ void StarOverlay::shutdown()
             ImGui_ImplDX9_Shutdown();
         } else if (active_api_ == GraphicsAPI::DX8) {
             ImGui_ImplDX8_Shutdown();
+        } else if (active_api_ == GraphicsAPI::DX7) {
+            ImGui_ImplDX7_Shutdown();
         } else if (active_api_ == GraphicsAPI::OpenGL) {
             ImGui_ImplOpenGL3_Shutdown();
         } else if (active_api_ == GraphicsAPI::Vulkan) {
@@ -349,6 +354,8 @@ void StarOverlay::shutdown()
         dx9_device_ = nullptr;
     } else if (api_snapshot == GraphicsAPI::DX8) {
         release_icons_dx8();
+    } else if (api_snapshot == GraphicsAPI::DX7) {
+        release_icons_dx7();
     }
     // OpenGL icon textures belong to the game's GL context, which may be gone
     // at shutdown; the OS/driver reclaims them with the context.
