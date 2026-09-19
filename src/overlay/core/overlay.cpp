@@ -4,6 +4,7 @@
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx9.h"
+#include "dx8/imgui_impl_dx8.h"
 #include "imgui_impl_dx10.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
@@ -150,7 +151,8 @@ void StarOverlay::init()
     }
 
     hook_dx9();
-hook_dxgi();
+    hook_dx8();
+    hook_dxgi();
     hook_opengl();
     hook_vulkan();
     hooks_installed_ = true;
@@ -162,7 +164,7 @@ hook_dxgi();
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (retry_stop_.load() || !g_overlay) break;
             ensure_hooks();
-            if (dxgi_hooked_ && dx9_hooked_ && opengl_hooked_ && vulkan_hooked_) break;
+            if (dxgi_hooked_ && dx9_hooked_ && dx8_hooked_ && opengl_hooked_ && vulkan_hooked_) break;
             if (imgui_initialized_) break;
         }
     }).detach();
@@ -213,6 +215,7 @@ void StarOverlay::ensure_hooks()
     // Each hook fn is now idempotent (checks orig_* / hooked flag), so safe to retry.
     if (!dxgi_hooked_) hook_dxgi();
     if (!dx9_hooked_) hook_dx9();
+    if (!dx8_hooked_) hook_dx8();
     if (!opengl_hooked_) hook_opengl();
     if (!vulkan_hooked_) hook_vulkan();
 #ifdef _WIN64
@@ -316,6 +319,8 @@ void StarOverlay::shutdown()
 #endif
         } else if (active_api_ == GraphicsAPI::DX9) {
             ImGui_ImplDX9_Shutdown();
+        } else if (active_api_ == GraphicsAPI::DX8) {
+            ImGui_ImplDX8_Shutdown();
         } else if (active_api_ == GraphicsAPI::OpenGL) {
             ImGui_ImplOpenGL3_Shutdown();
         } else if (active_api_ == GraphicsAPI::Vulkan) {
@@ -342,6 +347,8 @@ void StarOverlay::shutdown()
         // MANAGED-pool IDirect3DTexture9* icons.
         icons_.release_all([](ImTextureID v) { ((IDirect3DTexture9*)v)->Release(); });
         dx9_device_ = nullptr;
+    } else if (api_snapshot == GraphicsAPI::DX8) {
+        release_icons_dx8();
     }
     // OpenGL icon textures belong to the game's GL context, which may be gone
     // at shutdown; the OS/driver reclaims them with the context.

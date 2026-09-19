@@ -112,7 +112,7 @@ public:
 private:
     StarOverlay() = default;
 
-    enum class GraphicsAPI { None, DX9, DX10, DX11, DX12, OpenGL, Vulkan };
+    enum class GraphicsAPI { None, DX8, DX9, DX10, DX11, DX12, OpenGL, Vulkan };
     GraphicsAPI active_api_ = GraphicsAPI::None;
     GraphicsAPI game_api_ = GraphicsAPI::None; // what the GAME renders with
 
@@ -151,6 +151,26 @@ private:
     ImTextureID upload_icon_dx9(const std::vector<uint8_t>& rgba, int w, int h);
     ImTextureID upload_icon_dx10(const std::vector<uint8_t>& rgba, int w, int h);
     ImTextureID upload_icon_opengl(const std::vector<uint8_t>& rgba, int w, int h);
+
+    using DX8PresentFn = HRESULT(STDMETHODCALLTYPE*)(struct IDirect3DDevice8*, const RECT*, const RECT*, HWND, const struct RGNDATA*);
+    using DX8ResetFn   = HRESULT(STDMETHODCALLTYPE*)(struct IDirect3DDevice8*, void*);
+    using Direct3DCreate8Fn = struct IDirect3D8* (STDMETHODCALLTYPE*)(UINT);
+    using DX8CreateDeviceFn = HRESULT(STDMETHODCALLTYPE*)(struct IDirect3D8*, UINT, int, HWND, DWORD, void*, struct IDirect3DDevice8**);
+    Direct3DCreate8Fn orig_direct3dcreate8_ = nullptr;
+    DX8CreateDeviceFn orig_d3d8_create_device_ = nullptr;
+    DX8PresentFn orig_dx8_present_ = nullptr;
+    DX8ResetFn   orig_dx8_reset_   = nullptr;
+    struct IDirect3DDevice8* dx8_device_ = nullptr;
+    static struct IDirect3D8* STDMETHODCALLTYPE hooked_Direct3DCreate8(UINT sdk_version);
+    static HRESULT STDMETHODCALLTYPE hooked_D3D8CreateDevice(struct IDirect3D8*, UINT, int, HWND, DWORD, void*, struct IDirect3DDevice8**);
+    static HRESULT STDMETHODCALLTYPE hooked_DX8Present(struct IDirect3DDevice8*, const RECT*, const RECT*, HWND, const struct RGNDATA*);
+    static HRESULT STDMETHODCALLTYPE hooked_DX8Reset(struct IDirect3DDevice8*, void*);
+    void hook_dx8();
+    void on_present_dx8(struct IDirect3DDevice8* device);
+    void on_reset_dx8();
+    ImTextureID upload_icon_dx8(const std::vector<uint8_t>& rgba, int w, int h);
+    void release_icons_dx8();
+    void maybe_capture_dx8(struct IDirect3DDevice8* device);
 
     using wglSwapBuffersFn = BOOL(WINAPI*)(HDC);
     wglSwapBuffersFn orig_wglSwapBuffers_ = nullptr;
@@ -235,6 +255,7 @@ private:
     bool  hooks_installed_   = false;
     bool  dxgi_hooked_       = false;
     bool  dx9_hooked_        = false;
+    bool  dx8_hooked_        = false;
     bool  opengl_hooked_     = false;
     bool  vulkan_hooked_     = false;
     bool  hotkey_prev_down_  = false;

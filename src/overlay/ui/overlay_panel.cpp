@@ -90,6 +90,7 @@ void StarOverlay::panel_header(ImFont* fsmall, ImFont* ftitle, float pw)
     ImGui::Text("App ID:   %s", aid);
     const char* gfx = "detecting…";
     switch (game_api_) {
+    case GraphicsAPI::DX8:    gfx = "DirectX 8"; break;
     case GraphicsAPI::DX9:    gfx = "DirectX 9"; break;
     case GraphicsAPI::DX10:   gfx = "DirectX 10"; break;
     case GraphicsAPI::DX11:   gfx = "DirectX 11"; break;

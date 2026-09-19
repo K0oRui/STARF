@@ -18,6 +18,8 @@ ImTextureID StarOverlay::get_or_create_icon(
             return upload_icon_vulkan(rgba, w, h);
         } else if (active_api_ == GraphicsAPI::DX9) {
             return upload_icon_dx9(rgba, w, h);
+        } else if (active_api_ == GraphicsAPI::DX8) {
+            return upload_icon_dx8(rgba, w, h);
         } else if (active_api_ == GraphicsAPI::DX10) {
             return upload_icon_dx10(rgba, w, h);
         } else if (active_api_ == GraphicsAPI::OpenGL) {

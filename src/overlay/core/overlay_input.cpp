@@ -12,7 +12,10 @@ int WINAPI StarOverlay::hooked_ShowCursor(BOOL bShow)
             // Hold the floor at 1 while open: the game may re-hide every frame.
             if (!bShow) {
                 if (current <= 1) {
-                    return 0;
+                    // Games commonly loop until ShowCursor(FALSE) < 0.
+                    // Report hidden to the game while retaining the overlay's
+                    // visible cursor; returning zero traps that loop forever.
+                    return -1;
                 }
             }
         }

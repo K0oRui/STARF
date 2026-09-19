@@ -44,6 +44,7 @@ set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/overlay/backends/dx8/imgui_impl_dx8.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx9.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx10.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
@@ -55,9 +56,11 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 add_library(imgui STATIC ${IMGUI_SOURCES})
 target_include_directories(imgui PUBLIC
+    ${PROJECT_SOURCE_DIR}/sdk/dx8
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
     ${vulkan_headers_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/overlay/backends
 )
 target_compile_definitions(imgui PUBLIC UNICODE IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
 
@@ -95,6 +98,7 @@ set(STAR_SOURCES
     overlay/capture/screenshot_service.cpp
     overlay/capture/overlay_capture.cpp
     overlay/backends/backend_dx9.cpp
+    overlay/backends/backend_dx8.cpp
     overlay/backends/backend_dx10.cpp
     overlay/backends/backend_dx11.cpp
     overlay/backends/backend_dx12.cpp
@@ -145,8 +149,10 @@ target_compile_definitions(star PRIVATE
 )
 
 target_include_directories(star PRIVATE
+    ${PROJECT_SOURCE_DIR}/sdk/dx8
     ${PROJECT_SOURCE_DIR}/sdk
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/overlay/backends
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
     ${vulkan_headers_SOURCE_DIR}/include
