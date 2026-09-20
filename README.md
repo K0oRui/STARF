@@ -120,9 +120,21 @@ Output lands in `build/x64/Release/steam_api64.dll` or `build/x86/Release/steam_
 
 ---
 
+To run the standalone regression checks:
+
+```powershell
+cmake --preset x64 -DSTAR_BUILD_TESTS=ON
+cmake --build --preset x64-release
+ctest --test-dir build/x64 -C Release --output-on-failure
+```
+
+Use the x86 preset and build directory for the 32-bit checks. These tests cover
+queued I/O, PNG encoding/decoding, notification ownership, draw reuse, bulk
+achievements, and pixel/GDI helpers; they do not replace testing inside a game.
+
 ## logs
 
-`STAR/star.log` next to the DLL. Falls back to `%TEMP%/star.log` if that directory isn't writable. The log tells you what app ID loaded, how many achievements came in, and whether the overlay hooks fired correctly.
+`STAR/star.log` next to the DLL. Falls back to `%TEMP%/star.log` if that directory isn't writable. The log tells you what app ID loaded, how many achievements came in, and whether the overlay hooks fired correctly. Routine flat-API calls are omitted by default; set `STAR_TRACE_API=1` before launching the game to include them. Writes are buffered and flushed on the next log message after one second, or at `SteamAPI_Shutdown`.
 
 ---
 

@@ -25,10 +25,11 @@ std::string ScreenshotService::next_path()
     Storage::ensure_dir(base_dir);
     SYSTEMTIME st{};
     GetLocalTime(&st);
+    static std::atomic<unsigned> sequence{0};
     char base[128];
-    snprintf(base, sizeof(base), "STAR_%u_%04d%02d%02d_%02d%02d%02d",
+    snprintf(base, sizeof(base), "STAR_%u_%04d%02d%02d_%02d%02d%02d_%u",
         Settings::get().app_id, (int)st.wYear, (int)st.wMonth, (int)st.wDay,
-        (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
+        (int)st.wHour, (int)st.wMinute, (int)st.wSecond, sequence.fetch_add(1));
     for (int i = 0; i < 100; i++) {
         char full[MAX_PATH];
         if (i == 0) snprintf(full, sizeof(full), "%s\\%s.png", base_dir.c_str(), base);
@@ -104,4 +105,32 @@ bool ScreenshotService::save_rgba_png(const std::string& path, const uint8_t* rg
     if (com_here) CoUninitialize();
     if (!ok) STAR_LOG("Screenshot encode failed: %s", path.c_str());
     return ok;
+}
+
+
+bool ScreenshotService::save_async(const std::string& path, std::vector<uint8_t> rgba, int w, int h, bool dark)
+{
+    if (path.empty() || w <= 0 || h <= 0 || w > 16384 || h > 16384 ||
+        rgba.size() != (size_t)w * h * 4) return false;
+    size_t bytes = rgba.size();
+    if (outstanding_.fetch_add(1) >= 3) { --outstanding_; return false; }
+    bool accepted = worker_.submit([this, path, rgba = std::move(rgba), w, h, dark] {
+        if (save_rgba_png(path, rgba.data(), w, h)) {
+            std::lock_guard<std::mutex> lock(completed_mutex_);
+            completed_.push_back({path, dark});
+        }
+        // Count only in-flight encodes: completed-but-unconsumed notifications
+        // must not block the gate when the UI is not rendering.
+        --outstanding_;
+    }, bytes);
+    if (!accepted) { --outstanding_; STAR_LOG("Screenshot queue full: %s", path.c_str()); }
+    return accepted;
+}
+
+std::vector<ScreenshotService::Completed> ScreenshotService::take_completed()
+{
+    std::lock_guard<std::mutex> lock(completed_mutex_);
+    std::vector<Completed> result;
+    result.swap(completed_);
+    return result;
 }

@@ -9,6 +9,7 @@
 #include "overlay/ui/notification_queue.h"
 #include "overlay/capture/screenshot_service.h"
 #include "overlay/ui/icon_cache.h"
+#include "overlay/ui/draw_snapshot.h"
 #include "overlay/ui/overlay_style.h"
 #include "overlay/core/overlay_util.h"
 #include "overlay/core/pixel_copy.h"
@@ -360,6 +361,7 @@ private:
     IDXGISwapChain* dx12_chain_ = nullptr;
     UINT dx12_srv_next_slot_ = 1;
     std::vector<void*> dx12_icon_resources_;
+    std::vector<UINT> dx12_free_icon_slots_;
     // Frame fence: Reset() on an allocator the GPU is still reading is
     // undefined behavior (fast GPU fault / device removed). Track one fence
     // value per backbuffer and wait before reusing its allocator.
@@ -377,6 +379,7 @@ private:
     std::mutex                        render_mutex_;
     NotificationQueue notifications_;
     IconCache         icons_;
+    DrawSnapshot external_draw_snapshot_;
 
     struct IconDecodeRequest {
         std::string path;
@@ -390,12 +393,20 @@ private:
         int w = 0, h = 0;
     };
     std::deque<IconDecodeRequest> icon_decode_queue_;
-    std::vector<IconDecodeResult> icon_decode_ready_;
+    std::deque<IconDecodeResult> icon_decode_ready_;
     std::unordered_set<std::string> icon_decode_pending_;
     std::mutex                    icon_decode_mutex_;
     std::condition_variable       icon_decode_cv_;
     std::thread                   icon_decode_thread_;
     bool                          icon_decode_stop_ = false;
+    std::deque<std::string> screenshot_icons_;
+    std::deque<std::string> other_icons_;
+    std::string viewer_icon_;
+    void release_icon(ImTextureID texture);
+    void release_icon_vulkan(ImTextureID texture);
+#ifdef _WIN64
+    void release_icon_dx12(ImTextureID texture);
+#endif
     void drain_icon_decodes();
     void icon_decode_worker();
 

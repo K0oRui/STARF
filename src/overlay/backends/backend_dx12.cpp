@@ -156,8 +156,7 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
         empty.Begin = 0; empty.End = 0;
         readback->Unmap(0, &empty);
         std::string path = ScreenshotService::next_path();
-        if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)w, (int)h))
-            notify_screenshot(path);
+        screenshots_.save_async(path, std::move(rgba), (int)w, (int)h);
     }
 }
 #endif
@@ -261,7 +260,7 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
     auto* dev   = (ID3D12Device*)dx12_device_;
     auto* queue = (ID3D12CommandQueue*)dx12_command_queue_;
     auto* heap  = (ID3D12DescriptorHeap*)dx12_srv_heap_;
-    if (!dev || !queue || !heap || dx12_srv_next_slot_ >= 257) return nullptr;
+    if (!dev || !queue || !heap || (dx12_srv_next_slot_ >= 257 && dx12_free_icon_slots_.empty())) return nullptr;
 
     UINT row_pitch     = (UINT)(w * 4);
     UINT aligned_pitch = (row_pitch + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
@@ -335,15 +334,16 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     tmp_list->ResourceBarrier(1, &barrier);
     bool uploaded = SUCCEEDED(tmp_list->Close()) &&
-        star_dx12::submit_and_wait(dev, queue, tmp_list.Get(), {tmp_alloc.Get(), upload_buf.Get(), texture.Get()});
+        star_dx12::submit_and_wait(dev, queue, tmp_list.Get(), {tmp_alloc.Get(), upload_buf.Get(), texture.Get()}, false);
     if (!uploaded) return nullptr;
 
     UINT desc_inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
-    cpu.ptr += (UINT64)dx12_srv_next_slot_ * desc_inc;
-    gpu.ptr += (UINT64)dx12_srv_next_slot_ * desc_inc;
-    dx12_srv_next_slot_++;
+    UINT slot = dx12_free_icon_slots_.empty() ? dx12_srv_next_slot_++ : dx12_free_icon_slots_.back();
+    if (!dx12_free_icon_slots_.empty()) dx12_free_icon_slots_.pop_back();
+    cpu.ptr += (UINT64)slot * desc_inc;
+    gpu.ptr += (UINT64)slot * desc_inc;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
     srv_desc.Format                    = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -352,12 +352,45 @@ ImTextureID StarOverlay::upload_icon_dx12(const std::vector<uint8_t>& rgba, int 
     srv_desc.Texture2D.MipLevels       = 1;
     dev->CreateShaderResourceView(texture.Get(), &srv_desc, cpu);
 
-    dx12_icon_resources_.push_back(texture.Detach());
+    if (dx12_icon_resources_.size() <= slot) dx12_icon_resources_.resize(slot + 1);
+    dx12_icon_resources_[slot] = texture.Detach();
     return (ImTextureID)(void*)(UINT64)gpu.ptr;
+}
+
+void StarOverlay::release_icon_dx12(ImTextureID texture)
+{
+    auto* device = (ID3D12Device*)dx12_device_;
+    auto* heap = (ID3D12DescriptorHeap*)dx12_srv_heap_;
+    if (!device || !heap) return;
+    auto base = heap->GetGPUDescriptorHandleForHeapStart().ptr;
+    auto step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    size_t slot = ((UINT64)(uintptr_t)texture - base) / step;
+    if (slot >= dx12_icon_resources_.size() || !dx12_icon_resources_[slot]) return;
+    auto* queue = (ID3D12CommandQueue*)dx12_command_queue_;
+    auto* resource = (ID3D12Resource*)dx12_icon_resources_[slot];
+    dx12_icon_resources_[slot] = nullptr;
+    dx12_free_icon_slots_.push_back((UINT)slot);
+    if (!queue || FAILED(device->GetDeviceRemovedReason())) { resource->Release(); return; }
+    // Retire without blocking: the queue signals this fence after all prior
+    // work (including the draws that referenced the icon); reap_submissions
+    // releases the resource once it completes.
+    auto& pending = star_dx12::pending_submissions();
+    std::lock_guard<std::mutex> lock(pending.mutex);
+    pending.reap();
+    auto submission = std::make_unique<star_dx12::Submission>();
+    submission->device = device;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&submission->fence)))) {
+        resource->Release();
+        return;
+    }
+    submission->objects.emplace_back(resource);
+    queue->Signal(submission->fence.Get(), 1);
+    pending.items.push_back(std::move(submission));
 }
 
 void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
 {
+    star_dx12::reap_submissions();
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
     if (!imgui_initialized_ || chain != dx12_chain_) return;
@@ -499,10 +532,12 @@ void StarOverlay::wait_dx12_idle()
 void StarOverlay::cleanup_dx12()
 {
     wait_dx12_idle();
+    star_dx12::reap_submissions();
     dx12_chain_ = nullptr;
     dx12_frame_index_ = 0;
     for (auto* res : dx12_icon_resources_) if (res) ((ID3D12Resource*)res)->Release();
     dx12_icon_resources_.clear();
+    dx12_free_icon_slots_.clear();
     dx12_srv_next_slot_ = 1;
     dx12_frame_fence_.clear();
     dx12_fence_value_ = 0;

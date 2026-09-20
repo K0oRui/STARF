@@ -17,17 +17,32 @@ struct Submission {
     HANDLE event = nullptr;
     ~Submission() { if (event) CloseHandle(event); }
 };
-inline bool submit_and_wait(ID3D12Device* device, ID3D12CommandQueue* queue,
-    ID3D12GraphicsCommandList* list, std::initializer_list<IUnknown*> objects)
-{
-    static auto* pending = new std::vector<std::unique_ptr<Submission>>;
-    static auto* mutex = new std::mutex;
-    std::lock_guard<std::mutex> lock(*mutex);
-    for (auto it = pending->begin(); it != pending->end();) {
-        if ((*it)->fence->GetCompletedValue() >= 1 ||
-            FAILED((*it)->device->GetDeviceRemovedReason())) it = pending->erase(it);
-        else ++it;
+struct PendingSubmissions {
+    std::vector<std::unique_ptr<Submission>> items;
+    std::mutex mutex;
+    void reap() {
+        for (auto it = items.begin(); it != items.end();) {
+            if ((*it)->fence->GetCompletedValue() >= 1 ||
+                FAILED((*it)->device->GetDeviceRemovedReason())) it = items.erase(it);
+            else ++it;
+        }
     }
+};
+inline PendingSubmissions& pending_submissions() {
+    static auto* pending = new PendingSubmissions;
+    return *pending;
+}
+inline void reap_submissions() {
+    auto& pending = pending_submissions();
+    std::lock_guard<std::mutex> lock(pending.mutex);
+    pending.reap();
+}
+inline bool submit_and_wait(ID3D12Device* device, ID3D12CommandQueue* queue,
+    ID3D12GraphicsCommandList* list, std::initializer_list<IUnknown*> objects, bool wait = true)
+{
+    auto& pending = pending_submissions();
+    std::lock_guard<std::mutex> lock(pending.mutex);
+    pending.reap();
     auto submission = std::make_unique<Submission>();
     submission->device = device;
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
@@ -38,6 +53,10 @@ inline bool submit_and_wait(ID3D12Device* device, ID3D12CommandQueue* queue,
     ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
     HRESULT hr = queue->Signal(submission->fence.Get(), 1);
+    if (!wait && SUCCEEDED(hr)) {
+        pending.items.push_back(std::move(submission));
+        return true; // Queue ordering makes the texture available to the next draw.
+    }
     HANDLE event = submission->event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (SUCCEEDED(hr) && event) {
         hr = submission->fence->SetEventOnCompletion(1, event);
@@ -46,7 +65,7 @@ inline bool submit_and_wait(ID3D12Device* device, ID3D12CommandQueue* queue,
     } else if (!event) hr = E_OUTOFMEMORY;
     if (FAILED(hr) || FAILED(device->GetDeviceRemovedReason())) {
         // Signal failure does not prove that execution has stopped.
-        pending->push_back(std::move(submission));
+        pending.items.push_back(std::move(submission));
         return false;
     }
     return true;

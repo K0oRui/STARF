@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -9,8 +10,9 @@ struct AchievementNotification {
     std::string header = "ACHIEVEMENT UNLOCKED";
     bool summary = false; // all-complete celebration: gold styling + star
     std::string title;
+    std::string icon_key;
     std::string description;
-    std::vector<uint8_t> icon_rgba;
+    std::shared_ptr<const std::vector<uint8_t>> icon_rgba;
     int   icon_width  = 0;
     int   icon_height = 0;
     float time_remaining = 5.0f;
@@ -53,7 +55,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& n : items_) {
             if (n.title == title) {
-                n.icon_rgba = std::move(rgba);
+                n.icon_rgba = std::make_shared<const std::vector<uint8_t>>(std::move(rgba));
                 n.icon_width = w;
                 n.icon_height = h;
                 break;

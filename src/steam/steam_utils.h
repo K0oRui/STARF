@@ -83,11 +83,13 @@ public:
     int LoadImageFromFile(const std::string& path);
     bool GetImageFileSize(const std::string& path, uint32* w, uint32* h);
     bool LoadSummaryIcon(std::vector<uint8_t>& rgba, int& w, int& h);
-    bool LoadIconFile(const std::string& full_path, std::vector<uint8_t>& rgba, int& w, int& h);
+    bool LoadIconFile(const std::string& full_path, std::vector<uint8_t>& rgba, int& w, int& h, int max_side = 0);
 
 private:
     StarSteamUtils();
     std::chrono::steady_clock::time_point start_time_;
     std::vector<StarImage> images_;
     std::mutex images_mutex_;
+    std::mutex image_load_mutex_;
+    std::unordered_map<std::string, int> image_handles_;
 };

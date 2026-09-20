@@ -5,6 +5,8 @@
 
 void StarOverlay::build_frame_ui()
 {
+    for (auto& shot : screenshots_.take_completed()) notify_screenshot(shot.path, shot.dark);
+    drain_icon_decodes();
     float dt = ImGui::GetIO().DeltaTime;
     if (dt <= 0.f) dt = 0.0167f;
 
@@ -55,7 +57,13 @@ void StarOverlay::render_hud()
     };
 
     if (show_fps) {
-        float fps = present_fps_ > 0.5f ? present_fps_ : ImGui::GetIO().Framerate;
+        static float fps = 0;
+        static DWORD sampled = 0;
+        DWORD now = GetTickCount();
+        if (!sampled || now - sampled >= 250) {
+            fps = present_fps_ > 0.5f ? present_fps_ : ImGui::GetIO().Framerate;
+            sampled = now;
+        }
         if (fps < 0.f) fps = 0.f;
         char buf[32];
         snprintf(buf, sizeof(buf), "%d FPS", (int)(fps + 0.5f));
@@ -79,7 +87,6 @@ void StarOverlay::render_hud()
 
 void StarOverlay::render_notifications(float dt)
 {
-    drain_icon_decodes();
     std::vector<AchievementNotification> notifs = notifications_.advance_and_snapshot(dt);
     if (notifs.empty()) return;
 
@@ -134,7 +141,8 @@ void StarOverlay::render_notifications(float dt)
         dl->AddRectFilled({x, y+3.f}, {x+3.f, y+H-3.f}, tacc(1.f), 2.f);
 
         float ix = x + 14.f * S, iy = y + (H - 52.f * S) * .5f, is = 52.f * S;
-        ImTextureID notif_tex = get_or_create_icon(n.title, n.icon_rgba, n.icon_width, n.icon_height);
+        const auto& icon_key = n.icon_key.empty() ? n.title : n.icon_key;
+        ImTextureID notif_tex = n.icon_rgba ? get_or_create_icon(icon_key, *n.icon_rgba, n.icon_width, n.icon_height) : icons_.find(icon_key);
         if (notif_tex) {
             dl->AddImageRounded(notif_tex,
                 {ix,iy},{ix+is,iy+is},{0,0},{1,1}, col(0xff,0xff,0xff,a), 4.f);

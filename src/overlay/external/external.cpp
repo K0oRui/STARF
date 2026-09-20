@@ -360,24 +360,18 @@ void StarOverlay::external_render_frame()
     if (w != ext_w_ || h != ext_h_) {
         cleanup_rtv();
         if (!external_alloc_surfaces(w, h)) return;
+        external_draw_snapshot_.clear();
         ext_w_ = w;
         ext_h_ = h;
     }
 
-    IDirect3DSurface9* old_rt = nullptr;
     if (ext_use_d3d9_) {
-        ext_d3d9_dev_->GetRenderTarget(0, &old_rt);
-        ext_d3d9_dev_->SetRenderTarget(0, ext_d3d9_rt_);
-        ext_d3d9_dev_->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
         ImGui_ImplDX9_NewFrame();
     } else {
         if (!rtv_) {
             device_->CreateRenderTargetView(ext_rt_tex_, nullptr, &rtv_);
         }
         if (!rtv_) return;
-        float clear[4] = { 0.f, 0.f, 0.f, 0.f };
-        context_->OMSetRenderTargets(1, &rtv_, nullptr);
-        context_->ClearRenderTargetView(rtv_, clear);
         ImGui_ImplDX11_NewFrame();
     }
 
@@ -406,7 +400,12 @@ void StarOverlay::external_render_frame()
         }
     }
 
+    if (!external_draw_snapshot_.changed(ImGui::GetDrawData())) return;
     if (ext_use_d3d9_) {
+        IDirect3DSurface9* old_rt = nullptr;
+        ext_d3d9_dev_->GetRenderTarget(0, &old_rt);
+        ext_d3d9_dev_->SetRenderTarget(0, ext_d3d9_rt_);
+        ext_d3d9_dev_->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
         ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
         ext_d3d9_dev_->SetRenderTarget(0, old_rt);
         if (old_rt) old_rt->Release();
@@ -422,9 +421,12 @@ void StarOverlay::external_render_frame()
                     memcpy(dst + (size_t)y * row, src + (size_t)y * lr.Pitch, row);
                 ext_d3d9_sys_->UnlockRect();
                 external_upload_layered(w, h);
-            }
-        }
+            } else external_draw_snapshot_.clear();
+        } else external_draw_snapshot_.clear();
     } else {
+        const float clear[4]{};
+        context_->OMSetRenderTargets(1, &rtv_, nullptr);
+        context_->ClearRenderTargetView(rtv_, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         // CPU readback into the layered-window DIB (premultiplied alpha output
         // matches what UpdateLayeredWindow expects with AC_SRC_ALPHA).
@@ -438,7 +440,7 @@ void StarOverlay::external_render_frame()
                 memcpy(dst + (size_t)y * row, src + (size_t)y * map.RowPitch, row);
             context_->Unmap(ext_stage_tex_, 0);
             external_upload_layered(w, h);
-        }
+        } else external_draw_snapshot_.clear();
     }
 }
 
@@ -560,7 +562,7 @@ void StarOverlay::external_thread_proc()
 
         bool want = fg_ok_ && open_;
         if (!want && fg_ok_) {
-            want = notifications_.has_pending();
+            want = (notifications_.has_pending() || screenshots_.busy());
             if (!want)
                 want = Settings::get().overlay_show_fps || Settings::get().overlay_show_playtime;
         }

@@ -23,7 +23,7 @@ public:
 
 bool StarOverlay::gdi_wants_draw() const
 {
-    return open_ || panel_anim_ > 0.001f || notifications_.has_pending() ||
+    return open_ || panel_anim_ > 0.001f || (notifications_.has_pending() || screenshots_.busy()) ||
         Settings::get().overlay_show_fps || Settings::get().overlay_show_playtime;
 }
 
@@ -284,15 +284,6 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
     if (w != gdi_.width || h != gdi_.height || !gdi_.render_view) {
         if (!gdi_alloc_surfaces(w, h)) return false;
     }
-    const float clear[4]{};
-    gdi_.context->OMSetRenderTargets(1, gdi_.render_view.GetAddressOf(), nullptr);
-    gdi_.context->ClearRenderTargetView(gdi_.render_view.Get(), clear);
-    D3D11_VIEWPORT viewport{};
-    viewport.Width = (float)w;
-    viewport.Height = (float)h;
-    viewport.MaxDepth = 1.0f;
-    gdi_.context->RSSetViewports(1, &viewport);
-
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGuiIO& io = ImGui::GetIO();
@@ -307,20 +298,31 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
     ImGui::NewFrame();
     apply_cursor_mode();
     build_frame_ui();
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    gdi_.context->OMSetRenderTargets(0, nullptr, nullptr);
-    gdi_.context->CopyResource(gdi_.staging_texture.Get(), gdi_.render_texture.Get());
-    D3D11_MAPPED_SUBRESOURCE map{};
-    HRESULT hr = gdi_.context->Map(gdi_.staging_texture.Get(), 0, D3D11_MAP_READ, 0, &map);
-    if (FAILED(hr)) return false;
-    const auto* src = static_cast<const uint8_t*>(map.pData);
-    auto* dst = static_cast<uint8_t*>(gdi_.pixels.bits());
-    const size_t row_bytes = (size_t)w * 4;
-    // Finish any previous GDI read of the DIB before overwriting its pixels.
-    GdiFlush();
-    for (int y = 0; y < h; ++y)
-        memcpy(dst + (size_t)y * row_bytes, src + (size_t)y * map.RowPitch, row_bytes);
-    gdi_.context->Unmap(gdi_.staging_texture.Get(), 0);
+    if (gdi_.draw_snapshot.changed(ImGui::GetDrawData())) {
+        const float clear[4]{};
+        gdi_.context->OMSetRenderTargets(1, gdi_.render_view.GetAddressOf(), nullptr);
+        gdi_.context->ClearRenderTargetView(gdi_.render_view.Get(), clear);
+        D3D11_VIEWPORT viewport{};
+        viewport.Width = (float)w;
+        viewport.Height = (float)h;
+        viewport.MaxDepth = 1.0f;
+        gdi_.context->RSSetViewports(1, &viewport);
+
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        gdi_.context->OMSetRenderTargets(0, nullptr, nullptr);
+        gdi_.context->CopyResource(gdi_.staging_texture.Get(), gdi_.render_texture.Get());
+        D3D11_MAPPED_SUBRESOURCE map{};
+        HRESULT hr = gdi_.context->Map(gdi_.staging_texture.Get(), 0, D3D11_MAP_READ, 0, &map);
+        if (FAILED(hr)) { gdi_.draw_snapshot.clear(); return false; }
+        const auto* src = static_cast<const uint8_t*>(map.pData);
+        auto* dst = static_cast<uint8_t*>(gdi_.pixels.bits());
+        const size_t row_bytes = (size_t)w * 4;
+        // Finish any previous GDI read of the DIB before overwriting its pixels.
+        GdiFlush();
+        for (int y = 0; y < h; ++y)
+            memcpy(dst + (size_t)y * row_bytes, src + (size_t)y * map.RowPitch, row_bytes);
+        gdi_.context->Unmap(gdi_.staging_texture.Get(), 0);
+    }
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     bool drawn = AlphaBlend(dest_dc, 0, 0, w, h, gdi_.pixels.dc(), 0, 0, w, h, blend) != FALSE;
     if (drawn) GdiFlush();
@@ -354,6 +356,5 @@ void StarOverlay::maybe_capture_gdi(HDC src_dc, int w, int h)
         rgba[i * 4 + 3] = 255;
     }
     std::string path = ScreenshotService::next_path();
-    if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), w, h))
-        notify_screenshot(path);
+    screenshots_.save_async(path, std::move(rgba), w, h);
 }

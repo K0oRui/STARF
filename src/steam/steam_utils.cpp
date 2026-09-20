@@ -1,4 +1,5 @@
 #include "steam/steam_utils.h"
+#include <wrl/client.h>
 #include "core/callbacks.h"
 #include "core/settings.h"
 #include <wincodec.h>
@@ -247,44 +248,16 @@ struct WicFrame {
 };
 } // namespace
 
-int StarSteamUtils::LoadImageFromFile(const std::string& path){
-    if (path.empty()) return 0;
-
-    WicFrame fr;
-    if (!fr.open(path)) return 0;
-
-    IWICFormatConverter* converter = nullptr;
-    fr.factory->CreateFormatConverter(&converter);
-    if (!converter) {
-        STAR_LOG("WIC: no converter for %s", path.c_str());
-        return 0;
-    }
-
-    HRESULT hr = converter->Initialize(fr.frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
-        nullptr, 0.0, WICBitmapPaletteTypeCustom);
-    if (FAILED(hr)) {
-        STAR_LOG("WIC: convert failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
-        converter->Release();
-        return 0;
-    }
-
-    UINT w = 0, h = 0;
-    converter->GetSize(&w, &h);
-    if (w == 0 || h == 0 || w > 4096 || h > 4096) {
-        STAR_LOG("WIC: bad size %ux%u for %s", w, h, path.c_str());
-        converter->Release();
-        return 0;
-    }
-
-    std::vector<uint8_t> rgba((size_t)w * h * 4);
-    hr = converter->CopyPixels(nullptr, w * 4, (UINT)rgba.size(), rgba.data());
-    converter->Release();
-    if (FAILED(hr)) {
-        STAR_LOG("WIC: CopyPixels failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
-        return 0;
-    }
-
-    return StoreImage(w, h, rgba);
+int StarSteamUtils::LoadImageFromFile(const std::string& path) {
+    std::lock_guard<std::mutex> lock(image_load_mutex_);
+    auto it = image_handles_.find(path);
+    if (it != image_handles_.end()) return it->second;
+    std::vector<uint8_t> rgba;
+    int w = 0, h = 0;
+    if (!LoadIconFile(path, rgba, w, h)) return 0;
+    int handle = StoreImage(w, h, rgba);
+    image_handles_[path] = handle;
+    return handle;
 }
 
 bool StarSteamUtils::GetImageFileSize(const std::string& path, uint32* w, uint32* h){
@@ -298,16 +271,35 @@ bool StarSteamUtils::GetImageFileSize(const std::string& path, uint32* w, uint32
     return true;
 }
 
-bool StarSteamUtils::LoadIconFile(const std::string& full_path, std::vector<uint8_t>& rgba, int& w, int& h)
+bool StarSteamUtils::LoadIconFile(const std::string& path, std::vector<uint8_t>& rgba,
+                                     int& w, int& h, int max_side)
 {
-    rgba.clear(); w = 0; h = 0;
-    int handle = LoadImageFromFile(full_path);
-    if (handle <= 0) return false;
-    uint32 uw = 0, uh = 0;
-    if (!GetImageSize(handle, &uw, &uh) || uw == 0 || uh == 0) return false;
-    w = (int)uw; h = (int)uh;
-    rgba.resize((size_t)uw * uh * 4);
-    return GetImageRGBA(handle, rgba.data(), (int)rgba.size());
+    rgba.clear(); w = h = 0;
+    WicFrame fr;
+    if (path.empty() || !fr.open(path)) return false;
+    UINT width = 0, height = 0;
+    if (FAILED(fr.frame->GetSize(&width, &height)) || !width || !height ||
+        width > 16384 || height > 16384) return false;
+    Microsoft::WRL::ComPtr<IWICBitmapScaler> scaler;
+    IWICBitmapSource* source = fr.frame;
+    if (max_side > 0 && (width > (UINT)max_side || height > (UINT)max_side)) {
+        double scale = (double)max_side / std::max(width, height);
+        width = std::max(1u, (UINT)(width * scale));
+        height = std::max(1u, (UINT)(height * scale));
+        if (FAILED(fr.factory->CreateBitmapScaler(&scaler)) ||
+            FAILED(scaler->Initialize(fr.frame, width, height, WICBitmapInterpolationModeFant))) return false;
+        source = scaler.Get();
+    }
+    Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+    if (FAILED(fr.factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(source, GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) return false;
+    rgba.resize((size_t)width * height * 4);
+    if (FAILED(converter->CopyPixels(nullptr, width * 4, (UINT)rgba.size(), rgba.data()))) {
+        rgba.clear(); return false;
+    }
+    w = (int)width; h = (int)height;
+    return true;
 }
 
 bool StarSteamUtils::LoadSummaryIcon(std::vector<uint8_t>& rgba, int& w, int& h)

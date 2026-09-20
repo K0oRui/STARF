@@ -55,6 +55,7 @@
     VK_FUNC(vkDestroySemaphore) \
     VK_FUNC(vkResetFences) \
     VK_FUNC(vkCreateFence) \
+    VK_FUNC(vkGetFenceStatus) \
     VK_FUNC(vkWaitForFences) \
     VK_FUNC(vkDestroyFence) \
     VK_FUNC(vkQueuePresentKHR) \
@@ -134,10 +135,36 @@ struct VulkanOverlayData {
     std::vector<VkImage>        icon_images;
     std::vector<VkDeviceMemory> icon_memories;
     std::vector<VkImageView>    icon_views;
+    std::vector<VkDescriptorSet> icon_sets;
+    struct Upload { VkFence fence; VkCommandBuffer commands; VkBuffer buffer; VkDeviceMemory memory; };
+    std::vector<Upload> uploads;
+    struct Retired { VkFence fence; VkCommandBuffer commands; VkDescriptorSet set; VkImageView view; VkImage image; VkDeviceMemory memory; };
+    std::vector<Retired> retired;
+    void reap_uploads() {
+        for (auto it = uploads.begin(); it != uploads.end();) {
+            if (vkGetFenceStatus(device, it->fence) == VK_NOT_READY) { ++it; continue; }
+            vkDestroyFence(device, it->fence, nullptr);
+            vkFreeCommandBuffers(device, command_pool, 1, &it->commands);
+            vkDestroyBuffer(device, it->buffer, nullptr);
+            vkFreeMemory(device, it->memory, nullptr);
+            it = uploads.erase(it);
+        }
+        for (auto it = retired.begin(); it != retired.end();) {
+            if (vkGetFenceStatus(device, it->fence) == VK_NOT_READY) { ++it; continue; }
+            vkDestroyFence(device, it->fence, nullptr);
+            vkFreeCommandBuffers(device, command_pool, 1, &it->commands);
+            ImGui_ImplVulkan_RemoveTexture(it->set);
+            vkDestroyImageView(device, it->view, nullptr);
+            vkDestroyImage(device, it->image, nullptr);
+            vkFreeMemory(device, it->memory, nullptr);
+            it = retired.erase(it);
+        }
+    }
 
     ~VulkanOverlayData() {
         if (device) {
             if (vkDeviceWaitIdle) vkDeviceWaitIdle(device);
+            reap_uploads();
             for (auto fence : fences) if (fence) vkDestroyFence(device, fence, nullptr);
             for (auto semaphore : present_ready) if (semaphore) vkDestroySemaphore(device, semaphore, nullptr);
             for (auto v : icon_views)    if (v && vkDestroyImageView) vkDestroyImageView(device, v, nullptr);
@@ -628,7 +655,6 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
     cb_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cb_alloc.commandBufferCount = 1;
     VkCommandBuffer cb = VK_NULL_HANDLE;
-    bool shot_ok = false;
     std::string shot_path;
     if (vkAllocateCommandBuffers(dev, &cb_alloc, &cb) == VK_SUCCESS) {
         VkCommandBufferBeginInfo begin{};
@@ -682,8 +708,7 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
                 copy_pixels32(rgba.data(), (size_t)w * 4, mapped, (size_t)w * 4, w, h, bgra);
                 vkUnmapMemory(dev, mem);
                 shot_path = ScreenshotService::next_path();
-                if (!shot_path.empty() && ScreenshotService::save_rgba_png(shot_path, rgba.data(), (int)w, (int)h))
-                    shot_ok = true;
+                screenshots_.save_async(shot_path, std::move(rgba), (int)w, (int)h);
             }
             vkDestroyFence(dev, fence, nullptr);
         }
@@ -691,7 +716,6 @@ void StarOverlay::maybe_capture_vulkan(void* queue, const void* pPresentInfo)
     }
     vkDestroyBuffer(dev, staging, nullptr);
     vkFreeMemory(dev, mem, nullptr);
-    if (shot_ok) notify_screenshot(shot_path);
 }
 
 void StarOverlay::render_frame_vulkan(void* queue, const void* pPresentInfo)
@@ -699,6 +723,7 @@ void StarOverlay::render_frame_vulkan(void* queue, const void* pPresentInfo)
     auto* data = (VulkanOverlayData*)vk_data_;
     auto* pi = const_cast<VkPresentInfoKHR*>(static_cast<const VkPresentInfoKHR*>(pPresentInfo));
     if (!data || data->failed || pi->pSwapchains[0] != data->swapchain) return;
+    data->reap_uploads();
     uint32_t image_index = pi->pImageIndices[0];
     if (image_index >= data->image_count) return;
     uint32_t frame = data->next_frame;
@@ -754,6 +779,7 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     auto* data = (VulkanOverlayData*)vk_data_;
     if (!data || !data->device || !data->icon_sampler || !data->command_pool) return nullptr;
 
+    data->reap_uploads();
     VkDevice dev  = data->device;
     VkQueue  que  = data->queue;
     VkCommandPool pool = data->command_pool;
@@ -899,11 +925,8 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
         vkFreeMemory(dev, staging_mem, nullptr);
         return nullptr;
     }
-    vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
-    vkDestroyFence(dev, fence, nullptr);
-    vkFreeCommandBuffers(dev, pool, 1, &cb);
-    vkDestroyBuffer(dev, staging, nullptr);
-    vkFreeMemory(dev, staging_mem, nullptr);
+    // The draw submission uses this same queue, so no CPU wait is needed.
+    data->uploads.push_back({fence, cb, staging, staging_mem});
 
     VkImageViewCreateInfo view_info = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     view_info.image            = image;
@@ -912,16 +935,78 @@ ImTextureID StarOverlay::upload_icon_vulkan(const std::vector<uint8_t>& rgba, in
     view_info.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(dev, &view_info, nullptr, &view) != VK_SUCCESS) {
+        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        data->reap_uploads();
         vkDestroyImage(dev, image, nullptr);
         vkFreeMemory(dev, img_mem, nullptr);
         return nullptr;
     }
 
+    auto set = ImGui_ImplVulkan_AddTexture(data->icon_sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (!set) {
+        // Descriptor pool exhausted: wait for the copy, reap the staging
+        // upload, then destroy the image so nothing leaks.
+        vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
+        data->reap_uploads();
+        vkDestroyImageView(dev, view, nullptr);
+        vkDestroyImage(dev, image, nullptr);
+        vkFreeMemory(dev, img_mem, nullptr);
+        return nullptr;
+    }
     data->icon_images.push_back(image);
     data->icon_memories.push_back(img_mem);
     data->icon_views.push_back(view);
+    data->icon_sets.push_back(set);
+    return reinterpret_cast<ImTextureID>(set);
+}
 
-    return reinterpret_cast<ImTextureID>(ImGui_ImplVulkan_AddTexture(data->icon_sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+void StarOverlay::release_icon_vulkan(ImTextureID texture)
+{
+    auto* data = (VulkanOverlayData*)vk_data_;
+    if (!data) return;
+    auto set = reinterpret_cast<VkDescriptorSet>(texture);
+    auto it = std::find(data->icon_sets.begin(), data->icon_sets.end(), set);
+    if (it == data->icon_sets.end()) return;
+    size_t i = (size_t)(it - data->icon_sets.begin());
+    VkImageView view = data->icon_views[i];
+    VkImage image = data->icon_images[i];
+    VkDeviceMemory mem = data->icon_memories[i];
+    data->icon_sets.erase(it);
+    data->icon_views.erase(data->icon_views.begin() + i);
+    data->icon_images.erase(data->icon_images.begin() + i);
+    data->icon_memories.erase(data->icon_memories.begin() + i);
+    // Retire without blocking: an empty submit's fence signals after the
+    // draws that referenced this icon; reap_uploads then removes the
+    // descriptor set and destroys the image.
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cb_alloc = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cb_alloc.commandPool = data->command_pool;
+    cb_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cb_alloc.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(data->device, &cb_alloc, &cb) == VK_SUCCESS) {
+        VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(cb, &begin) == VK_SUCCESS && vkEndCommandBuffer(cb) == VK_SUCCESS) {
+            VkFenceCreateInfo fence_info = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            if (vkCreateFence(data->device, &fence_info, nullptr, &fence) == VK_SUCCESS) {
+                VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                submit.commandBufferCount = 1;
+                submit.pCommandBuffers = &cb;
+                if (vkQueueSubmit(data->queue, 1, &submit, fence) == VK_SUCCESS) {
+                    data->retired.push_back({fence, cb, set, view, image, mem});
+                    return;
+                }
+                vkDestroyFence(data->device, fence, nullptr);
+            }
+        }
+        vkFreeCommandBuffers(data->device, data->command_pool, 1, &cb);
+    }
+    // Couldn't defer (device likely lost): destroy now.
+    ImGui_ImplVulkan_RemoveTexture(set);
+    vkDestroyImageView(data->device, view, nullptr);
+    vkDestroyImage(data->device, image, nullptr);
+    vkFreeMemory(data->device, mem, nullptr);
 }
 
 void StarOverlay::cleanup_vulkan()

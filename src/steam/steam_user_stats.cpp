@@ -18,6 +18,7 @@ void StarSteamUserStats::load_from_storage()
     std::lock_guard<std::mutex> lock(mutex_);
     if (stats_loaded_) return;
     stats_loaded_ = true;
+    for (const auto& def : Settings::get().achievements) known_achievements_.insert(def.name);
 
     nlohmann::json ach_json;
     if (Storage::get().load_achievements(ach_json) && ach_json.is_object()) {
@@ -124,20 +125,52 @@ bool StarSteamUserStats::UpdateAvgRateStat(const char* pchName, float flCountThi
     return true;
 }
 
-bool StarSteamUserStats::GetAchievement(const char* pchName, bool* pbAchieved)
+bool StarSteamUserStats::GetAchievement(const char* name, bool* achieved)
 {
-    if (!pchName) return false;
+    if (!name) return false;
+    load_from_storage();
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = achievements_.find(pchName);
-    if (pbAchieved) {
-        *pbAchieved = (it != achievements_.end()) ? it->second.achieved : false;
-    }
+    auto it = achievements_.find(name);
+    if (achieved) *achieved = it != achievements_.end() && it->second.achieved;
+    return it != achievements_.end() || known_achievements_.count(name) != 0;
+}
 
-    auto& defs = Settings::get().achievements;
-    for (auto& d : defs) {
-        if (d.name == pchName) return true;
+std::unordered_map<std::string, AchievementState> StarSteamUserStats::achievement_snapshot()
+{
+    load_from_storage();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return achievements_;
+}
+
+void StarSteamUserStats::set_all_achievements(bool unlocked)
+{
+    load_from_storage();
+    std::vector<std::string> changed;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto now = (uint32_t)time(nullptr);
+        for (const auto& def : Settings::get().achievements) {
+            auto& state = achievements_[def.name];
+            if (state.achieved == unlocked) continue;
+            state.achieved = unlocked;
+            state.unlock_time = unlocked ? now : 0;
+            changed.push_back(def.name);
+        }
+        if (!changed.empty()) {
+            nlohmann::json json = nlohmann::json::object();
+            for (const auto& [name, state] : achievements_)
+                json[name] = {{"achieved", state.achieved}, {"unlock_time", state.unlock_time}};
+            Storage::get().save_achievements(json);
+        }
     }
-    return (it != achievements_.end());
+    for (const auto& name : changed) {
+        if (!unlocked) { Overlay::get().note_session_revoke(); continue; }
+        Overlay::get().note_session_unlock();
+        UserAchievementStored_t cb{};
+        cb.m_nGameID = Settings::get().app_id;
+        strncpy_s(cb.m_rgchAchievementName, name.c_str(), _TRUNCATE);
+        STAR_DispatchCallback(UserAchievementStored_t::k_iCallback, &cb, sizeof(cb));
+    }
 }
 
 static void play_sound_file(const std::string& full_path);
@@ -191,9 +224,7 @@ bool StarSteamUserStats::SetAchievement(const char* pchName)
         cb.m_nMaxProgress = 0;
         STAR_DispatchCallback(UserAchievementStored_t::k_iCallback, &cb, sizeof(cb));
 
-        bool silent = false;
-        { std::lock_guard<std::mutex> lock(mutex_); silent = bulk_silent_; }
-        if (!silent) {
+        {
             // Completing the set gets the dedicated jingle + summary instead
             // of the normal unlock sound.
             auto& defs = Settings::get().achievements;
@@ -333,8 +364,10 @@ bool StarSteamUserStats::ClearAchievement(const char* pchName)
                 {"unlock_time", state.unlock_time}
             };
         }
+        // Save under the lock: a concurrent SetAchievement must not be able to
+        // persist after this stale snapshot and overwrite the unlock on disk.
+        Storage::get().save_achievements(ach_json);
     }
-    Storage::get().save_achievements(ach_json);
     return true;
 }
 

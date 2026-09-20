@@ -87,6 +87,9 @@ static std::string find_settings_dir()
 
 void STAR_WriteLog(const char* fmt, ...)
 {
+    // Routine flat-API tracing is opt-in; these queries often run every frame.
+    static const bool trace_api = [] { char value[2]{}; return GetEnvironmentVariableA("STAR_TRACE_API", value, 2) == 1 && value[0] == '1'; }();
+    if (!trace_api && strncmp(fmt, "SteamAPI_", 9) == 0 && !strstr(fmt, "Shutdown")) return;
     char buf[1024];
     va_list args;
     va_start(args, fmt);
@@ -98,22 +101,25 @@ void STAR_WriteLog(const char* fmt, ...)
 
     OutputDebugStringA(out_buf);
 
-    static std::wstring log_wpath;
-    if (log_wpath.empty()) {
-        log_wpath = utf8_to_wstring(get_dll_dir() + "\\STAR\\star.log");
-    }
-
-    std::ofstream f(log_wpath, std::ios::app);
-    if (f.is_open()) {
-        f << out_buf;
-    } else {
-        wchar_t temp_path[MAX_PATH];
-        if (GetTempPathW(MAX_PATH, temp_path) > 0) {
-            std::wstring fallback_path = std::wstring(temp_path) + L"star.log";
-            std::ofstream f_fallback(fallback_path, std::ios::app);
-            if (f_fallback.is_open()) {
-                f_fallback << out_buf;
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    static std::ofstream stream;
+    if (!stream.is_open()) {
+        stream.open(utf8_to_wstring(get_dll_dir() + "\\STAR\\star.log"), std::ios::app);
+        if (!stream.is_open()) {
+            wchar_t temp[MAX_PATH];
+            if (GetTempPathW(MAX_PATH, temp)) {
+                stream.clear();
+                stream.open(std::wstring(temp) + L"star.log", std::ios::app);
             }
+        }
+    }
+    if (stream.is_open()) {
+        stream << out_buf;
+        static auto last_flush = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_flush >= std::chrono::seconds(1) || strstr(fmt, "Shutdown")) {
+            stream.flush(); last_flush = now;
         }
     }
 }
@@ -121,6 +127,14 @@ void STAR_WriteLog(const char* fmt, ...)
 static DWORD WINAPI STAR_EarlyHookThread(LPVOID)
 {
     STAR_install_integrity_hooks();
+    return 0;
+}
+
+static DWORD WINAPI STAR_CleanupThread(LPVOID)
+{
+    StarSteamRemoteStorage::get().stop_async();
+    Overlay::get().shutdown();
+    CoUninitialize();
     return 0;
 }
 
@@ -135,9 +149,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         break;
     case DLL_PROCESS_DETACH:
         if (lpReserved == nullptr && g_initialized) {
-            Overlay::get().shutdown();
-            CoUninitialize();
+            // Joining workers from DllMain blocks on the loader lock if a
+            // worker needs it. Run teardown on a helper thread and wait with
+            // a timeout so unload can't hang; the common case finishes fast.
             g_initialized = false;
+            HANDLE cleanup = CreateThread(NULL, 0, STAR_CleanupThread, NULL, 0, NULL);
+            if (cleanup) {
+                WaitForSingleObject(cleanup, 5000);
+                CloseHandle(cleanup);
+            }
         }
         if (lpReserved == nullptr) {
             STAR_uninstall_integrity_hooks();
@@ -149,6 +169,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 
 static bool star_init_internal()
 {
+    StarSteamRemoteStorage::get().start_async();
     STAR_install_integrity_hooks();
     STAR_install_il2cpp_hooks_deferred();
     if (g_initialized) return true;
@@ -244,6 +265,7 @@ STAR_EXPORT ESteamAPIInitResult SteamInternal_SteamAPI_Init(const char* pszInter
 STAR_EXPORT void SteamAPI_Shutdown()
 {
     if (!g_initialized) return;
+    StarSteamRemoteStorage::get().stop_async();
     Overlay::get().shutdown();
     CoUninitialize();
     g_initialized = false;

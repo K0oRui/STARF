@@ -8,4 +8,8 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+option(STAR_BUILD_TESTS "Build standalone regression checks" OFF)
+if(STAR_BUILD_TESTS)
+    enable_testing()
+endif()
 add_subdirectory(src)

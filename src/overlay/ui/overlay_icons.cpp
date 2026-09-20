@@ -5,6 +5,8 @@
 #include <d3d10.h>
 #include <GL/gl.h>
 
+namespace { constexpr size_t kMaxOtherIcons = 64; }
+
 ImTextureID StarOverlay::get_or_create_icon(
     const std::string& key, const std::vector<uint8_t>& rgba, int w, int h)
 {
@@ -100,7 +102,8 @@ void StarOverlay::enqueue_icon_decode(const std::string& path, const std::string
     if (path.empty() || key.empty()) return;
     {
         std::lock_guard<std::mutex> lock(icon_decode_mutex_);
-        if (!icon_decode_pending_.insert(key).second) return;
+        if (icon_decode_stop_) return;
+        if (icon_decode_pending_.size() >= 32 || !icon_decode_pending_.insert(key).second) return;
         icon_decode_queue_.push_back({path, key, toast_title});
     }
     icon_decode_cv_.notify_one();
@@ -113,16 +116,16 @@ void StarOverlay::icon_decode_worker()
         {
             std::unique_lock<std::mutex> lock(icon_decode_mutex_);
             icon_decode_cv_.wait(lock, [&] {
-                return icon_decode_stop_ || !icon_decode_queue_.empty();
+                return icon_decode_stop_ || (!icon_decode_queue_.empty() && icon_decode_ready_.size() < 4);
             });
-            if (icon_decode_stop_ && icon_decode_queue_.empty()) break;
+            if (icon_decode_stop_) break;
             req = std::move(icon_decode_queue_.front());
             icon_decode_queue_.pop_front();
         }
         IconDecodeResult res;
         res.key = req.key;
         res.toast_title = req.toast_title;
-        StarSteamUtils::get().LoadIconFile(req.path, res.rgba, res.w, res.h);
+        StarSteamUtils::get().LoadIconFile(req.path, res.rgba, res.w, res.h, req.key.rfind("viewer_", 0) == 0 ? 4096 : 256);
         {
             std::lock_guard<std::mutex> lock(icon_decode_mutex_);
             icon_decode_ready_.push_back(std::move(res));
@@ -130,22 +133,62 @@ void StarOverlay::icon_decode_worker()
     }
 }
 
-void StarOverlay::drain_icon_decodes()
+void StarOverlay::release_icon(ImTextureID texture)
 {
-    std::vector<IconDecodeResult> ready;
-    {
-        std::lock_guard<std::mutex> lock(icon_decode_mutex_);
-        ready.swap(icon_decode_ready_);
-    }
-    for (auto& r : ready) {
-        if (r.w > 0 && r.h > 0 && !r.rgba.empty())
-            get_or_create_icon(r.key, r.rgba, r.w, r.h);
-        if (!r.toast_title.empty())
-            notifications_.attach_icon(r.toast_title, std::move(r.rgba), r.w, r.h);
-        {
-            std::lock_guard<std::mutex> lock(icon_decode_mutex_);
-            icon_decode_pending_.erase(r.key);
-        }
-    }
+    if (!texture) return;
+#ifdef _WIN64
+    if (active_api_ == GraphicsAPI::DX12) { release_icon_dx12(texture); return; }
+#endif
+    if (active_api_ == GraphicsAPI::Vulkan) { release_icon_vulkan(texture); return; }
+    if (active_api_ == GraphicsAPI::OpenGL) {
+        GLuint name = (GLuint)(uintptr_t)texture;
+        glDeleteTextures(1, &name);
+    } else ((IUnknown*)texture)->Release();
 }
 
+void StarOverlay::drain_icon_decodes()
+{
+    IconDecodeResult r;
+    {
+        std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+        if (icon_decode_ready_.empty()) return;
+        r = std::move(icon_decode_ready_.front());
+        icon_decode_ready_.pop_front();
+    }
+    icon_decode_cv_.notify_one();
+    bool uploaded = false;
+    if (r.w > 0 && r.h > 0 && !r.rgba.empty()) {
+        // Evict before submitting this frame: draw lists cannot refer to the old texture.
+        bool is_shot   = r.key.rfind("shot_", 0) == 0;
+        bool is_viewer = r.key.rfind("viewer_", 0) == 0;
+        if (is_shot && !icons_.contains(r.key)) {
+            while (screenshot_icons_.size() >= 16) {
+                release_icon(icons_.take(screenshot_icons_.front()));
+                screenshot_icons_.pop_front();
+            }
+        }
+        if (is_viewer && viewer_icon_ != r.key) {
+            release_icon(icons_.take(viewer_icon_));
+            viewer_icon_ = r.key;
+        }
+        // Bound the rest (achievement toasts, panel icons) so the Vulkan
+        // descriptor pool / DX12 SRV heap can't be exhausted.
+        if (!is_shot && !is_viewer && !icons_.contains(r.key)) {
+            while (other_icons_.size() >= kMaxOtherIcons) {
+                release_icon(icons_.take(other_icons_.front()));
+                other_icons_.pop_front();
+            }
+        }
+        bool cached = icons_.contains(r.key);
+        uploaded = get_or_create_icon(r.key, r.rgba, r.w, r.h) != nullptr;
+        if (uploaded && !cached) { external_draw_snapshot_.clear(); gdi_.draw_snapshot.clear(); }
+        if (uploaded && !cached && is_shot) screenshot_icons_.push_back(r.key);
+        if (uploaded && !cached && !is_shot && !is_viewer) other_icons_.push_back(r.key);
+    }
+    if (uploaded && !r.toast_title.empty())
+        notifications_.attach_icon(r.toast_title, std::move(r.rgba), r.w, r.h);
+    {
+        std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+        icon_decode_pending_.erase(r.key);
+    }
+}

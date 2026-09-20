@@ -202,3 +202,37 @@ endif()
 install(TARGETS star RUNTIME DESTINATION .)
 
 add_subdirectory(proxy)
+
+if(STAR_BUILD_TESTS)
+    add_executable(performance_smoke ../tests/performance_smoke.cpp)
+    target_include_directories(performance_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${imgui_SOURCE_DIR})
+    target_link_libraries(performance_smoke PRIVATE imgui)
+    add_test(NAME performance_smoke COMMAND performance_smoke)
+
+    add_executable(dx12_submission_smoke ../tests/dx12_submission_smoke.cpp)
+    target_include_directories(dx12_submission_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(dx12_submission_smoke PRIVATE d3d12 dxgi)
+    add_test(NAME dx12_submission_smoke COMMAND dx12_submission_smoke)
+    set_tests_properties(dx12_submission_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+
+    add_executable(async_io_smoke ../tests/async_io_smoke.cpp
+        core/storage.cpp core/callbacks.cpp steam/steam_remote_storage.cpp
+        steam/steam_utils.cpp steam/steam_user_stats.cpp)
+    target_sources(async_io_smoke PRIVATE overlay/capture/screenshot_service.cpp)
+    target_include_directories(async_io_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/sdk)
+    target_link_libraries(async_io_smoke PRIVATE nlohmann_json::nlohmann_json ole32 shell32 user32 winmm)
+    target_compile_definitions(async_io_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    add_test(NAME async_io_smoke COMMAND async_io_smoke ${CMAKE_CURRENT_BINARY_DIR}/async-io-test)
+
+    foreach(check gdi_resources_smoke pixel_copy_smoke)
+        add_executable(${check} ../tests/${check}.cpp)
+        target_include_directories(${check} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${imgui_SOURCE_DIR})
+        target_link_libraries(${check} PRIVATE imgui gdi32 user32)
+        add_test(NAME ${check} COMMAND ${check})
+    endforeach()
+    if(MSVC)
+        foreach(check performance_smoke dx12_submission_smoke async_io_smoke gdi_resources_smoke pixel_copy_smoke)
+            target_compile_options(${check} PRIVATE /UNDEBUG)
+        endforeach()
+    endif()
+endif()

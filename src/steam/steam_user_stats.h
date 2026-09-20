@@ -1,4 +1,5 @@
 #pragma once
+#include <unordered_set>
 #include "core/star_common.h"
 #include "steam/isteamuserstats001.h"
 #include "steam/isteamuserstats002.h"
@@ -127,12 +128,13 @@ public:
     void notify_achievement_unlock(const std::string& name, bool with_sound = true);
     static void play_unlock_sound();
     static void play_completion_sound();
-    void set_bulk_silent(bool silent) { bulk_silent_ = silent; }
+    void set_all_achievements(bool unlocked);
+    std::unordered_map<std::string, AchievementState> achievement_snapshot();
 
 private:
     StarSteamUserStats() = default;
     bool stats_loaded_ = false;
-    bool bulk_silent_ = false; // bulk unlock: persist + callbacks, skip toast/sound
+    std::unordered_set<std::string> known_achievements_;
     std::unordered_map<std::string, AchievementState> achievements_;
     std::unordered_map<std::string, StatValue> stats_;
     std::vector<LeaderboardInfo> leaderboards_;

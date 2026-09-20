@@ -1,4 +1,5 @@
 #pragma once
+#include "overlay/ui/draw_snapshot.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 
@@ -62,9 +63,11 @@ struct Resources {
     ComPtr<ID3D11RenderTargetView> render_view;
     ComPtr<ID3D11Texture2D> staging_texture;
     DibSurface pixels;
+    DrawSnapshot draw_snapshot;
     int width = 0, height = 0;
 
     void reset_surfaces() {
+        draw_snapshot.clear();
         render_view.Reset();
         staging_texture.Reset();
         render_texture.Reset();

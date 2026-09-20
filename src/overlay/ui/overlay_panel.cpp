@@ -247,7 +247,11 @@ void StarOverlay::panel_screenshots(ImFont* fsmall, float sw, float sh)
             ImGui::Text("%s", vname.c_str());
             ImGui::PopStyleColor();
             ImGui::PopFont();
-            ImTextureID vtex = icons_.find("shot_" + vname);
+            ImTextureID vtex = icons_.find("viewer_" + vname);
+            if (!vtex) {
+                enqueue_icon_decode(viewer_file_, "viewer_" + vname);
+                vtex = icons_.find("shot_" + vname);
+            }
             if (vtex) {
                 int iw = 0, ih = 0;
                 for (auto& e : shots) {
@@ -282,15 +286,8 @@ void StarOverlay::panel_screenshots(ImFont* fsmall, float sw, float sh)
             ImGui::PushStyleColor(ImGuiCol_Text,          v4(P_TXT, 1.f));
             if (ImGui::Button("Delete")) {
                 DeleteFileA(viewer_file_.c_str());
-                ImTextureID dit = icons_.take("shot_" + vname);
-                if (dit) {
-                    if (active_api_ == GraphicsAPI::DX11)
-                        ((ID3D11ShaderResourceView*)dit)->Release();
-                    else if (active_api_ == GraphicsAPI::DX10)
-                        ((ID3D10ShaderResourceView*)dit)->Release();
-                    else if (active_api_ == GraphicsAPI::DX9)
-                        ((IDirect3DTexture9*)dit)->Release();
-                }
+                // Textures may already be referenced by this frame's draw list;
+                // bounded cache eviction releases them on a later frame.
                 shots.clear();
                 shots_refresh = 0;
                 viewer_file_.clear();
@@ -317,9 +314,10 @@ void StarOverlay::panel_achievements(ImFont* fsmall, ImFont* ftitle, float pw, f
     auto& stats = StarSteamUserStats::get();
     int total = (int)s.achievements.size();
     int done  = 0;
+    auto snapshot = stats.achievement_snapshot();
     for (auto& d : s.achievements) {
-        bool got = false; stats.GetAchievement(d.name.c_str(), &got);
-        if (got) done++;
+        auto it = snapshot.find(d.name);
+        if (it != snapshot.end() && it->second.achieved) done++;
     }
 
     ImGui::PushFont(fsmall);
@@ -419,9 +417,7 @@ void StarOverlay::panel_achievements(ImFont* fsmall, ImFont* ftitle, float pw, f
             ImGui::PushStyleColor(ImGuiCol_Text,          bulk_is_unlock_ ? style_.vacc(1.f) : v4(P_TXT, 1.f));
             if (ImGui::Button("Confirm")) {
                 if (bulk_is_unlock_) {
-                    stats.set_bulk_silent(true);
-                    for (auto& d : s.achievements) stats.SetAchievement(d.name.c_str());
-                    stats.set_bulk_silent(false);
+                    stats.set_all_achievements(true);
                     char msg[64];
                     snprintf(msg, sizeof(msg), "%d achievements", total);
                     StarSteamUserStats::get().play_completion_sound();
@@ -431,7 +427,7 @@ void StarOverlay::panel_achievements(ImFont* fsmall, ImFont* ftitle, float pw, f
                         sum_rgba, sum_w, sum_h, "100% COMPLETE", true);
                     STAR_LOG("Bulk unlock all (%d)", total);
                 } else {
-                    for (auto& d : s.achievements) stats.ClearAchievement(d.name.c_str());
+                    stats.set_all_achievements(false);
                     STAR_LOG("Bulk reset all (%d)", total);
                 }
                 ImGui::CloseCurrentPopup();
@@ -636,27 +632,38 @@ void StarOverlay::panel_achievement_list(ImFont* fsmall, ImFont* ftitle)
     auto& s = Settings::get();
     auto& stats = StarSteamUserStats::get();
     const float S = style_.scale();
-    const float ROW_BASE = 64.f;
     const float ICON_S = 44.f;
     const float ICON_X = 12.f;
 
     std::string needle = achievement_filter_;
     std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
 
-    int shown = 0;
-    for (auto& def : s.achievements) {
-        bool got = false;
-        uint32_t unlock_t = 0;
-        stats.GetAchievementAndUnlockTime(def.name.c_str(), &got, &unlock_t);
-
+    auto snapshot = stats.achievement_snapshot();
+    std::vector<size_t> filtered;
+    for (size_t i = 0; i < s.achievements.size(); ++i) {
+        const auto& def = s.achievements[i];
+        auto it = snapshot.find(def.name);
+        bool got = it != snapshot.end() && it->second.achieved;
         if (filter_mode_ == 1 && !got) continue;
         if (filter_mode_ == 2 && got) continue;
         if (!needle.empty()) {
-            std::string hay = (!def.display_name.empty()) ? def.display_name : def.name;
+            std::string hay = def.display_name.empty() ? def.name : def.display_name;
             std::transform(hay.begin(), hay.end(), hay.begin(), ::tolower);
             if (hay.find(needle) == std::string::npos) continue;
         }
-        shown++;
+        filtered.push_back(i);
+    }
+    int shown = (int)filtered.size();
+    // Fixed-height rows allow ImGui to skip all layout/decode work off screen.
+    const float ROW_H = 80.f * S;
+    ImGuiListClipper clipper;
+    clipper.Begin(shown, ROW_H);
+    while (clipper.Step())
+    for (int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
+        auto& def = s.achievements[filtered[index]];
+        auto it = snapshot.find(def.name);
+        bool got = it != snapshot.end() && it->second.achieved;
+        uint32_t unlock_t = it != snapshot.end() ? it->second.unlock_time : 0;
 
         ImVec2 rmin = ImGui::GetCursorScreenPos();
         float  rw   = ImGui::GetContentRegionAvail().x;
@@ -671,7 +678,6 @@ void StarOverlay::panel_achievement_list(ImFont* fsmall, ImFont* ftitle)
         std::string d1, d2;
         int desc_lines = (!is_hidden && raw_desc)
             ? wrap_two_lines(fsmall, 15.f * S, raw_desc, tw_probe, d1, d2) : 0;
-        float ROW_H = (desc_lines == 2 ? 80.f : ROW_BASE) * S;
 
         ImGui::SetNextItemAllowOverlap();
         ImGui::InvisibleButton(("##r_"+def.name).c_str(), {rw, ROW_H});
@@ -800,7 +806,8 @@ void StarOverlay::push_achievement(const std::string& name, const std::string& d
     if (!enabled_) return;
     AchievementNotification n;
     n.header = header; n.summary = summary; n.title = name; n.description = desc;
-    n.icon_rgba = rgba; n.icon_width = iw; n.icon_height = ih;
+    if (!rgba.empty()) n.icon_rgba = std::make_shared<const std::vector<uint8_t>>(rgba);
+    n.icon_width = iw; n.icon_height = ih;
     n.time_remaining = 5.f; n.age = 0.f;
     notifications_.push(std::move(n));
 }

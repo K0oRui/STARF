@@ -247,6 +247,5 @@ void StarOverlay::maybe_capture_dx7(IDirect3DDevice7* device)
         return;
     }
     std::string path = ScreenshotService::next_path();
-    if (!rgba.empty() && !path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(),
-            (int)desc.dwWidth, (int)desc.dwHeight)) notify_screenshot(path);
+    screenshots_.save_async(path, std::move(rgba), (int)desc.dwWidth, (int)desc.dwHeight);
 }

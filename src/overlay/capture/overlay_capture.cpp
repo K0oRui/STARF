@@ -51,8 +51,7 @@ void StarOverlay::maybe_capture_dx11(IDXGISwapChain* chain)
                       desc.Width, desc.Height, bgra);
         context_->Unmap(staging, 0);
         path = ScreenshotService::next_path();
-        if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
-            notify_screenshot(path);
+        screenshots_.save_async(path, std::move(rgba), (int)desc.Width, (int)desc.Height);
     }
     staging->Release();
     if (resolved) resolved->Release();
@@ -106,8 +105,7 @@ void StarOverlay::maybe_capture_dx10(IDXGISwapChain* chain)
                       desc.Width, desc.Height, bgra);
         staging->Unmap(0);
         path = ScreenshotService::next_path();
-        if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
-            notify_screenshot(path);
+        screenshots_.save_async(path, std::move(rgba), (int)desc.Width, (int)desc.Height);
     }
     staging->Release();
     if (resolved) resolved->Release();
@@ -146,8 +144,7 @@ void StarOverlay::maybe_capture_dx9(IDirect3DDevice9* device)
                       desc.Width, desc.Height, true);
         sys->UnlockRect();
         std::string path = ScreenshotService::next_path();
-        if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
-            notify_screenshot(path);
+        screenshots_.save_async(path, std::move(rgba), (int)desc.Width, (int)desc.Height);
     }
     sys->Release();
 }
@@ -167,8 +164,7 @@ void StarOverlay::maybe_capture_opengl()
     for (int y = 0; y < vp[3]; y++)
         memcpy(rgba.data() + (size_t)y * row, px.data() + (size_t)(vp[3] - 1 - y) * row, row);
     std::string path = ScreenshotService::next_path();
-    if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), vp[2], vp[3]))
-        notify_screenshot(path);
+    screenshots_.save_async(path, std::move(rgba), vp[2], vp[3]);
 }
 
 void StarOverlay::capture_desktop_duplication()
@@ -291,8 +287,7 @@ void StarOverlay::capture_desktop_duplication()
             double mean = (double)bright / ((double)desc.Width * desc.Height * 3.0);
             bool dark = mean < 4.0;
             if (dark) STAR_LOG("Screenshot looks black (exclusive fullscreen?)");
-            if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
-                notify_screenshot(path, dark);
+            screenshots_.save_async(path, std::move(rgba), (int)desc.Width, (int)desc.Height, dark);
         }
         staging->Release();
     }

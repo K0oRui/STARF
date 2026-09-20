@@ -225,8 +225,7 @@ void StarOverlay::maybe_capture_dx8(IDirect3DDevice8* device)
         }
         sys->UnlockRect();
         std::string path = ScreenshotService::next_path();
-        if (!path.empty() && ScreenshotService::save_rgba_png(path, rgba.data(), (int)desc.Width, (int)desc.Height))
-            notify_screenshot(path);
+        screenshots_.save_async(path, std::move(rgba), (int)desc.Width, (int)desc.Height);
     }
     sys->Release();
 }

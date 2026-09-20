@@ -15,11 +15,13 @@ void StarOverlay::notify_screenshot(const std::string& file, bool dark)
     if (slash != std::string::npos) name = name.substr(slash + 1);
     // Thumbnail preview so the toast isn't a grey box. Decode off-thread so
     // a big PNG never stalls the render loop.
-    push_achievement(name,
-        dark ? "All black? Try Borderless mode."
-             : "Saved to " + ScreenshotService::dir(),
-        {}, 0, 0, "SCREENSHOT SAVED");
-    enqueue_icon_decode(file, name, name);
+    AchievementNotification toast;
+    toast.title = name;
+    toast.icon_key = "shot_" + name;
+    toast.header = "SCREENSHOT SAVED";
+    toast.description = dark ? "All black? Try Borderless mode." : "Saved to " + ScreenshotService::dir();
+    notifications_.push(std::move(toast));
+    enqueue_icon_decode(file, "shot_" + name);
     // Pop the viewer so the user gets an instant preview on next panel open.
     viewer_file_ = file;
     viewer_pending_ = true;

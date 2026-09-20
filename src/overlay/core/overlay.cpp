@@ -43,6 +43,7 @@ void StarOverlay::init()
     // "auto" (default) starts on hooks and falls back to external if the
     // title proves hostile (see switch_to_external).
     if (!enabled_) return;
+    screenshots_.start();
     icon_decode_stop_ = false;
     icon_decode_thread_ = std::thread(&StarOverlay::icon_decode_worker, this);
     fallback_count_ = Settings::get().overlay_fallback_count;
@@ -273,6 +274,7 @@ std::string StarOverlay::format_playtime(uint64_t secs)
 
 void StarOverlay::shutdown()
 {
+    screenshots_.stop();
     // A retry session that survived without falling back again means the
     // hostile title healed: clear the backoff so future launches use hooks.
     if (retry_session_ && !fell_back_this_session_) {
@@ -288,6 +290,9 @@ void StarOverlay::shutdown()
         }
         icon_decode_cv_.notify_all();
         icon_decode_thread_.join();
+        std::lock_guard<std::mutex> lock(icon_decode_mutex_);
+        icon_decode_queue_.clear(); icon_decode_ready_.clear();
+        icon_decode_pending_.clear();
     }
     if (mode_ == OverlayMode::External && ext_thread_) {
         ext_stop_ = true;
@@ -372,6 +377,7 @@ void StarOverlay::shutdown()
     // OpenGL icon textures belong to the game's GL context, which may be gone
     // at shutdown; the OS/driver reclaims them with the context.
     icons_.clear();
+    screenshot_icons_.clear(); viewer_icon_.clear();
     if (context_) { context_->Release(); context_ = nullptr; }
     if (device_)  { device_->Release();  device_  = nullptr; }
     if (dx10_device_) { dx10_device_->Release(); dx10_device_ = nullptr; }
