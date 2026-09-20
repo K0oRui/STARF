@@ -7,12 +7,21 @@ void StarOverlay::build_frame_ui()
 {
     for (auto& shot : screenshots_.take_completed()) notify_screenshot(shot.path, shot.dark);
     drain_icon_decodes();
-    float dt = ImGui::GetIO().DeltaTime;
+    // Real-time clock (not ImGui's present-rate clock): the animation must
+    // keep advancing even when the game stalls its presents during loading.
+    float now = now_seconds();
+    float dt = now - last_frame_time_;
     if (dt <= 0.f) dt = 0.0167f;
+    last_frame_time_ = now;
 
     float target = open_ ? 1.f : 0.f;
-    panel_anim_ += (target - panel_anim_) * clamp01(12.f * dt);
-    panel_anim_  = clamp01(panel_anim_);
+    if (target != panel_target_) {
+        panel_target_ = target;
+        panel_anim_t0_ = now;
+    }
+    const float PANEL_ANIM_DUR = 0.35f;
+    float t = clamp01((now - panel_anim_t0_) / PANEL_ANIM_DUR);
+    panel_anim_ = open_ ? easeOut(t) : 1.f - easeIn(t);
 
     if (panel_anim_ > 0.001f) render_panel();
     render_notifications(dt);
@@ -173,9 +182,9 @@ void StarOverlay::render_notifications(float dt)
         if (desc_lines >= 1) {
             float dy = ty2 + 23.f * S;
             dl->PushClipRect({tx,dy},{tx+tw,dy+38.f*S},true);
-            dl->AddText(fsmall, 13.f * S, {tx,dy}, col(P_MUT, a), d1.c_str());
+            dl->AddText(fsmall, 14.f * S, {tx,dy}, col(P_MUT, a), d1.c_str());
             if (desc_lines == 2)
-                dl->AddText(fsmall, 13.f * S, {tx,dy+17.f*S}, col(P_MUT, a), d2.c_str());
+                dl->AddText(fsmall, 14.f * S, {tx,dy+17.f*S}, col(P_MUT, a), d2.c_str());
             dl->PopClipRect();
         }
 

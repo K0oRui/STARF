@@ -3,6 +3,7 @@
 // overlay.cpp; extracted so the split overlay translation units can share them.
 
 #include "imgui.h"
+#include <chrono>
 #include <cstdint>
 #include <string>
 
@@ -19,6 +20,13 @@
 
 float clamp01(float v);
 float easeOut(float t);
+float easeIn(float t);
+
+// Real-time seconds (steady clock), independent of the game's present rate.
+inline float now_seconds() {
+    return (float)std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // 5-point star (procedural trophy for the all-complete toast).
 void draw_star(ImDrawList* dl, ImVec2 c, float r_out, float r_in, ImU32 col);

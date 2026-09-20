@@ -560,7 +560,8 @@ void StarOverlay::external_thread_proc()
 
         if ((frame++ % 30) == 0) external_track_game_window();
 
-        bool want = fg_ok_ && open_;
+        bool panel_active = open_ || panel_anim_ > 0.001f;
+        bool want = fg_ok_ && panel_active;
         if (!want && fg_ok_) {
             want = (notifications_.has_pending() || screenshots_.busy());
             if (!want)
@@ -573,7 +574,8 @@ void StarOverlay::external_thread_proc()
             }
             external_render_frame();
             // Interactive while open, calm while closed (HUD/toasts only).
-            std::this_thread::sleep_for(std::chrono::milliseconds(open_ ? 8 : 33));
+            // Keep the panel animating out at full rate too.
+            std::this_thread::sleep_for(std::chrono::milliseconds(panel_active ? 8 : 33));
         } else {
             if (ext_visible_) {
                 ShowWindow(ext_hwnd_, SW_HIDE);

@@ -32,6 +32,8 @@ public:
     void init() override;
     void shutdown() override;
 
+    void hook_vulkan_early() { hook_vulkan(); }
+
     void push_achievement(const std::string& name, const std::string& desc,
                            const std::vector<uint8_t>& icon_rgba, int iw, int ih,
                            const std::string& header = "ACHIEVEMENT UNLOCKED",
@@ -200,6 +202,7 @@ private:
     int vk_swapchain_format_ = 0;
     uint32_t vk_min_image_count_ = 2;
     bool vk_swapchain_recreated_ = false;
+    DWORD vk_first_missing_tick_ = 0;
     void* orig_vkCreateInstance_ = nullptr;
     void* orig_vkCreateDevice_ = nullptr;
     void* orig_vkCreateSwapchainKHR_ = nullptr;
@@ -213,6 +216,9 @@ private:
     static int WINAPI hooked_vkCreateSwapchainKHR(void*, const void*, const void*, uint64_t*);
     static int WINAPI hooked_vkQueuePresentKHR(void*, const void*);
     void hook_vulkan();
+    void recover_queue_family();
+    void recover_physical_device();
+    void recover_vulkan_metadata();
     void on_present_vulkan(void* queue, const void* pPresentInfo);
     void init_imgui_vulkan(void* queue, const void* pPresentInfo);
     void render_frame_vulkan(void* queue, const void* pPresentInfo);
@@ -329,6 +335,9 @@ private:
     std::atomic<bool> retry_stop_{ false };
     bool  open_              = false;
     float panel_anim_        = 0.0f;
+    float panel_target_      = 0.0f;
+    float panel_anim_t0_     = 0.0f;
+    float last_frame_time_   = 0.0f;
     int   cursor_show_count_offset_ = 0;
 
     char  achievement_filter_[64] = {};

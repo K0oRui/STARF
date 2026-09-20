@@ -155,6 +155,10 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
     // External mode only sniffs (for the label + input); all drawing lives
     // in the external window. Hook rendering stays off entirely.
     if (mode_ == OverlayMode::External) return;
+    // A Vulkan title may also present a DXGI helper swapchain (Unity does
+    // this for its player loop). The overlay belongs on the Vulkan surface;
+    // never init the DX12 path on a Vulkan game or it corrupts the frame.
+    if (game_api_ == GraphicsAPI::Vulkan) return;
 
     // The game switched to a different API on a different, now-foreground
     // window (e.g. D3D11 splash -> D3D10 main). Re-init so the overlay draws

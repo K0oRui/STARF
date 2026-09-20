@@ -38,6 +38,7 @@
 #include "steam/steam_parties.h"
 #include "steam/steam_remote_play.h"
 #include "overlay/overlay.h"
+#include "overlay/overlay_internal.h"
 #include "core/integrity_hooks.h"
 
 #ifndef STAR_EXPORT
@@ -127,6 +128,12 @@ void STAR_WriteLog(const char* fmt, ...)
 static DWORD WINAPI STAR_EarlyHookThread(LPVOID)
 {
     STAR_install_integrity_hooks();
+    // Hook vulkan-1.dll before SteamAPI_Init: Unity-style games create their
+    // Vulkan instance/device before the Steamworks plugin initializes, so the
+    // normal hook path (SteamAPI_Init) misses the creation metadata and the
+    // overlay falls back to external. Hooking here catches it natively.
+    g_overlay = &StarOverlay::get();
+    g_overlay->hook_vulkan_early();
     return 0;
 }
 

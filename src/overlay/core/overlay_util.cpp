@@ -9,6 +9,7 @@
 
 float clamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
 float easeOut(float t) { float f = 1.f - t; return 1.f - f * f * f; }
+float easeIn(float t) { return t * t * t; }
 
 void draw_star(ImDrawList* dl, ImVec2 c, float r_out, float r_in, ImU32 col)
 {

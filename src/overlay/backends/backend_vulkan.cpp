@@ -59,6 +59,7 @@
     VK_FUNC(vkWaitForFences) \
     VK_FUNC(vkDestroyFence) \
     VK_FUNC(vkQueuePresentKHR) \
+    VK_FUNC(vkAcquireNextImageKHR) \
     VK_FUNC(vkDeviceWaitIdle) \
     VK_FUNC(vkResetCommandBuffer) \
     VK_FUNC(vkQueueSubmit)
@@ -130,6 +131,7 @@ struct VulkanOverlayData {
     VkExtent2D extent{};
     std::vector<VkFence> fences;
     std::vector<VkSemaphore> present_ready;
+    VkFence boost_acquire_fence = VK_NULL_HANDLE;
     bool failed = false;
     VkSampler icon_sampler = VK_NULL_HANDLE;
     std::vector<VkImage>        icon_images;
@@ -261,6 +263,11 @@ int WINAPI StarOverlay::hooked_vkCreateSwapchainKHR(void* device, const void* pC
         }
         g_overlay->vk_swapchain_recreated_ = true;
         STAR_LOG("Vulkan swapchain created fmt=%d count=%u device=%p", g_overlay->vk_swapchain_format_, (unsigned)g_overlay->vk_min_image_count_, device);
+        // If vkCreateInstance/vkCreateDevice were missed (game init before our
+        // hooks loaded), recover instance/physical-device/queue-family now.
+        if (!g_overlay->vk_instance_ || !g_overlay->vk_physical_device_ ||
+            g_overlay->vk_queue_family_ == UINT32_MAX)
+            g_overlay->recover_vulkan_metadata();
     }
     return res;
 }
@@ -363,6 +370,64 @@ void StarOverlay::hook_vulkan()
     if (orig_vkQueuePresentKHR_) { vulkan_hooked_ = true; STAR_LOG("Vulkan hooked"); }
 }
 
+void StarOverlay::recover_queue_family()
+{
+    HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkan) return;
+    auto get_queue = (PFN_vkGetDeviceQueue)GetProcAddress(vulkan, "vkGetDeviceQueue");
+    if (!get_queue || vk_queue_family_ != UINT32_MAX || !vk_device_ || !vk_queue_) return;
+    for (uint32_t f = 0; f < 32; f++) {
+        for (uint32_t i = 0; i < 4; i++) {
+            VkQueue q = VK_NULL_HANDLE;
+            get_queue((VkDevice)vk_device_, f, i, &q);
+            if (q == (VkQueue)vk_queue_) { vk_queue_family_ = f; return; }
+        }
+    }
+}
+
+void StarOverlay::recover_physical_device()
+{
+    if (vk_instance_ && vk_physical_device_) return;
+    HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
+    if (!vulkan) return;
+    auto create_instance = (PFN_vkCreateInstance)orig_vkCreateInstance_;
+    auto enumerate = (PFN_vkEnumeratePhysicalDevices)GetProcAddress(vulkan, "vkEnumeratePhysicalDevices");
+    auto get_props = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)GetProcAddress(vulkan, "vkGetPhysicalDeviceQueueFamilyProperties");
+    if (!create_instance || !enumerate || !get_props) return;
+    VkApplicationInfo app = {};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.apiVersion = VK_API_VERSION_1_0;
+    VkInstanceCreateInfo ici = {};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (create_instance(&ici, nullptr, &inst) != VK_SUCCESS) return;
+    uint32_t count = 0;
+    enumerate(inst, &count, nullptr);
+    std::vector<VkPhysicalDevice> pdevs(count);
+    enumerate(inst, &count, pdevs.data());
+    for (auto pdev : pdevs) {
+        uint32_t fcount = 0;
+        get_props(pdev, &fcount, nullptr);
+        std::vector<VkQueueFamilyProperties> families(fcount);
+        get_props(pdev, &fcount, families.data());
+        for (auto& fam : families) {
+            if (fam.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                vk_instance_ = inst;
+                vk_physical_device_ = pdev;
+                g_vk_instance = inst;
+                return;
+            }
+        }
+    }
+}
+
+void StarOverlay::recover_vulkan_metadata()
+{
+    recover_queue_family();
+    recover_physical_device();
+}
+
 void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
 {
     if (!enabled_) return;
@@ -375,24 +440,50 @@ void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
     if (!lock.owns_lock()) return;
     const auto* pi = static_cast<const VkPresentInfoKHR*>(pPresentInfo);
     if (!pi || !pi->swapchainCount || !pi->pSwapchains || !pi->pImageIndices) return;
+    // Games that created their Vulkan context before our hooks loaded never
+    // hit vkCreateInstance/vkCreateDevice; adopt the presenting queue so the
+    // swapchain hook can recover the rest.
+    if (!vk_queue_) vk_queue_ = queue;
+    bool metadata_ok = vk_device_ && vk_instance_ && vk_physical_device_ &&
+        vk_width_ && vk_height_ && vk_queue_family_ != UINT32_MAX &&
+        vk_swapchain_ && vk_image_usage_;
+    if (!metadata_ok) {
+        if (vk_swapchain_recreated_) recover_vulkan_metadata();
+        metadata_ok = vk_device_ && vk_instance_ && vk_physical_device_ &&
+            vk_width_ && vk_height_ && vk_queue_family_ != UINT32_MAX &&
+            vk_swapchain_ && vk_image_usage_;
+        if (!metadata_ok) {
+            // Wait for the swapchain hook to fire and recover metadata before
+            // falling back to the external overlay.
+            if (vk_first_missing_tick_ == 0) vk_first_missing_tick_ = GetTickCount();
+            if (GetTickCount() - vk_first_missing_tick_ < 2000) return;
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                STAR_LOG("Vulkan native unavailable: creation metadata missing");
+            }
+            if (Settings::get().overlay_mode != "hook") {
+                cleanup_vulkan();
+                mode_ = OverlayMode::External;
+                STAR_LOG("Vulkan: using external overlay for this session (creation metadata unavailable)");
+                start_external_thread();
+            }
+            return;
+        }
+    }
     if (!orig_vkDestroySwapchainKHR_ || !orig_vkDestroyDevice_ ||
-        !vk_device_ || !vk_instance_ || !vk_physical_device_ ||
-        !vk_width_ || !vk_height_ || vk_queue_family_ == UINT32_MAX ||
         queue != vk_queue_ || pi->swapchainCount != 1 ||
         (uintptr_t)pi->pSwapchains[0] != (uintptr_t)vk_swapchain_ ||
         !(vk_image_usage_ & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
         static bool logged = false;
         if (!logged) {
             logged = true;
-            STAR_LOG("Vulkan native unavailable: creation metadata missing or unsupported queue/swapchain; instance=%p physical=%p device=%p queue=%p captured=%p extent=%ux%u",
-                vk_instance_, vk_physical_device_, vk_device_, queue, vk_queue_, vk_width_, vk_height_);
+            STAR_LOG("Vulkan native unavailable: unsupported queue/swapchain");
         }
-        // There is no Vulkan API to reconstruct a device's physical GPU and
-        // enabled queues. A dummy instance cannot supply that information.
         if (Settings::get().overlay_mode != "hook") {
             cleanup_vulkan();
             mode_ = OverlayMode::External;
-            STAR_LOG("Vulkan: using external overlay for this session (creation metadata unavailable)");
+            STAR_LOG("Vulkan: using external overlay for this session (unsupported queue/swapchain)");
             start_external_thread();
         }
         return;
