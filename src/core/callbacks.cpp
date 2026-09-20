@@ -31,7 +31,6 @@ void STAR_RegisterCallback(CCallbackBase* cb, int id)
     }
     vec.push_back(cb);
     CBAccess::set_registered(cb, true);
-    STAR_LOG("RegisterCallback id=%d", id);
 }
 
 void STAR_UnregisterCallback(CCallbackBase* cb)
@@ -78,7 +77,6 @@ uint64_t STAR_PostCallResult(int cb_id, const void* data, size_t size, bool io_f
         memcpy(pr.data.data(), data, size);
     }
     g_pending_results[handle] = std::move(pr);
-    STAR_LOG("PostCallResult handle=%llu cb_id=%d", handle, cb_id);
 
     if (g_manual_dispatch_enabled) {
         #pragma pack(push, 8)

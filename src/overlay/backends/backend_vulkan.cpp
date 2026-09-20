@@ -346,14 +346,12 @@ void StarOverlay::hook_vulkan()
     if (pQueuePresent && !orig_vkQueuePresentKHR_) {
         if (MH_CreateHook(pQueuePresent, &hooked_vkQueuePresentKHR, (void**)&orig_vkQueuePresentKHR_) == MH_OK) {
             MH_EnableHook(pQueuePresent);
-            STAR_LOG("Vulkan QueuePresent hooked");
         }
     }
     // Loader export: catches swapchain recreates even when vkCreateDevice was missed.
     if (pCreateSwapchain && !orig_vkCreateSwapchainKHR_) {
         if (MH_CreateHook(pCreateSwapchain, &hooked_vkCreateSwapchainKHR, (void**)&orig_vkCreateSwapchainKHR_) == MH_OK) {
             MH_EnableHook(pCreateSwapchain);
-            STAR_LOG("Vulkan CreateSwapchain hooked (loader)");
         }
     }
     auto install = [&](const char* name, void* detour, void** original) {
@@ -367,7 +365,10 @@ void StarOverlay::hook_vulkan()
     };
     install("vkDestroySwapchainKHR", (void*)&hooked_vkDestroySwapchainKHR, &orig_vkDestroySwapchainKHR_);
     install("vkDestroyDevice", (void*)&hooked_vkDestroyDevice, &orig_vkDestroyDevice_);
-    if (orig_vkQueuePresentKHR_) { vulkan_hooked_ = true; STAR_LOG("Vulkan hooked"); }
+    if (orig_vkQueuePresentKHR_) {
+        vulkan_hooked_ = true;
+        if (!api_detected_) { api_detected_ = true; STAR_LOG("Vulkan hooked"); }
+    }
 }
 
 void StarOverlay::recover_queue_family()

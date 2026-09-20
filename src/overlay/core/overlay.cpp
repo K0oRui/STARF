@@ -169,9 +169,8 @@ void StarOverlay::init()
         for (int i = 0; i < 30; i++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             if (retry_stop_.load() || !g_overlay) break;
+            if (api_detected_) break;
             ensure_hooks();
-            if (dxgi_hooked_ && dx9_hooked_ && dx8_hooked_ && dx7_hooked_ && opengl_hooked_ && vulkan_hooked_ && gdi_hooked_) break;
-            if (imgui_initialized_) break;
         }
     }).detach();
 }

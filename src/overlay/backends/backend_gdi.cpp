@@ -186,7 +186,6 @@ void StarOverlay::hook_gdi()
                 original = nullptr;
             }
         }
-        STAR_LOG("GDI hook %s MH=%d", name, (int)status);
         return status == MH_OK;
     };
     bool bitblt = install("BitBlt", gdi32, &hooked_BitBlt, orig_bitblt_);
@@ -194,7 +193,7 @@ void StarOverlay::hook_gdi()
     bool dib = install("StretchDIBits", gdi32, &hooked_StretchDIBits, orig_stretchdibits_);
     bool setdib = install("SetDIBitsToDevice", gdi32, &hooked_SetDIBitsToDevice, orig_setdibitstodevice_);
     gdi_hooked_ = bitblt && stretch && dib && setdib;
-    if (gdi_hooked_) STAR_LOG("GDI backend hooked");
+    if (gdi_hooked_ && !api_detected_) { api_detected_ = true; STAR_LOG("GDI hooked"); }
 
 
 }

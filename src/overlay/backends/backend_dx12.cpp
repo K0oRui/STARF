@@ -22,14 +22,14 @@ void StarOverlay::hook_dx12_ecl()
     typedef HRESULT(WINAPI* PFN_D3D12CreateDevice)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
     HMODULE hD3D12 = GetModuleHandleA("d3d12.dll");
     if (!hD3D12) hD3D12 = LoadLibraryA("d3d12.dll");
-    if (!hD3D12) { STAR_LOG("DX12 ECL: d3d12.dll not found"); return; }
+    if (!hD3D12) return;
 
     auto pfnCreate = (PFN_D3D12CreateDevice)GetProcAddress(hD3D12, "D3D12CreateDevice");
-    if (!pfnCreate) { STAR_LOG("DX12 ECL: D3D12CreateDevice export not found"); return; }
+    if (!pfnCreate) return;
 
     ID3D12Device* dummy_dev = nullptr;
     HRESULT hr = pfnCreate(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dummy_dev));
-    if (FAILED(hr)) { STAR_LOG("DX12 ECL: D3D12CreateDevice failed hr=0x%08x", (unsigned)hr); return; }
+    if (FAILED(hr)) return;
 
     D3D12_COMMAND_QUEUE_DESC cqdesc = {};
     cqdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -39,13 +39,11 @@ void StarOverlay::hook_dx12_ecl()
         MH_STATUS mh = MH_CreateHook(vt12[10], &hooked_ExecuteCommandLists, (void**)&orig_execute_command_lists_);
         if (mh == MH_OK) {
             MH_EnableHook(vt12[10]);
-            STAR_LOG("DX12 ExecuteCommandLists hooked");
+            if (g_overlay && !g_overlay->api_detected_) { g_overlay->api_detected_ = true; STAR_LOG("DX12 hooked"); }
         } else {
-            STAR_LOG("DX12 ECL: MH_CreateHook failed status=%d", (int)mh);
+            STAR_LOG("DX12 ECL: MH_CreateHook failed");
         }
         dummy_queue->Release();
-    } else {
-        STAR_LOG("DX12 ECL: CreateCommandQueue failed");
     }
     dummy_dev->Release();
 }
@@ -172,7 +170,8 @@ void STDMETHODCALLTYPE StarOverlay::hooked_ExecuteCommandLists(void* queue, UINT
         auto* q = (ID3D12CommandQueue*)queue;
         if (!*captured_queue && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
             *captured_queue = q;
-            STAR_LOG("DX12 command queue captured");
+            if (g_overlay && g_overlay->game_api_ != GraphicsAPI::Vulkan)
+                STAR_LOG("DX12 command queue captured");
         }
     }
     if (g_overlay && g_overlay->orig_execute_command_lists_)

@@ -28,17 +28,17 @@ void StarOverlay::hook_dx9()
     if (orig_dx9_present_ && orig_dx9_reset_) { dx9_hooked_ = true; return; }
     HMODULE d3d9_dll = GetModuleHandleA("d3d9.dll");
     if (!d3d9_dll) d3d9_dll = LoadLibraryA("d3d9.dll");
-    if (!d3d9_dll) { STAR_LOG("DX9 hook: d3d9.dll not available"); return; }
+    if (!d3d9_dll) return;
 
     typedef IDirect3D9* (WINAPI* Direct3DCreate9Fn)(UINT);
     auto pDirect3DCreate9 = (Direct3DCreate9Fn)GetProcAddress(d3d9_dll, "Direct3DCreate9");
-    if (!pDirect3DCreate9) { STAR_LOG("DX9 hook: Direct3DCreate9 export missing"); return; }
+    if (!pDirect3DCreate9) return;
 
     IDirect3D9* d3d = pDirect3DCreate9(D3D_SDK_VERSION);
-    if (!d3d) { STAR_LOG("DX9 hook: Direct3DCreate9 failed"); return; }
+    if (!d3d) return;
 
     HWND dummy = CreateWindowExA(0, "STAR_Dummy", "", WS_OVERLAPPEDWINDOW, 0, 0, 4, 4, nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
-    if (!dummy) { STAR_LOG("DX9 hook: dummy window failed"); d3d->Release(); return; }
+    if (!dummy) { d3d->Release(); return; }
 
     D3DPRESENT_PARAMETERS d3dpp{};
     d3dpp.Windowed = TRUE;
@@ -66,13 +66,10 @@ void StarOverlay::hook_dx9()
     for (auto& a : attempts) {
         hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, (D3DDEVTYPE)a.devtype, dummy, a.behavior, &d3dpp, &device);
         if (SUCCEEDED(hr) && device) {
-            STAR_LOG("DX9 hook: probe device %s ready", a.name);
             break;
         }
-        STAR_LOG("DX9 hook: CreateDevice %s failed hr=0x%08x", a.name, (unsigned)hr);
     }
     if (FAILED(hr) || !device) {
-        STAR_LOG("DX9 hook: all CreateDevice attempts failed, last hr=0x%08x", (unsigned)hr);
         DestroyWindow(dummy);
         d3d->Release();
         return;
@@ -81,17 +78,20 @@ void StarOverlay::hook_dx9()
     void** vt = *(void***)device;
     if (!orig_dx9_present_) {
         MH_STATUS s1 = MH_CreateHook(vt[17], &hooked_DX9Present, (void**)&orig_dx9_present_);
-        if (s1 == MH_OK) MH_EnableHook(vt[17]); else STAR_LOG("DX9 hook: Present MH=%d", (int)s1);
+        if (s1 == MH_OK) MH_EnableHook(vt[17]);
     }
     if (!orig_dx9_reset_) {
         MH_STATUS s2 = MH_CreateHook(vt[16], &hooked_DX9Reset,   (void**)&orig_dx9_reset_);
-        if (s2 == MH_OK) MH_EnableHook(vt[16]); else STAR_LOG("DX9 hook: Reset MH=%d", (int)s2);
+        if (s2 == MH_OK) MH_EnableHook(vt[16]);
     }
 
     device->Release();
     DestroyWindow(dummy);
     d3d->Release();
-    if (orig_dx9_present_) { dx9_hooked_ = true; STAR_LOG("DX9 hooked"); }
+    if (orig_dx9_present_) {
+        dx9_hooked_ = true;
+        if (!api_detected_) { api_detected_ = true; STAR_LOG("DX9 hooked"); }
+    }
 }
 
 void StarOverlay::on_present_dx9(IDirect3DDevice9* device)

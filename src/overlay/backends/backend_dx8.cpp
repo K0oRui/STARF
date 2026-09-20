@@ -31,7 +31,7 @@ struct IDirect3D8* STDMETHODCALLTYPE StarOverlay::hooked_Direct3DCreate8(UINT sd
         void** vt = *(void***)d3d;
         if (!g_overlay->orig_d3d8_create_device_) {
             MH_STATUS s = MH_CreateHook(vt[15], &hooked_D3D8CreateDevice, (void**)&g_overlay->orig_d3d8_create_device_);
-            if (s == MH_OK) MH_EnableHook(vt[15]); else STAR_LOG("DX8 hook: IDirect3D8::CreateDevice MH=%d", (int)s);
+            if (s == MH_OK) MH_EnableHook(vt[15]);
         }
     }
     return d3d;
@@ -44,13 +44,16 @@ HRESULT STDMETHODCALLTYPE StarOverlay::hooked_D3D8CreateDevice(IDirect3D8* d3d, 
         void** vt = *(void***)*out;
         if (!g_overlay->orig_dx8_present_) {
             MH_STATUS s1 = MH_CreateHook(vt[15], &hooked_DX8Present, (void**)&g_overlay->orig_dx8_present_);
-            if (s1 == MH_OK) MH_EnableHook(vt[15]); else STAR_LOG("DX8 hook: Present MH=%d", (int)s1);
+            if (s1 == MH_OK) MH_EnableHook(vt[15]);
         }
         if (!g_overlay->orig_dx8_reset_) {
             MH_STATUS s2 = MH_CreateHook(vt[14], &hooked_DX8Reset, (void**)&g_overlay->orig_dx8_reset_);
-            if (s2 == MH_OK) MH_EnableHook(vt[14]); else STAR_LOG("DX8 hook: Reset MH=%d", (int)s2);
+            if (s2 == MH_OK) MH_EnableHook(vt[14]);
         }
-        if (g_overlay->orig_dx8_present_) { g_overlay->dx8_hooked_ = true; STAR_LOG("DX8 hooked"); }
+        if (g_overlay->orig_dx8_present_) {
+            g_overlay->dx8_hooked_ = true;
+            if (!g_overlay->api_detected_) { g_overlay->api_detected_ = true; STAR_LOG("DX8 hooked"); }
+        }
     }
     return hr;
 }
@@ -60,18 +63,15 @@ void StarOverlay::hook_dx8()
     if (orig_direct3dcreate8_) { dx8_hooked_ = true; return; }
     HMODULE d3d8_dll = GetModuleHandleA("d3d8.dll");
     if (!d3d8_dll) d3d8_dll = LoadLibraryA("d3d8.dll");
-    if (!d3d8_dll) { STAR_LOG("DX8 hook: d3d8.dll not available"); return; }
+    if (!d3d8_dll) return;
 
     auto pDirect3DCreate8 = (Direct3DCreate8Fn)GetProcAddress(d3d8_dll, "Direct3DCreate8");
-    if (!pDirect3DCreate8) { STAR_LOG("DX8 hook: Direct3DCreate8 export missing"); return; }
+    if (!pDirect3DCreate8) return;
 
     MH_STATUS s = MH_CreateHook(pDirect3DCreate8, &hooked_Direct3DCreate8, (void**)&orig_direct3dcreate8_);
     if (s == MH_OK) {
         MH_EnableHook(pDirect3DCreate8);
         dx8_hooked_ = true;
-        STAR_LOG("DX8 hook: Direct3DCreate8 hooked");
-    } else {
-        STAR_LOG("DX8 hook: Direct3DCreate8 MH=%d", (int)s);
     }
 }
 

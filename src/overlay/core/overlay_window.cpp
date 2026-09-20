@@ -179,23 +179,6 @@ LRESULT CALLBACK StarOverlay::star_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPAR
 {
     if (!g_overlay) goto passthrough;
 
-    // Diagnostics: first few input messages prove the hook is alive and show
-    // whether the panel was open when the user typed/clicked.
-    if (msg == WM_KEYDOWN || msg == WM_CHAR || msg == WM_LBUTTONDOWN || msg == WM_MOUSEMOVE) {
-        static int logged_inputs = 0;
-        static DWORD first_tick = 0;
-        if (logged_inputs < 8) {
-            if (first_tick == 0) first_tick = GetTickCount();
-            // Log mouse-move only once (it floods), keys/clicks a few times.
-            if (msg != WM_MOUSEMOVE || logged_inputs == 0) {
-                logged_inputs++;
-                STAR_LOG("WndProc msg=0x%04x wp=0x%llx open=%d hwnd=%p t+%lums",
-                    msg, (unsigned long long)wp, (int)g_overlay->open_, hwnd,
-                    (unsigned long)(GetTickCount() - first_tick));
-            }
-        }
-    }
-
     if (msg == WM_KEYDOWN && wp == VK_TAB && (g_overlay->real_GetKeyState(VK_SHIFT) & 0x8000)) {
         // Shared edge with poll_hotkey(): skip if polling already claimed it.
         if (!g_overlay->hotkey_prev_down_) {

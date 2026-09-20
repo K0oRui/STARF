@@ -59,15 +59,12 @@ void StarOverlay::hook_dx7()
             status = MH_EnableHook(end_scene);
             if (status == MH_OK) {
                 dx7_hooked_ = true;
-                STAR_LOG("DX7 EndScene hooked");
+                if (!api_detected_) { api_detected_ = true; STAR_LOG("DX7 hooked"); }
             } else {
                 MH_RemoveHook(end_scene);
                 orig_dx7_end_scene_ = nullptr;
             }
         }
-        if (!dx7_hooked_) STAR_LOG("DX7 hook failed MH=%d", (int)status);
-    } else {
-        STAR_LOG("DX7 hook: probe device failed hr=0x%08x", (unsigned)hr);
     }
     if (device) device->Release();
     if (target) target->Release();

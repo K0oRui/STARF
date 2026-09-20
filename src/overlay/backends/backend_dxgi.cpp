@@ -6,7 +6,6 @@
 #include <MinHook.h>
 #include <d3d10.h>
 #include <d3d11.h>
-#include <set>
 
 void StarOverlay::hook_dxgi()
 {
@@ -18,7 +17,7 @@ void StarOverlay::hook_dxgi()
     RegisterClassExA(&wc);
     HWND dummy = CreateWindowExA(0,"STAR_Dummy","",WS_OVERLAPPEDWINDOW,0,0,4,4,
                                  nullptr,nullptr,wc.hInstance,nullptr);
-    if (!dummy) { STAR_LOG("DXGI hook: dummy window failed"); return; }
+    if (!dummy) { STAR_LOG("DXGI: dummy window failed"); return; }
 
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount = 1; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -31,16 +30,16 @@ void StarOverlay::hook_dxgi()
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,
         nullptr,0,D3D11_SDK_VERSION,&sd,&dsc,&ddev,&fl,nullptr);
     if (FAILED(hr)||!dsc) {
-        STAR_LOG("DXGI hook: D3D11CreateDeviceAndSwapChain failed hr=0x%08x", (unsigned)hr);
+        STAR_LOG("DXGI: D3D11CreateDeviceAndSwapChain failed");
         DestroyWindow(dummy);
         return;
     }
 
     void** vt = *(void***)dsc;
     MH_STATUS s1 = orig_present_ ? MH_OK : MH_CreateHook(vt[8],  &hooked_Present,       (void**)&orig_present_);
-    if (s1 == MH_OK) MH_EnableHook(vt[8]); else STAR_LOG("DXGI hook: Present MH=%d", (int)s1);
+    if (s1 != MH_OK && !orig_present_) STAR_LOG("DXGI: Present hook failed");
     MH_STATUS s2 = orig_resize_ ? MH_OK : MH_CreateHook(vt[13], &hooked_ResizeBuffers, (void**)&orig_resize_);
-    if (s2 == MH_OK) MH_EnableHook(vt[13]); else STAR_LOG("DXGI hook: ResizeBuffers MH=%d", (int)s2);
+    if (s2 != MH_OK && !orig_resize_) STAR_LOG("DXGI: ResizeBuffers hook failed");
 
     IDXGISwapChain1* dsc1 = nullptr;
     if (SUCCEEDED(dsc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&dsc1))) {
@@ -49,16 +48,16 @@ void StarOverlay::hook_dxgi()
             MH_STATUS s3 = MH_CreateHook(vt1[22], &hooked_Present1, (void**)&orig_present1_);
             if (s3 == MH_OK) {
                 MH_EnableHook(vt1[22]);
-                STAR_LOG("DXGI Present1 hooked");
-            } else {
-                STAR_LOG("DXGI hook: Present1 MH=%d", (int)s3);
             }
         }
         dsc1->Release();
     }
 
     dsc->Release(); ddev->Release(); DestroyWindow(dummy);
-    if (orig_present_) { dxgi_hooked_ = true; STAR_LOG("DXGI hooked"); }
+    if (orig_present_) {
+        dxgi_hooked_ = true;
+        if (!api_detected_) { api_detected_ = true; STAR_LOG("DXGI hooked"); }
+    }
 
 #ifdef _WIN64
     hook_dx12_ecl();
@@ -136,22 +135,6 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
         default:                STAR_LOG("Game graphics API: DirectX 12"); break;
         }
     }
-    // Ground-truth probe: the game may present multiple swapchains (D3D10
-    // visible window + D3D11 splash/helper). Log EVERY chain once so we can
-    // tell which API the visible (foreground) window truly presents.
-    {
-        static std::mutex probe_mutex;
-        std::lock_guard<std::mutex> probe_lock(probe_mutex);
-        static std::set<IDXGISwapChain*> probed{};
-        if (probed.insert(chain).second) {
-            DXGI_SWAP_CHAIN_DESC sd{};
-            bool have_desc = SUCCEEDED(chain->GetDesc(&sd));
-            STAR_LOG("chain probe: %p api=%d hwnd=%p fg=%d%s", (void*)chain,
-                     (int)this_api, (void*)(have_desc ? sd.OutputWindow : nullptr),
-                     have_desc && GetForegroundWindow() == sd.OutputWindow ? 1 : 0,
-                     have_desc ? "" : " (GetDesc failed)");
-        }
-    }
     // External mode only sniffs (for the label + input); all drawing lives
     // in the external window. Hook rendering stays off entirely.
     if (mode_ == OverlayMode::External) return;
@@ -190,8 +173,6 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
     if (!imgui_initialized_) {
         std::unique_lock<std::mutex> init_lock(render_mutex_, std::try_to_lock);
         if (!init_lock.owns_lock() || imgui_initialized_) return;
-        static bool logged_attempt = false;
-        if (!logged_attempt) { logged_attempt = true; STAR_LOG("on_present: attempting imgui init"); }
         if (this_api == GraphicsAPI::DX11) {
             init_imgui(chain);
         } else if (this_api == GraphicsAPI::DX10) {
@@ -200,12 +181,9 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
                 init_imgui_dx10(chain, d3d10_device);
                 d3d10_device->Release();
             } else {
-                static bool logged_dx10_fail = false;
-                if (!logged_dx10_fail) { logged_dx10_fail = true; STAR_LOG("on_present: DX10 device query failed"); }
+                // DX10 device not found on this swapchain.
             }
         } else {
-            static bool logged_dx11_fail = false;
-            if (!logged_dx11_fail) { logged_dx11_fail = true; STAR_LOG("on_present: DX11 device not found, using DX12 path"); }
 #ifdef _WIN64
             try_init_dx12(chain);
 #endif

@@ -23,9 +23,7 @@ void StarOverlay::hook_opengl()
         if (s == MH_OK) {
             MH_EnableHook(pSwapBuffers);
             opengl_hooked_ = true;
-            STAR_LOG("OpenGL hooked");
-        } else {
-            STAR_LOG("OpenGL hook: MH=%d", (int)s);
+            if (!api_detected_) { api_detected_ = true; STAR_LOG("OpenGL hooked"); }
         }
     }
 }

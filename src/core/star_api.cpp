@@ -106,12 +106,12 @@ void STAR_WriteLog(const char* fmt, ...)
     std::lock_guard<std::mutex> lock(log_mutex);
     static std::ofstream stream;
     if (!stream.is_open()) {
-        stream.open(utf8_to_wstring(get_dll_dir() + "\\STAR\\star.log"), std::ios::app);
+        stream.open(utf8_to_wstring(get_dll_dir() + "\\STAR\\star.log"), std::ios::trunc);
         if (!stream.is_open()) {
             wchar_t temp[MAX_PATH];
             if (GetTempPathW(MAX_PATH, temp)) {
                 stream.clear();
-                stream.open(std::wstring(temp) + L"star.log", std::ios::app);
+                stream.open(std::wstring(temp) + L"star.log", std::ios::trunc);
             }
         }
     }

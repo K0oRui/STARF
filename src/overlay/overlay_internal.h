@@ -309,6 +309,7 @@ private:
     bool  opengl_hooked_     = false;
     bool  vulkan_hooked_     = false;
     bool  gdi_hooked_        = false;
+    bool  api_detected_      = false;
     bool  hotkey_prev_down_  = false;
     bool  f12_prev_down_     = false;
     ScreenshotService screenshots_;
