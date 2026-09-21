@@ -580,7 +580,7 @@ void StarOverlay::panel_notes(ImFont* fsmall)
         ImGui::PopStyleColor();
         ImGui::PopFont();
 
-        static char buf[8192] = {};
+        static char buf[NotesStore::kMaxBytes + 1] = {};
         static bool buf_init = false;
         if (!buf_init) {
             buf_init = true;

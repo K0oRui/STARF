@@ -12,7 +12,7 @@ void NotesStore::load()
     std::ifstream in(utf8_to_wstring(path), std::ios::binary);
     if (!in.is_open()) return;
     std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (data.size() > 65536) data.resize(65536);
+    if (data.size() > kMaxBytes) data.resize(kMaxBytes);
     // Strip UTF-8 BOM if present.
     if (data.size() >= 3 && (unsigned char)data[0] == 0xEF &&
         (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)

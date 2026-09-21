@@ -6,6 +6,7 @@
 // STAR/notes.txt next to the game copy; edits autosave after a short idle.
 class NotesStore {
 public:
+    static constexpr size_t kMaxBytes = 65536; // ponytail: hard cap on note size; raise if anyone needs more
     void load();
     void save();
 
