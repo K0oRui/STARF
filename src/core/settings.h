@@ -39,7 +39,6 @@ public:
     bool overlay_show_playtime = false;  // session playtime HUD (top-left)
     bool overlay_play_sound = true;      // achievement unlock sound
     std::string overlay_notify_pos = "bottom_right"; // top_left|top_right|bottom_left|bottom_right
-    bool overlay_dx12_render = true;     // DX12 overlay drawing (off = API-only, escape hatch)
     std::string overlay_mode = "auto";   // auto | hook | external
     int overlay_fallback_count = 0;      // auto-fallback: sessions left to skip before retrying hooks
     int overlay_fallback_level = 0;      // auto-fallback: backoff level (0-6, skip window = 2^level - 1)

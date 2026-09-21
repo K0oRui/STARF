@@ -91,7 +91,6 @@ show_fps = false
 show_playtime = false
 play_sound = true
 notify_pos = bottom_right
-dx12_render = true
 font =
 ```
 
@@ -107,7 +106,6 @@ font =
 | `show_playtime` | `false` | session clock next to FPS |
 | `play_sound` | `true` | achievement unlock jingle |
 | `notify_pos` | `bottom_right` | `top_left` `top_right` `bottom_left` `bottom_right` |
-| `dx12_render` | `true` | DX12 in-backbuffer drawing; auto mode disables it on hostile titles and restores it when hooks are retried |
 | `font` | *(empty)* | custom TTF in `STAR/Fonts`, needs restart |
 
 **Auto-fallback backoff.** When `mode = auto` and a title is hostile (crashes, device loss, fence timeouts), STAR switches to the external window and writes two keys into `overlay.star`:

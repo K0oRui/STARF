@@ -264,10 +264,10 @@ void StarOverlay::start_external_thread()
     else STAR_LOG("External overlay started");
 }
 
-void StarOverlay::switch_to_external(const char* reason, bool dx12_hostile)
+void StarOverlay::switch_to_external(const char* reason)
 {
     // Hook rendering proved hostile (GPU fault / endless fence timeouts).
-    // Remember "external" itself (not just render-off) so the next launch
+    // Remember "external" itself so the next launch
     // goes straight to the working UI. API emulation + input hooks stay.
     // The fallback is not permanent: an exponential backoff (1,3,7,15,31,63
     // skipped sessions) retries hook mode on later launches, so a transient
@@ -284,11 +284,6 @@ void StarOverlay::switch_to_external(const char* reason, bool dx12_hostile)
     save_overlay_key("mode", "external");
     save_overlay_key("fallback_count", std::to_string(fallback_count_));
     save_overlay_key("fallback_level", std::to_string(fallback_level_));
-    if (dx12_hostile) {
-        // The title faults on DX12 in-backbuffer drawing: keep drawing off
-        // so the retry (and any manual hook mode) stays safe.
-        save_overlay_key("dx12_render", "false");
-    }
     STAR_LOG("Switching to external overlay (%s) - backoff level %d (%d sessions)",
         reason, fallback_level_, fallback_count_);
     start_external_thread();

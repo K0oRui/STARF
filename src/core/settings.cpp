@@ -82,9 +82,6 @@ static void bootstrap_star_folder(const std::string& dir)
         "play_sound = true\n"
         "# notify_pos: top_left | top_right | bottom_left | bottom_right (tl | tr | bl | br work too)\n"
         "notify_pos = bottom_right\n"
-        "# dx12_render: true | false - DX12 in-backbuffer drawing. Leave true; auto mode disables it\n"
-        "#       on hostile titles and restores it when the fallback backoff retries hooks.\n"
-        "dx12_render = true\n"
         "# font: custom TTF for the overlay. Put the file in STAR/Fonts and name it here (e.g. poppins.ttf).\n"
         "# Absolute paths work too. Empty = system font. Needs game restart.\n"
         "font = \n");
@@ -249,7 +246,6 @@ void Settings::load(const std::string& dir)
             overlay_show_fps = ini.get_bool("", "show_fps", false);
             overlay_show_playtime = ini.get_bool("", "show_playtime", false);
             overlay_play_sound = ini.get_bool("", "play_sound", true);
-            overlay_dx12_render = ini.get_bool("", "dx12_render", true);
             overlay_font = ini.get("", "font", "");
             overlay_mode = ini.get("", "mode", "auto");
             std::transform(overlay_mode.begin(), overlay_mode.end(), overlay_mode.begin(),

@@ -122,12 +122,6 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
     if (!lock.owns_lock() || !enabled_ || mode_ == OverlayMode::External || chain != dx12_chain_) return;
     if (!screenshots_.consume()) return;
     if (!enabled_) return;
-    // Render is off (hostile titles): read the composed desktop instead of
-    // touching the game's buffers at all.
-    if (!Settings::get().overlay_dx12_render) {
-        capture_desktop_duplication();
-        return;
-    }
     if (!imgui_initialized_ || active_api_ != GraphicsAPI::DX12) return;
     auto* dev = (ID3D12Device*)dx12_device_;
     auto* queue = (ID3D12CommandQueue*)dx12_command_queue_;
@@ -421,7 +415,7 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
     if (!lock.owns_lock()) return;
     star_dx12::reap_submissions();
     if (!enabled_ || mode_ == OverlayMode::External || !imgui_initialized_ || chain != dx12_chain_) return;
-    if (!Settings::get().overlay_dx12_render || active_api_ != GraphicsAPI::DX12) return;
+    if (active_api_ != GraphicsAPI::DX12) return;
 
     IDXGISwapChain3* chain3 = nullptr;
     UINT backbuffer_index = 0;
@@ -477,10 +471,6 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
     build_frame_ui();
     if (ImGui::GetDrawData()->DisplaySize.x <= 0 || ImGui::GetDrawData()->DisplaySize.y <= 0) return;
 
-    // NOTE: on engines with unexpected backbuffer state (e.g. ACEVO), ANY
-    // transition of their buffer faults the GPU, so there is a dx12_render
-    // escape hatch in overlay.star. When enabled we assume stock flip-model
-    // PRESENT state here, like the stock ImGui DX12 example does.
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;

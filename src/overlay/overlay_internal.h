@@ -320,7 +320,7 @@ private:
     void hook_window_for(HWND h);
     void toggle_overlay();
     void start_external_thread();
-    void switch_to_external(const char* reason, bool dx12_hostile = false);
+    void switch_to_external(const char* reason);
     void poll_hotkey();
     void poll_keyboard();
     void ensure_hooks();
