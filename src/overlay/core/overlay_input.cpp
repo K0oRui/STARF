@@ -62,7 +62,7 @@ SHORT StarOverlay::real_GetKeyState(int vk)
     return orig_get_key_ ? orig_get_key_(vk) : ::GetKeyState(vk);
 }
 
-BOOL StarOverlay::caller_in_self_module()
+BOOL StarOverlay::caller_in_self_module(void* caller)
 {
     static HMODULE self_base = nullptr;
     static bool resolved = false;
@@ -72,7 +72,6 @@ BOOL StarOverlay::caller_in_self_module()
         if (VirtualQuery((void*)&hooked_GetCursorPos, &mbi, sizeof(mbi)))
             self_base = (HMODULE)mbi.AllocationBase;
     }
-    void* caller = _ReturnAddress();
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(caller, &mbi, sizeof(mbi))) return false;
     return self_base && mbi.AllocationBase == self_base;
@@ -110,7 +109,7 @@ BOOL WINAPI StarOverlay::hooked_GetCursorPos(LPPOINT pt)
                  : ::GetCursorPos(pt);
     }
     // ImGui's own backend polls through here too; give our own code the truth.
-    if (caller_in_self_module()) return o->orig_get_cursor_pos_(pt);
+    if (caller_in_self_module(_ReturnAddress())) return o->orig_get_cursor_pos_(pt);
     if (o->open_) {
         if (pt) *pt = o->frozen_cursor_;
         return TRUE;
@@ -121,7 +120,7 @@ BOOL WINAPI StarOverlay::hooked_GetCursorPos(LPPOINT pt)
 BOOL WINAPI StarOverlay::hooked_SetCursorPos(int x, int y)
 {
     auto* o = g_overlay;
-    if (o && o->open_ && !caller_in_self_module()) {
+    if (o && o->open_ && !caller_in_self_module(_ReturnAddress())) {
         // Game re-locking the cursor (Unity Locked mode). Swallow it; the
         // real cursor keeps following the user's mouse for the panel.
         STAR_UNREFERENCED(x); STAR_UNREFERENCED(y);
@@ -156,7 +155,7 @@ static bool is_injected_mouse_move(const MOUSEINPUT& mi)
 UINT WINAPI StarOverlay::hooked_SendInput(UINT nInputs, LPINPUT pInputs, int cbSize)
 {
     auto* o = g_overlay;
-    if (o && o->open_ && pInputs && cbSize == sizeof(INPUT) && !caller_in_self_module()) {
+    if (o && o->open_ && pInputs && cbSize == sizeof(INPUT) && !caller_in_self_module(_ReturnAddress())) {
         // Drop motion everywhere (pure packets vanish, mixed packets keep
         // their buttons). Physical mouse never travels this path.
         std::vector<INPUT> fwd;
@@ -184,7 +183,7 @@ UINT WINAPI StarOverlay::hooked_SendInput(UINT nInputs, LPINPUT pInputs, int cbS
 void WINAPI StarOverlay::hooked_mouse_event(DWORD dwFlags, DWORD dx, DWORD dy, DWORD dwData, ULONG_PTR dwExtraInfo)
 {
     auto* o = g_overlay;
-    if (o && o->open_ && !caller_in_self_module()) {
+    if (o && o->open_ && !caller_in_self_module(_ReturnAddress())) {
         MOUSEINPUT mi{};
         mi.dwFlags = dwFlags;
         mi.dx = (LONG)dx;

@@ -13,6 +13,7 @@
 #include "overlay/ui/overlay_style.h"
 #include "overlay/core/overlay_util.h"
 #include "overlay/core/pixel_copy.h"
+#include "overlay/core/backend_selection.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -24,6 +25,7 @@
 #include "overlay/backends/gdi_resources.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+struct IUnityInterfaces;
 
 class StarOverlay final : public Overlay {
 public:
@@ -32,7 +34,8 @@ public:
     void init() override;
     void shutdown() override;
 
-    void hook_vulkan_early() { hook_vulkan(); }
+    void hook_graphics_early() { hook_vulkan(); hook_dxgi(); }
+    void set_unity_interfaces(IUnityInterfaces* interfaces) { unity_interfaces_ = interfaces; }
 
     void push_achievement(const std::string& name, const std::string& desc,
                            const std::vector<uint8_t>& icon_rgba, int iw, int ih,
@@ -53,7 +56,7 @@ public:
     void open_panel() override;
 
     enum class OverlayMode { Hook, External };
-    OverlayMode mode_ = OverlayMode::Hook;
+    std::atomic<OverlayMode> mode_{OverlayMode::Hook};
     // Auto-fallback backoff (see switch_to_external): fallback_count_ is the
     // number of sessions to skip before retrying hook mode; fallback_level_
     // grows the skip window on repeated failures (1,3,7,15,31,63). Persisted
@@ -112,11 +115,21 @@ public:
     static LRESULT CALLBACK ext_wnd_proc(HWND, UINT, WPARAM, LPARAM);
 
 private:
+    std::atomic<IUnityInterfaces*> unity_interfaces_{nullptr};
+    static void* WINAPI hooked_vkGetInstanceProcAddr(void* instance, const char* name);
+    static void* WINAPI hooked_vkGetDeviceProcAddr(void* device, const char* name);
+    static void* vulkan_hook_for(const char* name, void* address);
     StarOverlay() = default;
 
-    enum class GraphicsAPI { None, DX7, DX8, DX9, DX10, DX11, DX12, OpenGL, Vulkan, GDI };
     GraphicsAPI active_api_ = GraphicsAPI::None;
-    GraphicsAPI game_api_ = GraphicsAPI::None; // what the GAME renders with
+    BackendSelection game_api_; // Survives renderer loss, resize, and fallback.
+    HWND game_window_ = nullptr;
+    IDXGISwapChain* dxgi_chain_ = nullptr;
+    HGLRC gl_context_ = nullptr;
+    HDC gl_dc_ = nullptr;
+    // Call with render_mutex_ held, before input, capture, or renderer work.
+    bool accept_backend(GraphicsAPI api, HWND window);
+    void shutdown_renderer();
 
     void hook_dxgi();
     void on_present(IDXGISwapChain* chain, UINT sync_interval, UINT flags);
@@ -136,8 +149,11 @@ private:
     void init_imgui_dx12(IDXGISwapChain* chain, void* device, void* command_queue);
     void render_frame_dx12(IDXGISwapChain* chain);
     void cleanup_dx12();
-    void wait_dx12_idle();
-    void hook_dx12_ecl();
+    bool wait_dx12_idle();
+    void retire_dx12_renderer();
+    void hook_dx12_factory(IDXGIFactory* factory);
+    void update_dx12_queue(IDXGISwapChain* chain, IUnknown* const* queues);
+    uint64_t dx12_missing_queue_tick_ = 0;
     ImTextureID upload_icon_dx12(const std::vector<uint8_t>& rgba, int w, int h);
 #endif
 
@@ -149,8 +165,8 @@ private:
     static HRESULT STDMETHODCALLTYPE hooked_DX9Present(struct IDirect3DDevice9*, const RECT*, const RECT*, HWND, const struct RGNDATA*);
     static HRESULT STDMETHODCALLTYPE hooked_DX9Reset(struct IDirect3DDevice9*, void*);
     void hook_dx9();
-    void on_present_dx9(struct IDirect3DDevice9* device);
-    void on_reset_dx9();
+    void on_present_dx9(struct IDirect3DDevice9* device, HWND window);
+    void on_reset_dx9(struct IDirect3DDevice9* device);
     ImTextureID upload_icon_dx9(const std::vector<uint8_t>& rgba, int w, int h);
     ImTextureID upload_icon_dx10(const std::vector<uint8_t>& rgba, int w, int h);
     ImTextureID upload_icon_opengl(const std::vector<uint8_t>& rgba, int w, int h);
@@ -179,29 +195,33 @@ private:
     static HRESULT STDMETHODCALLTYPE hooked_DX8Present(struct IDirect3DDevice8*, const RECT*, const RECT*, HWND, const struct RGNDATA*);
     static HRESULT STDMETHODCALLTYPE hooked_DX8Reset(struct IDirect3DDevice8*, void*);
     void hook_dx8();
-    void on_present_dx8(struct IDirect3DDevice8* device);
-    void on_reset_dx8();
+    void on_present_dx8(struct IDirect3DDevice8* device, HWND window);
+    void on_reset_dx8(struct IDirect3DDevice8* device);
     ImTextureID upload_icon_dx8(const std::vector<uint8_t>& rgba, int w, int h);
     void release_icons_dx8();
     void maybe_capture_dx8(struct IDirect3DDevice8* device);
 
     using wglSwapBuffersFn = BOOL(WINAPI*)(HDC);
     wglSwapBuffersFn orig_wglSwapBuffers_ = nullptr;
+    using wglDeleteContextFn = BOOL(WINAPI*)(HGLRC);
+    wglDeleteContextFn orig_wglDeleteContext_ = nullptr;
     static BOOL WINAPI hooked_wglSwapBuffers(HDC);
+    static BOOL WINAPI hooked_wglDeleteContext(HGLRC);
     void hook_opengl();
+    void shutdown_opengl();
     void on_present_opengl(HDC hdc);
 
     void* vk_instance_ = nullptr;
     void* vk_physical_device_ = nullptr;
     void* vk_device_ = nullptr;
-    void* vk_swapchain_ = nullptr;
+    uint64_t vk_swapchain_ = 0;
     void* vk_queue_ = nullptr;
+    uint64_t vk_surface_ = 0;
     void* vk_data_ = nullptr;
     uint32_t vk_width_ = 0, vk_height_ = 0, vk_image_usage_ = 0;
     uint32_t vk_queue_family_ = UINT32_MAX;
     int vk_swapchain_format_ = 0;
     uint32_t vk_min_image_count_ = 2;
-    bool vk_swapchain_recreated_ = false;
     DWORD vk_first_missing_tick_ = 0;
     void* orig_vkCreateInstance_ = nullptr;
     void* orig_vkCreateDevice_ = nullptr;
@@ -215,10 +235,12 @@ private:
     static int WINAPI hooked_vkCreateDevice(void*, const void*, const void*, void**);
     static int WINAPI hooked_vkCreateSwapchainKHR(void*, const void*, const void*, uint64_t*);
     static int WINAPI hooked_vkQueuePresentKHR(void*, const void*);
+    static int WINAPI hooked_vkEnumeratePhysicalDevices(void*, uint32_t*, void**);
+    static int WINAPI hooked_vkCreateWin32SurfaceKHR(void*, const void*, const void*, uint64_t*);
+    static void WINAPI hooked_vkDestroySurfaceKHR(void*, uint64_t, const void*);
+    static void WINAPI hooked_vkGetDeviceQueue(void*, uint32_t, uint32_t, void**);
+    static void WINAPI hooked_vkGetDeviceQueue2(void*, const void*, void**);
     void hook_vulkan();
-    void recover_queue_family();
-    void recover_physical_device();
-    void recover_vulkan_metadata();
     void on_present_vulkan(void* queue, const void* pPresentInfo);
     void init_imgui_vulkan(void* queue, const void* pPresentInfo);
     void render_frame_vulkan(void* queue, const void* pPresentInfo);
@@ -253,6 +275,10 @@ private:
     DWORD gdi_last_invalidate_ = 0;
     bool gdi_wants_draw() const;
     bool prepare_gdi_present(HWND window);
+    static LRESULT CALLBACK gdi_message_hook(int code, WPARAM removed, LPARAM message);
+    HHOOK gdi_message_hook_ = nullptr;
+    DWORD gdi_message_thread_ = 0;
+    std::atomic<int> gdi_wheel_x_{0}, gdi_wheel_y_{0};
 
     void render_notifications(float dt);
     void render_panel();
@@ -299,7 +325,7 @@ private:
     void poll_keyboard();
     void ensure_hooks();
 
-    bool  enabled_           = true;
+    std::atomic<bool> enabled_{false};
     bool  imgui_initialized_ = false;
     bool  hooks_installed_   = false;
     bool  dxgi_hooked_       = false;
@@ -309,8 +335,8 @@ private:
     bool  opengl_hooked_     = false;
     bool  vulkan_hooked_     = false;
     bool  gdi_hooked_        = false;
-    bool  api_detected_      = false;
-    bool  hotkey_prev_down_  = false;
+    std::atomic<bool> any_graphics_hook_installed_{false};
+    std::atomic<bool> hotkey_prev_down_{false};
     bool  f12_prev_down_     = false;
     ScreenshotService screenshots_;
     uint8_t prev_keys_[256]  = {};
@@ -334,6 +360,9 @@ private:
     void note_present();
     static std::string format_playtime(uint64_t secs);
     std::atomic<bool> retry_stop_{ false };
+    std::mutex retry_mutex_;
+    std::condition_variable retry_cv_;
+    std::thread retry_thread_;
     bool  open_              = false;
     float panel_anim_        = 0.0f;
     float panel_target_      = 0.0f;
@@ -381,9 +410,6 @@ private:
     void* dx12_fence_event_ = nullptr;
     int dx12_timeout_streak_ = 0;
 
-    using ExecuteCommandListsFn = void(STDMETHODCALLTYPE*)(void*, UINT, void* const*);
-    ExecuteCommandListsFn orig_execute_command_lists_ = nullptr;
-    static void STDMETHODCALLTYPE hooked_ExecuteCommandLists(void* queue, UINT count, void* const* lists);
 #endif
 
     std::mutex                        render_mutex_;
@@ -426,6 +452,9 @@ private:
     PresentFn       orig_present_  = nullptr;
     Present1Fn      orig_present1_ = nullptr;
     ResizeBuffersFn orig_resize_   = nullptr;
+    using ResizeBuffers1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT,
+        DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
+    ResizeBuffers1Fn orig_resize1_ = nullptr;
 
     using ShowCursorFn = int(WINAPI*)(BOOL);
     using ClipCursorFn = BOOL(WINAPI*)(const RECT*);
@@ -454,7 +483,7 @@ private:
     SHORT real_GetAsyncKeyState(int vk);
     BOOL  real_GetKeyboardState(PBYTE keys);
     SHORT real_GetKeyState(int vk);
-    static BOOL caller_in_self_module();
+    static BOOL caller_in_self_module(void* caller);
     static SHORT WINAPI hooked_GetAsyncKeyState(int vkey);
     static BOOL  WINAPI hooked_GetKeyboardState(PBYTE keys);
     static SHORT WINAPI hooked_GetKeyState(int vkey);
@@ -466,6 +495,8 @@ private:
     static HRESULT STDMETHODCALLTYPE hooked_Present(IDXGISwapChain*, UINT, UINT);
     static HRESULT STDMETHODCALLTYPE hooked_Present1(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
     static HRESULT STDMETHODCALLTYPE hooked_ResizeBuffers(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+    static HRESULT STDMETHODCALLTYPE hooked_ResizeBuffers1(IDXGISwapChain3*, UINT, UINT, UINT,
+        DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
     static LRESULT CALLBACK          star_wnd_proc(HWND, UINT, WPARAM, LPARAM);
 
     static int WINAPI hooked_ShowCursor(BOOL bShow);

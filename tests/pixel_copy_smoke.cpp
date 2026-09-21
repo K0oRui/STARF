@@ -1,5 +1,3 @@
-// From a Visual Studio developer prompt at the repo root:
-// cl /nologo /EHsc /std:c++17 tests/pixel_copy_smoke.cpp /Fe:build/pixel_copy_smoke.exe /Fo:build/pixel_copy_smoke.obj
 #ifdef NDEBUG
 #undef NDEBUG
 #endif

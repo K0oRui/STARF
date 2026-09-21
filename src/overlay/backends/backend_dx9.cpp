@@ -7,18 +7,23 @@
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_DX9Present(IDirect3DDevice9* device, const RECT* src, const RECT* dst, HWND window, const RGNDATA* rgn)
 {
-    if (g_overlay) g_overlay->on_present_dx9(device);
+    if (g_overlay) g_overlay->on_present_dx9(device, window);
     return g_overlay ? g_overlay->orig_dx9_present_(device, src, dst, window, rgn) : S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_DX9Reset(IDirect3DDevice9* device, void* params)
 {
-    if (g_overlay) g_overlay->on_reset_dx9();
+    if (g_overlay) g_overlay->on_reset_dx9(device);
     typedef HRESULT(STDMETHODCALLTYPE* DX9ResetFn)(IDirect3DDevice9*, void*);
     auto orig = (DX9ResetFn)g_overlay->orig_dx9_reset_;
     HRESULT hr = orig(device, params);
-    if (SUCCEEDED(hr) && g_overlay && g_overlay->active_api_ == GraphicsAPI::DX9) {
-        ImGui_ImplDX9_CreateDeviceObjects();
+    if (SUCCEEDED(hr) && g_overlay && g_overlay->game_api_ == GraphicsAPI::DX9 &&
+        g_overlay->mode_ != OverlayMode::External) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        if (g_overlay->enabled_ && g_overlay->mode_ != OverlayMode::External &&
+            g_overlay->imgui_initialized_ && g_overlay->active_api_ == GraphicsAPI::DX9 &&
+            g_overlay->dx9_device_ == device)
+            ImGui_ImplDX9_CreateDeviceObjects();
     }
     return hr;
 }
@@ -90,40 +95,34 @@ void StarOverlay::hook_dx9()
     d3d->Release();
     if (orig_dx9_present_) {
         dx9_hooked_ = true;
-        if (!api_detected_) { api_detected_ = true; STAR_LOG("DX9 hooked"); }
+        if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("DX9 hooked"); }
     }
 }
 
-void StarOverlay::on_present_dx9(IDirect3DDevice9* device)
+void StarOverlay::on_present_dx9(IDirect3DDevice9* device, HWND window)
 {
     if (!enabled_ || !device) return;
-    poll_hotkey();
-    note_present();
-    if (game_api_ == GraphicsAPI::None) {
-        game_api_ = GraphicsAPI::DX9;
-        STAR_LOG("Game graphics API: DirectX 9");
-    }
-    if (mode_ == OverlayMode::External) return;
-
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    if (imgui_initialized_ && active_api_ != GraphicsAPI::DX9) return;
-    if (imgui_initialized_ && dx9_device_ != device) {
-        icons_.release_all([](ImTextureID v) { ((IDirect3DTexture9*)v)->Release(); });
-        ImGui_ImplDX9_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        imgui_initialized_ = false;
-        active_api_ = GraphicsAPI::None;
+    D3DDEVICE_CREATION_PARAMETERS cp{};
+    if (FAILED(device->GetCreationParameters(&cp))) return;
+    if (!window) {
+        Microsoft::WRL::ComPtr<IDirect3DSwapChain9> chain;
+        D3DPRESENT_PARAMETERS pp{};
+        if (SUCCEEDED(device->GetSwapChain(0, &chain)) && SUCCEEDED(chain->GetPresentParameters(&pp)))
+            window = pp.hDeviceWindow;
     }
+    if (!window) window = cp.hFocusWindow;
+    if (!accept_backend(GraphicsAPI::DX9, window)) return;
+    note_present();
+    if (mode_ == OverlayMode::External) return;
+    poll_hotkey();
+    if (imgui_initialized_ && active_api_ != GraphicsAPI::DX9) return;
+    if (imgui_initialized_ && dx9_device_ != device) shutdown_renderer();
     dx9_device_ = device;
 
     if (!imgui_initialized_) {
-        D3DDEVICE_CREATION_PARAMETERS cp{};
-        device->GetCreationParameters(&cp);
-        HWND new_hwnd = cp.hFocusWindow;
-        if (!new_hwnd) new_hwnd = GetActiveWindow();
-        hook_window_for(new_hwnd);
+        hook_window_for(window);
 
         ImGui::CreateContext();
         if (!ImGui_ImplWin32_Init(hwnd_)) { ImGui::DestroyContext(); return; }
@@ -159,11 +158,12 @@ void StarOverlay::on_present_dx9(IDirect3DDevice9* device)
     }
 }
 
-void StarOverlay::on_reset_dx9()
+void StarOverlay::on_reset_dx9(IDirect3DDevice9* device)
 {
-    if (mode_ == OverlayMode::External) return;
+    if (mode_ == OverlayMode::External || game_api_ != GraphicsAPI::DX9) return;
     std::lock_guard<std::mutex> lock(render_mutex_);
-    if (active_api_ == GraphicsAPI::DX9 && imgui_initialized_) {
+    if (enabled_ && mode_ != OverlayMode::External && dx9_device_ == device &&
+        active_api_ == GraphicsAPI::DX9 && imgui_initialized_) {
         ImGui_ImplDX9_InvalidateDeviceObjects();
     }
 }

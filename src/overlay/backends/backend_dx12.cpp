@@ -4,63 +4,110 @@
 #include "imgui_impl_dx12.h"
 #include <MinHook.h>
 #include <d3d12.h>
+#include "../../../third_party/unity/IUnityGraphicsD3D12.h"
 #include "dx12_submission.h"
 
 #ifdef _WIN64
 using Microsoft::WRL::ComPtr;
 namespace {
-std::mutex queue_mutex;
-auto* captured_queue = new Microsoft::WRL::ComPtr<ID3D12CommandQueue>;
-}
-#endif
+// Store the exact presenting queue on its swapchain; DXGI owns its lifetime.
+const GUID queue_tag = {0x91b5d402, 0x3e47, 0x4b7e, {0xa8, 0x93, 0x23, 0xdc, 0x7b, 0xaa, 0x61, 0x04}};
+using CreateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
+using HwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
+using CoreFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+using CompositionFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, IDXGIOutput*, IDXGISwapChain1**);
+CreateFn original_create = nullptr;
+HwndFn original_hwnd = nullptr;
+CoreFn original_core = nullptr;
+CompositionFn original_composition = nullptr;
 
-#ifdef _WIN64
-void StarOverlay::hook_dx12_ecl()
+void remember_queue(IUnknown* device, IDXGISwapChain* chain)
 {
-    if (orig_execute_command_lists_) return;
+    ComPtr<ID3D12CommandQueue> queue;
+    if (device && chain && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&queue))) &&
+        queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
+        chain->SetPrivateDataInterface(queue_tag, queue.Get());
+}
+HRESULT STDMETHODCALLTYPE create_chain(IDXGIFactory* factory, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** chain)
+{
+    HRESULT hr = original_create(factory, device, desc, chain);
+    if (SUCCEEDED(hr) && chain) remember_queue(device, *chain);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_hwnd(IDXGIFactory2* factory, IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen, IDXGIOutput* output, IDXGISwapChain1** chain)
+{
+    HRESULT hr = original_hwnd(factory, device, hwnd, desc, fullscreen, output, chain);
+    if (SUCCEEDED(hr) && chain) remember_queue(device, *chain);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_core(IDXGIFactory2* factory, IUnknown* device, IUnknown* window, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output, IDXGISwapChain1** chain)
+{
+    HRESULT hr = original_core(factory, device, window, desc, output, chain);
+    if (SUCCEEDED(hr) && chain) remember_queue(device, *chain);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE create_composition(IDXGIFactory2* factory, IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc, IDXGIOutput* output, IDXGISwapChain1** chain)
+{
+    HRESULT hr = original_composition(factory, device, desc, output, chain);
+    if (SUCCEEDED(hr) && chain) remember_queue(device, *chain);
+    return hr;
+}
+}
 
-    typedef HRESULT(WINAPI* PFN_D3D12CreateDevice)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
-    HMODULE hD3D12 = GetModuleHandleA("d3d12.dll");
-    if (!hD3D12) hD3D12 = LoadLibraryA("d3d12.dll");
-    if (!hD3D12) return;
-
-    auto pfnCreate = (PFN_D3D12CreateDevice)GetProcAddress(hD3D12, "D3D12CreateDevice");
-    if (!pfnCreate) return;
-
-    ID3D12Device* dummy_dev = nullptr;
-    HRESULT hr = pfnCreate(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dummy_dev));
-    if (FAILED(hr)) return;
-
-    D3D12_COMMAND_QUEUE_DESC cqdesc = {};
-    cqdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    ID3D12CommandQueue* dummy_queue = nullptr;
-    if (SUCCEEDED(dummy_dev->CreateCommandQueue(&cqdesc, IID_PPV_ARGS(&dummy_queue)))) {
-        void** vt12 = *(void***)dummy_queue;
-        MH_STATUS mh = MH_CreateHook(vt12[10], &hooked_ExecuteCommandLists, (void**)&orig_execute_command_lists_);
-        if (mh == MH_OK) {
-            MH_EnableHook(vt12[10]);
-            if (g_overlay && !g_overlay->api_detected_) { g_overlay->api_detected_ = true; STAR_LOG("DX12 hooked"); }
-        } else {
-            STAR_LOG("DX12 ECL: MH_CreateHook failed");
+void StarOverlay::hook_dx12_factory(IDXGIFactory* factory)
+{
+    auto install = [](void* target, void* hook, void** original) {
+        if (*original) return;
+        if (MH_CreateHook(target, hook, original) == MH_OK && MH_EnableHook(target) != MH_OK) {
+            MH_RemoveHook(target);
+            *original = nullptr;
         }
-        dummy_queue->Release();
+    };
+    void** vt = *(void***)factory;
+    install(vt[10], (void*)&create_chain, (void**)&original_create);
+    ComPtr<IDXGIFactory2> factory2;
+    if (SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory2)))) {
+        void** vt2 = *(void***)factory2.Get();
+        install(vt2[15], (void*)&create_hwnd, (void**)&original_hwnd);
+        install(vt2[16], (void*)&create_core, (void**)&original_core);
+        install(vt2[24], (void*)&create_composition, (void**)&original_composition);
     }
-    dummy_dev->Release();
+}
+
+void StarOverlay::update_dx12_queue(IDXGISwapChain* chain, IUnknown* const* queues)
+{
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(chain->GetDesc(&desc)) || !desc.BufferCount) return;
+    chain->SetPrivateDataInterface(queue_tag, nullptr);
+    for (UINT i = 1; i < desc.BufferCount; ++i)
+        if (queues[i] != queues[0]) return; // Multiple presenting queues need per-buffer ownership.
+    remember_queue(queues[0], chain);
 }
 
 void StarOverlay::try_init_dx12(IDXGISwapChain* chain)
 {
-    if (!orig_execute_command_lists_) {
-        hook_dx12_ecl();
+    ComPtr<ID3D12CommandQueue> queue;
+    UINT size = sizeof(ID3D12CommandQueue*);
+    chain->GetPrivateData(queue_tag, &size, queue.GetAddressOf());
+    if (!queue) {
+        if (auto* interfaces = unity_interfaces_.load()) {
+            if (auto* unity = interfaces->Get<IUnityGraphicsD3D12v7>(); unity && unity->GetSwapChain() == chain) {
+                queue = unity->GetCommandQueue();
+                if (queue) remember_queue(queue.Get(), chain);
+            }
+        }
+    }
+    if (!queue) {
+        if (!dx12_missing_queue_tick_) dx12_missing_queue_tick_ = GetTickCount64();
+        if (GetTickCount64() - dx12_missing_queue_tick_ >= 2000 && Settings::get().overlay_mode != "hook") {
+            mode_ = OverlayMode::External;
+            STAR_LOG("DX12: using external overlay; presenting queue was created before hooks");
+            start_external_thread();
+        }
         return;
     }
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        queue = *captured_queue;
-    }
-    if (!queue) return;
-    Microsoft::WRL::ComPtr<ID3D12Device> queue_device, chain_device;
+    dx12_missing_queue_tick_ = 0;
+    ComPtr<ID3D12Device> queue_device, chain_device;
     if (FAILED(queue->GetDevice(IID_PPV_ARGS(&queue_device))) ||
         FAILED(chain->GetDevice(IID_PPV_ARGS(&chain_device))) ||
         queue_device.Get() != chain_device.Get()) return;
@@ -72,7 +119,7 @@ void StarOverlay::try_init_dx12(IDXGISwapChain* chain)
 void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
 {
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
-    if (!lock.owns_lock() || chain != dx12_chain_) return;
+    if (!lock.owns_lock() || !enabled_ || mode_ == OverlayMode::External || chain != dx12_chain_) return;
     if (!screenshots_.consume()) return;
     if (!enabled_) return;
     // Render is off (hostile titles): read the composed desktop instead of
@@ -159,25 +206,6 @@ void StarOverlay::maybe_capture_dx12(IDXGISwapChain* chain)
 }
 #endif
 
-#ifdef _WIN64
-void STDMETHODCALLTYPE StarOverlay::hooked_ExecuteCommandLists(void* queue, UINT count, void* const* lists)
-{
-    // Only the DIRECT (graphics) queue can do our render-target work. Games
-    // routinely execute copy/compute queues first (uploads during loading);
-    // capturing one of those and issuing graphics barriers on it faults.
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        auto* q = (ID3D12CommandQueue*)queue;
-        if (!*captured_queue && q->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-            *captured_queue = q;
-            if (g_overlay && g_overlay->game_api_ != GraphicsAPI::Vulkan)
-                STAR_LOG("DX12 command queue captured");
-        }
-    }
-    if (g_overlay && g_overlay->orig_execute_command_lists_)
-        g_overlay->orig_execute_command_lists_(queue, count, lists);
-}
-#endif
 #ifdef _WIN64
 void StarOverlay::init_imgui_dx12(IDXGISwapChain* chain, void* device, void* command_queue)
 {
@@ -389,10 +417,10 @@ void StarOverlay::release_icon_dx12(ImTextureID texture)
 
 void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
 {
-    star_dx12::reap_submissions();
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    if (!imgui_initialized_ || chain != dx12_chain_) return;
+    star_dx12::reap_submissions();
+    if (!enabled_ || mode_ == OverlayMode::External || !imgui_initialized_ || chain != dx12_chain_) return;
     if (!Settings::get().overlay_dx12_render || active_api_ != GraphicsAPI::DX12) return;
 
     IDXGISwapChain3* chain3 = nullptr;
@@ -518,19 +546,61 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
     }
 }
 
-void StarOverlay::wait_dx12_idle()
+bool StarOverlay::wait_dx12_idle()
 {
     auto* fence = (ID3D12Fence*)dx12_fence_;
     auto* dev = (ID3D12Device*)dx12_device_;
-    if (fence && dev && SUCCEEDED(dev->GetDeviceRemovedReason()) &&
-        fence->GetCompletedValue() < dx12_fence_value_) {
-        fence->SetEventOnCompletion(dx12_fence_value_, nullptr);
-    }
+    if (!fence || !dev || FAILED(dev->GetDeviceRemovedReason()) ||
+        fence->GetCompletedValue() >= dx12_fence_value_) return true;
+    return dx12_fence_event_ &&
+        SUCCEEDED(fence->SetEventOnCompletion(dx12_fence_value_, (HANDLE)dx12_fence_event_)) &&
+        WaitForSingleObject((HANDLE)dx12_fence_event_, 1000) == WAIT_OBJECT_0 &&
+        fence->GetCompletedValue() >= dx12_fence_value_;
+}
+
+void StarOverlay::retire_dx12_renderer()
+{
+    // A timeout does not mean the GPU stopped using the renderer. Retain it
+    // until its fence completes/device is removed while external mode proceeds.
+    auto retired = std::make_unique<star_dx12::Submission>();
+    retired->device = (ID3D12Device*)dx12_device_;
+    retired->fence = (ID3D12Fence*)dx12_fence_;
+    retired->completion_value = dx12_fence_value_;
+    retired->event = (HANDLE)dx12_fence_event_;
+    dx12_fence_event_ = nullptr;
+    auto retain = [&](void*& object) {
+        if (object) {
+            ComPtr<IUnknown> owner;
+            owner.Attach((IUnknown*)object);
+            retired->objects.push_back(std::move(owner));
+            object = nullptr;
+        }
+    };
+    for (auto*& object : dx12_resources_) retain(object);
+    for (auto*& object : dx12_command_allocators_) retain(object);
+    for (auto*& object : dx12_icon_resources_) retain(object);
+    retain(dx12_device_); retain(dx12_command_queue_); retain(dx12_command_list_);
+    retain(dx12_rtv_heap_); retain(dx12_srv_heap_); retain(dx12_fence_);
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    retired->on_complete = [context] {
+        ImGuiContext* current = ImGui::GetCurrentContext();
+        ImGui::SetCurrentContext(context);
+        ImGui_ImplDX12_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext(context);
+        ImGui::SetCurrentContext(current);
+    };
+    ImGui::SetCurrentContext(nullptr);
+    imgui_initialized_ = false;
+    icons_.clear();
+    auto& pending = star_dx12::pending_submissions();
+    std::lock_guard<std::mutex> lock(pending.mutex);
+    pending.items.push_back(std::move(retired));
+    STAR_LOG("DX12 renderer retained until pending GPU work completes");
 }
 
 void StarOverlay::cleanup_dx12()
 {
-    wait_dx12_idle();
     star_dx12::reap_submissions();
     dx12_chain_ = nullptr;
     dx12_frame_index_ = 0;

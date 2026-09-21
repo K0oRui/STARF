@@ -17,9 +17,14 @@ void StarOverlay::init_imgui(IDXGISwapChain* chain)
 
     style_.setup();
 
-    ImGui_ImplWin32_Init(hwnd_);
-    if (!ImGui_ImplDX11_Init(device_, context_)) {
+    bool platform_ready = ImGui_ImplWin32_Init(hwnd_);
+    if (!platform_ready || !ImGui_ImplDX11_Init(device_, context_)) {
         STAR_LOG("init_imgui DX11: ImGui_ImplDX11_Init FAILED");
+        if (platform_ready) ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        context_->Release(); context_ = nullptr;
+        device_->Release(); device_ = nullptr;
+
         return;
     }
     imgui_initialized_ = true;
@@ -37,7 +42,8 @@ void StarOverlay::render_frame(IDXGISwapChain* chain)
 
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    if (!imgui_initialized_ || active_api_ != GraphicsAPI::DX11) return;
+    if (!enabled_ || mode_ == OverlayMode::External || chain != dxgi_chain_ ||
+        !imgui_initialized_ || active_api_ != GraphicsAPI::DX11) return;
 
     if (!rtv_) {
         ID3D11Texture2D* bb = nullptr;

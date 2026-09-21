@@ -1,5 +1,3 @@
-// From a Visual Studio developer prompt at the repo root:
-// cl /nologo /EHsc /std:c++17 tests/gdi_resources_smoke.cpp /Fe:build/gdi_resources_smoke.exe /Fo:build/gdi_resources_smoke.obj user32.lib gdi32.lib
 #ifdef NDEBUG
 #undef NDEBUG
 #endif

@@ -181,7 +181,7 @@ static std::string resolve_sound(const std::string& stem)
 {
     for (const char* ext : { ".mp3", ".wav" }) {
         std::string p = Settings::get().settings_dir + "\\Sounds\\" + stem + ext;
-        DWORD attr = GetFileAttributesA(p.c_str());
+        DWORD attr = GetFileAttributesW(utf8_to_wstring(p).c_str());
         if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY))
             return p;
     }
@@ -272,28 +272,35 @@ static void play_sound_file(const std::string& sound_path)
         }
     }
     std::thread([sound_path, looks_wav]() {
-        const char* order[2] = { looks_wav ? "waveaudio" : "mpegvideo",
-                                 looks_wav ? "mpegvideo" : "waveaudio" };
+        const std::wstring path = utf8_to_wstring(sound_path);
+        const wchar_t* order[2] = { looks_wav ? L"waveaudio" : L"mpegvideo",
+                                    looks_wav ? L"mpegvideo" : L"waveaudio" };
         for (int i = 0; i < 2; i++) {
-            char open_cmd[MAX_PATH + 64];
-            snprintf(open_cmd, sizeof(open_cmd), "open \"%s\" type %s alias star_ach",
-                sound_path.c_str(), order[i]);
-            MCIERROR err = mciSendStringA(open_cmd, nullptr, 0, nullptr);
+            // Each request owns its device; a shared alias lets concurrent
+            // notifications play or close each other's sound.
+            MCI_OPEN_PARMSW open{};
+            open.lpstrElementName = path.c_str();
+            open.lpstrDeviceType = order[i];
+            MCIERROR err = mciSendCommandW(0, MCI_OPEN,
+                MCI_OPEN_ELEMENT | MCI_OPEN_TYPE | MCI_WAIT, (DWORD_PTR)&open);
             if (err != 0) {
                 char ebuf[128] = {};
                 mciGetErrorStringA(err, ebuf, (UINT)sizeof(ebuf));
-                STAR_LOG("Sound: open as %s failed (%lu/%s): %s",
+                STAR_LOG("Sound: open as %ls failed (%lu/%s): %s",
                     order[i], (unsigned long)err, ebuf, sound_path.c_str());
                 continue;
             }
-            err = mciSendStringA("play star_ach wait", nullptr, 0, nullptr);
-            mciSendStringA("close star_ach", nullptr, 0, nullptr);
+            MCI_PLAY_PARMS play{};
+            err = mciSendCommandW(open.wDeviceID, MCI_PLAY, MCI_WAIT, (DWORD_PTR)&play);
+            mciSendCommandW(open.wDeviceID, MCI_CLOSE, MCI_WAIT, 0);
             if (err != 0) {
                 char ebuf[128] = {};
                 mciGetErrorStringA(err, ebuf, (UINT)sizeof(ebuf));
                 STAR_LOG("Sound: play failed (%lu/%s): %s",
                     (unsigned long)err, ebuf, sound_path.c_str());
+                continue;
             }
+            STAR_LOG("Sound: playback completed: %s", sound_path.c_str());
             return;
         }
     }).detach();

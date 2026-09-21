@@ -1,14 +1,13 @@
 #include "overlay/overlay_internal.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx10.h"
-#include "imgui_impl_dx11.h"
-#include "imgui_impl_dx12.h"
 #include <MinHook.h>
 #include <d3d10.h>
 #include <d3d11.h>
+#include <d3d12.h>
 
 void StarOverlay::hook_dxgi()
 {
+    static std::mutex install_mutex;
+    std::lock_guard<std::mutex> install_lock(install_mutex);
     if (orig_present_ && orig_resize_) { dxgi_hooked_ = true; return; }
 
     WNDCLASSEXA wc{};
@@ -37,9 +36,11 @@ void StarOverlay::hook_dxgi()
 
     void** vt = *(void***)dsc;
     MH_STATUS s1 = orig_present_ ? MH_OK : MH_CreateHook(vt[8],  &hooked_Present,       (void**)&orig_present_);
-    if (s1 != MH_OK && !orig_present_) STAR_LOG("DXGI: Present hook failed");
+    if (s1 == MH_OK) MH_EnableHook(vt[8]);
+    else if (!orig_present_) STAR_LOG("DXGI: Present hook failed");
     MH_STATUS s2 = orig_resize_ ? MH_OK : MH_CreateHook(vt[13], &hooked_ResizeBuffers, (void**)&orig_resize_);
-    if (s2 != MH_OK && !orig_resize_) STAR_LOG("DXGI: ResizeBuffers hook failed");
+    if (s2 == MH_OK) MH_EnableHook(vt[13]);
+    else if (!orig_resize_) STAR_LOG("DXGI: ResizeBuffers hook failed");
 
     IDXGISwapChain1* dsc1 = nullptr;
     if (SUCCEEDED(dsc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&dsc1))) {
@@ -53,22 +54,31 @@ void StarOverlay::hook_dxgi()
         dsc1->Release();
     }
 
+#ifdef _WIN64
+    IDXGIFactory* factory = nullptr;
+    if (SUCCEEDED(dsc->GetParent(IID_PPV_ARGS(&factory)))) {
+        hook_dx12_factory(factory);
+        factory->Release();
+    }
+#endif
+    IDXGISwapChain3* dsc3 = nullptr;
+    if (!orig_resize1_ && SUCCEEDED(dsc->QueryInterface(IID_PPV_ARGS(&dsc3)))) {
+        void** vt3 = *(void***)dsc3;
+        if (MH_CreateHook(vt3[39], &hooked_ResizeBuffers1, (void**)&orig_resize1_) == MH_OK)
+            MH_EnableHook(vt3[39]);
+        dsc3->Release();
+    }
     dsc->Release(); ddev->Release(); DestroyWindow(dummy);
     if (orig_present_) {
         dxgi_hooked_ = true;
-        if (!api_detected_) { api_detected_ = true; STAR_LOG("DXGI hooked"); }
+        if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("DXGI hooked"); }
     }
 
-#ifdef _WIN64
-    hook_dx12_ecl();
-#endif
 }
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_Present(IDXGISwapChain* sc, UINT si, UINT fl)
 {
     if (g_overlay && !(fl & DXGI_PRESENT_TEST)) {
-        g_overlay->poll_hotkey();
-        g_overlay->note_present();
         g_overlay->on_present(sc, si, fl);
     }
     return g_overlay && g_overlay->orig_present_ ? g_overlay->orig_present_(sc, si, fl) : S_OK;
@@ -78,8 +88,6 @@ HRESULT STDMETHODCALLTYPE StarOverlay::hooked_Present1(
     IDXGISwapChain1* sc, UINT si, UINT fl, const DXGI_PRESENT_PARAMETERS* pp)
 {
     if (g_overlay && !(fl & DXGI_PRESENT_TEST)) {
-        g_overlay->poll_hotkey();
-        g_overlay->note_present();
         g_overlay->on_present(sc, si, fl);
     }
     return g_overlay && g_overlay->orig_present1_ ? g_overlay->orig_present1_(sc, si, fl, pp) : S_OK;
@@ -92,25 +100,25 @@ HRESULT STDMETHODCALLTYPE StarOverlay::hooked_ResizeBuffers(
     return g_overlay ? g_overlay->orig_resize_(sc, bc, w, h, fmt, fl) : S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE StarOverlay::hooked_ResizeBuffers1(IDXGISwapChain3* chain,
+    UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags,
+    const UINT* masks, IUnknown* const* queues)
+{
+    auto* o = g_overlay;
+    if (!o || !o->orig_resize1_) return E_FAIL;
+    o->on_resize_buffers(chain, count, width, height, format, flags);
+    HRESULT hr = o->orig_resize1_(chain, count, width, height, format, flags, masks, queues);
+#ifdef _WIN64
+    if (SUCCEEDED(hr) && queues) o->update_dx12_queue(chain, queues);
+#endif
+    return hr;
+}
+
 void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
 {
     STAR_UNREFERENCED(si); STAR_UNREFERENCED(fl);
     if (!enabled_) return;
-    // Window recreated (mode switch / multi-window): re-hook so input keeps working.
-    {
-        DXGI_SWAP_CHAIN_DESC sd{};
-        if (SUCCEEDED(chain->GetDesc(&sd))) hook_window_for(sd.OutputWindow);
-    }
-
-    // Game API detection: DXGI present + D3D10 device = DX10, D3D11 device =
-    // DX11, else DX12. Re-detected every present so a title that presents
-    // multiple swapchains (D3D11 splash -> D3D10 game) lands on the visible one.
-    //
-    // Probe DX10 FIRST: on Windows 8+ the D3D10 runtime is layered on D3D11, so
-    // a swapchain created by D3D10CreateDeviceAndSwapChain answers BOTH
-    // GetDevice(ID3D10Device) and GetDevice(ID3D11Device). A swapchain created
-    // by D3D11CreateDeviceAndSwapChain answers only ID3D11Device. Checking DX11
-    // first therefore mislabels every genuine DX10 title as DX11.
+    // Detect from the presenting device, never from loaded DLLs or hook setup.
     GraphicsAPI this_api = GraphicsAPI::None;
     {
         ID3D10Device* probe10 = nullptr;
@@ -123,56 +131,29 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
                 probe->Release();
                 this_api = GraphicsAPI::DX11;
             } else {
-                this_api = GraphicsAPI::DX12;
+#ifdef _WIN64
+                ID3D12Device* probe12 = nullptr;
+                if (SUCCEEDED(chain->GetDevice(__uuidof(ID3D12Device), (void**)&probe12))) {
+                    probe12->Release();
+                    this_api = GraphicsAPI::DX12;
+                }
+#endif
             }
         }
     }
-    if (game_api_ == GraphicsAPI::None) {
-        game_api_ = this_api;
-        switch (this_api) {
-        case GraphicsAPI::DX10: STAR_LOG("Game graphics API: DirectX 10"); break;
-        case GraphicsAPI::DX11: STAR_LOG("Game graphics API: DirectX 11"); break;
-        default:                STAR_LOG("Game graphics API: DirectX 12"); break;
-        }
-    }
-    // External mode only sniffs (for the label + input); all drawing lives
-    // in the external window. Hook rendering stays off entirely.
+    std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    DXGI_SWAP_CHAIN_DESC sd{};
+    if (FAILED(chain->GetDesc(&sd)) || !accept_backend(this_api, sd.OutputWindow)) return;
+    note_present();
     if (mode_ == OverlayMode::External) return;
-    // A Vulkan title may also present a DXGI helper swapchain (Unity does
-    // this for its player loop). The overlay belongs on the Vulkan surface;
-    // never init the DX12 path on a Vulkan game or it corrupts the frame.
-    if (game_api_ == GraphicsAPI::Vulkan) return;
-
-    // The game switched to a different API on a different, now-foreground
-    // window (e.g. D3D11 splash -> D3D10 main). Re-init so the overlay draws
-    // on the visible swapchain. Same-window presents never switch (no
-    // flip-flop when a game presents two swapchains on one window).
-    if (imgui_initialized_ && active_api_ != this_api) {
-        DXGI_SWAP_CHAIN_DESC sd{};
-        HWND new_hwnd = nullptr;
-        if (SUCCEEDED(chain->GetDesc(&sd))) new_hwnd = sd.OutputWindow;
-        if (new_hwnd && new_hwnd != hwnd_ && GetForegroundWindow() == new_hwnd) {
-            STAR_LOG("Game switched graphics API - re-initializing overlay");
-            if (active_api_ == GraphicsAPI::DX11) {
-                ImGui_ImplDX11_Shutdown();
-                cleanup_rtv();
-            } else if (active_api_ == GraphicsAPI::DX10) {
-                ImGui_ImplDX10_Shutdown();
-                cleanup_dx10_rtv();
-            }
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-            imgui_initialized_ = false;
-            active_api_ = GraphicsAPI::None;
-            if (context_) { context_->Release(); context_ = nullptr; }
-            if (device_)  { device_->Release();  device_  = nullptr; }
-            if (dx10_device_) { dx10_device_->Release(); dx10_device_ = nullptr; }
-        }
-    }
+    if (imgui_initialized_ && active_api_ != this_api) return;
+    if (dxgi_chain_ && dxgi_chain_ != chain) shutdown_renderer();
+    dxgi_chain_ = chain;
+    hook_window_for(sd.OutputWindow);
+    poll_hotkey();
 
     if (!imgui_initialized_) {
-        std::unique_lock<std::mutex> init_lock(render_mutex_, std::try_to_lock);
-        if (!init_lock.owns_lock() || imgui_initialized_) return;
         if (this_api == GraphicsAPI::DX11) {
             init_imgui(chain);
         } else if (this_api == GraphicsAPI::DX10) {
@@ -190,46 +171,26 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
         }
     }
 
-    if (imgui_initialized_) {
-        if (active_api_ == GraphicsAPI::DX11) {
-            render_frame(chain);
-        } else if (active_api_ == GraphicsAPI::DX10) {
-            render_frame_dx10(chain);
+    lock.unlock(); // Each submission rechecks ownership under render_mutex_.
+    if (this_api == GraphicsAPI::DX11) render_frame(chain);
+    else if (this_api == GraphicsAPI::DX10) render_frame_dx10(chain);
 #ifdef _WIN64
-        } else if (active_api_ == GraphicsAPI::DX12) {
-            // Capture first: with dx12_render=false this is the ONLY consumer
-            // (render_frame_dx12 early-returns), routing to desktop duplication.
-            maybe_capture_dx12(chain);
-            render_frame_dx12(chain);
-#endif
-        }
+    else if (this_api == GraphicsAPI::DX12) {
+        maybe_capture_dx12(chain);
+        render_frame_dx12(chain);
     }
+#endif
 }
 
 void StarOverlay::on_resize_buffers(IDXGISwapChain* sc, UINT bc, UINT w, UINT h, DXGI_FORMAT fmt, UINT fl)
 {
     STAR_UNREFERENCED(sc); STAR_UNREFERENCED(bc); STAR_UNREFERENCED(w);
     STAR_UNREFERENCED(h);  STAR_UNREFERENCED(fmt); STAR_UNREFERENCED(fl);
-    // External mode owns its own RTV; a game-chain resize must never touch it.
-    if (mode_ == OverlayMode::External) return;
     std::lock_guard<std::mutex> lock(render_mutex_);
-    if (active_api_ == GraphicsAPI::DX11) {
-        cleanup_rtv();
-    } else if (active_api_ == GraphicsAPI::DX10) {
-        cleanup_dx10_rtv();
+    if (!enabled_ || mode_ == OverlayMode::External || sc != dxgi_chain_) return;
+    if (active_api_ == GraphicsAPI::DX11) cleanup_rtv();
+    else if (active_api_ == GraphicsAPI::DX10) cleanup_dx10_rtv();
 #ifdef _WIN64
-    } else if (active_api_ == GraphicsAPI::DX12) {
-        if (sc != dx12_chain_) return;
-        wait_dx12_idle();
-        if (imgui_initialized_) {
-            ImGui_ImplDX12_Shutdown();
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-        }
-        icons_.clear();
-        cleanup_dx12();
-        imgui_initialized_ = false;
-        active_api_ = GraphicsAPI::None;
+    else if (active_api_ == GraphicsAPI::DX12) shutdown_renderer();
 #endif
-    }
 }

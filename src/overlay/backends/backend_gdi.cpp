@@ -19,6 +19,7 @@ public:
     PresentGuard(const PresentGuard&) = delete;
     PresentGuard& operator=(const PresentGuard&) = delete;
 };
+
 } // namespace
 
 bool StarOverlay::gdi_wants_draw() const
@@ -29,81 +30,101 @@ bool StarOverlay::gdi_wants_draw() const
 
 bool StarOverlay::prepare_gdi_present(HWND window)
 {
-    if (!enabled_ || (mode_ != OverlayMode::External && imgui_initialized_ && active_api_ != GraphicsAPI::GDI))
+    if (!accept_backend(GraphicsAPI::GDI, window)) return false;
+    if (mode_ != OverlayMode::External && imgui_initialized_ && active_api_ != GraphicsAPI::GDI)
         return false;
-    if (game_api_ == GraphicsAPI::None) {
-        game_api_ = GraphicsAPI::GDI;
-        STAR_LOG("Game graphics API: GDI");
-    }
+    note_present();
     if (mode_ == OverlayMode::External) return false;
     hook_window_for(window);
-    DWORD foreground_pid = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
-    if (foreground_pid == GetCurrentProcessId()) poll_hotkey();
-    else poll_focus();
-    note_present();
+    const DWORD thread = GetWindowThreadProcessId(window, nullptr);
+    if (thread != gdi_message_thread_) {
+        if (gdi_message_hook_) UnhookWindowsHookEx(gdi_message_hook_);
+        gdi_message_hook_ = SetWindowsHookExW(WH_GETMESSAGE, &gdi_message_hook, nullptr, thread);
+        gdi_message_thread_ = gdi_message_hook_ ? thread : 0;
+    }
+    poll_hotkey();
     // Hotkeys, timing, and queued screenshots stay live without GPU work,
     // bitmap allocation, or frame copies while the overlay is idle.
     return gdi_wants_draw() || screenshots_.pending();
 }
 
+LRESULT CALLBACK StarOverlay::gdi_message_hook(int code, WPARAM removed, LPARAM message)
+{
+    auto* o = g_overlay;
+    if (code >= 0 && removed == PM_REMOVE && o && o->enabled_ &&
+        o->open_ && o->game_api_ == GraphicsAPI::GDI && o->mode_ != OverlayMode::External) {
+        auto* msg = reinterpret_cast<MSG*>(message);
+        if (msg && msg->hwnd && GetAncestor(msg->hwnd, GA_ROOT) == GetAncestor(o->game_window_, GA_ROOT)) {
+            // RGSS can remove mouse messages without dispatching its WndProc.
+            // Capture wheel deltas on removal, once, before that can happen.
+            if (msg->message == WM_MOUSEWHEEL || msg->message == WM_MOUSEHWHEEL) {
+                auto& wheel = msg->message == WM_MOUSEWHEEL ? o->gdi_wheel_y_ : o->gdi_wheel_x_;
+                wheel.fetch_add(GET_WHEEL_DELTA_WPARAM(msg->wParam));
+                msg->message = WM_NULL;
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, removed, message);
+}
+
 void StarOverlay::check_blit_and_present(HDC hdc, int x, int y, int cx, int cy)
 {
-    if (in_gdi_present || !enabled_ || cx <= 0 || cy <= 0) return;
+    if (in_gdi_present || !enabled_ || cx <= 0 || cy <= 0 ||
+        (game_api_ != GraphicsAPI::None && game_api_ != GraphicsAPI::GDI)) return;
     HWND window = WindowFromDC(hdc);
     if (!window) {
-        // Some engines assemble a frame in a short-lived memory DC, then
-        // consume its bitmap outside GDI. Only draw after a complete run.
+        // A screen DC has no process/window ownership. Only complete bitmap
+        // frames are eligible for this fallback, never arbitrary desktop blits.
         if (GetObjectType(hdc) != OBJ_MEMDC) return;
         struct StripRun {
             HGDIOBJ bitmap = nullptr;
-            int width = 0, height = 0, next_y = 0;
+            int width = 0, height = 0, x = 0, span = 0, next_y = 0, bottom = 0;
             DWORD at = 0;
         };
         static thread_local std::unordered_map<HDC, StripRun> runs;
         const DWORD now = GetTickCount();
         HGDIOBJ bitmap = GetCurrentObject(hdc, OBJ_BITMAP);
-        if (x == 0 && y == 0) {
-            BITMAP info{};
-            if (!GetObject(bitmap, sizeof(info), &info) || info.bmWidth != cx ||
-                info.bmHeight < 50 || info.bmHeight > 16384 || cx > 16384) return;
-            // DC handles change each frame in some engines. Bound stale runs.
-            if (runs.size() >= 32) runs.clear();
-            runs[hdc] = {bitmap, cx, info.bmHeight, 0, now};
-        }
         auto it = runs.find(hdc);
-        if (it == runs.end()) return;
-        auto& run = it->second;
-        if (bitmap != run.bitmap || x != 0 || cx != run.width || y != run.next_y ||
-            (int64_t)y + cy > run.height || now - run.at > 250) {
+        if (it != runs.end() && (bitmap != it->second.bitmap || x != it->second.x ||
+            cx != it->second.span || y != it->second.next_y ||
+            (int64_t)y + cy > it->second.bottom || now - it->second.at > 250)) {
             runs.erase(it);
-            return;
+            it = runs.end();
         }
+        if (it == runs.end()) {
+            BITMAP info{};
+            if (!GetObject(bitmap, sizeof(info), &info) || x < 0 || y < 0 ||
+                info.bmWidth > 16384 || info.bmHeight > 16384 ||
+                (int64_t)x * 2 + cx != info.bmWidth || cx < 50 ||
+                (int64_t)info.bmHeight - y * 2LL < 50 ||
+                (int64_t)y + cy > (int64_t)info.bmHeight - y) return;
+            // RGSS uses centered letterboxing in fullscreen. A frame ends at
+            // the matching bottom border, not at the bottom of its bitmap.
+            // Only contiguous, full-width (or centered) strip runs qualify.
+            if (runs.size() >= 32) runs.clear();
+            it = runs.emplace(hdc, StripRun{bitmap, info.bmWidth, info.bmHeight,
+                x, cx, y, info.bmHeight - y, now}).first;
+        }
+        auto& run = it->second;
         run.next_y = y + cy;
         run.at = now;
-        if (run.next_y != run.height) return;
-        const int height = run.height;
+        if (run.next_y != run.bottom) return;
+        const int width = run.width, height = run.height;
         runs.erase(it);
-
         PresentGuard guard;
         std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
         if (!lock.owns_lock()) return;
-        window = IsWindow(hwnd_) ? hwnd_ : find_game_window();
-        if (!window) return;
-        // Poll input even while closed; otherwise nothing can open the panel.
-        if (!prepare_gdi_present(window)) return;
-        const bool drawn = render_gdi(window, hdc, cx, height);
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            STAR_LOG("GDI memory frame: %dx%d hwnd=%p dc=%p drawn=%d", cx, height, window, hdc, (int)drawn);
+        window = IsWindow(game_window_) ? game_window_ : find_game_window();
+        if (!window || !prepare_gdi_present(window)) return;
+        const bool drawn = render_gdi(window, hdc, width, height);
+        static int logged_width = 0, logged_height = 0;
+        if (drawn && (logged_width != width || logged_height != height)) {
+            logged_width = width; logged_height = height;
+            STAR_LOG("GDI memory frame drawn: %dx%d hwnd=%p", width, height, window);
         }
         return;
     }
     if (!IsWindowVisible(window)) return;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(window, &pid);
-    if (pid != GetCurrentProcessId()) return;
     RECT client{};
     if (!GetClientRect(window, &client)) return;
     int w = client.right, h = client.bottom;
@@ -172,7 +193,7 @@ void StarOverlay::hook_gdi()
     if (gdi_hooked_) return;
     HMODULE gdi32 = GetModuleHandleW(L"gdi32.dll");
     if (!gdi32) gdi32 = LoadLibraryW(L"gdi32.dll");
-    if (!gdi32) return;
+    if (!gdi32) { STAR_LOG("hook_gdi: gdi32.dll not found"); return; }
 
     auto install = [](const char* name, HMODULE module, auto hook, auto& original) {
         if (original) return true;
@@ -193,9 +214,9 @@ void StarOverlay::hook_gdi()
     bool dib = install("StretchDIBits", gdi32, &hooked_StretchDIBits, orig_stretchdibits_);
     bool setdib = install("SetDIBitsToDevice", gdi32, &hooked_SetDIBitsToDevice, orig_setdibitstodevice_);
     gdi_hooked_ = bitblt && stretch && dib && setdib;
-    if (gdi_hooked_ && !api_detected_) { api_detected_ = true; STAR_LOG("GDI hooked"); }
-
-
+    STAR_LOG("hook_gdi: bitblt=%d stretch=%d dib=%d setdib=%d hooked=%d any_hook_installed=%d",
+        (int)bitblt, (int)stretch, (int)dib, (int)setdib, (int)gdi_hooked_, (int)any_graphics_hook_installed_);
+    if (gdi_hooked_ && !any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("GDI hooked"); }
 }
 
 bool StarOverlay::gdi_init_device()
@@ -262,7 +283,11 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
     if (!enabled_ || !dest_dc || w <= 0 || h <= 0 || w > 16384 || h > 16384) return false;
     maybe_capture_gdi(dest_dc, w, h);
     if (!gdi_wants_draw()) return true;
+    RECT client{};
+    if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0) return false;
+    const int render_w = client.right, render_h = client.bottom;
     if (!imgui_initialized_) {
+        if (game_api_ != GraphicsAPI::None && game_api_ != GraphicsAPI::GDI) return false;
         if (!gdi_init_device()) return false;
         ImGui::CreateContext();
         if (!ImGui_ImplWin32_Init(window)) {
@@ -280,18 +305,31 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
         STAR_LOG("ImGui ready (GDI renderer) hwnd=%p", window);
     }
     if (active_api_ != GraphicsAPI::GDI) return false;
-    if (w != gdi_.width || h != gdi_.height || !gdi_.render_view) {
-        if (!gdi_alloc_surfaces(w, h)) return false;
+    if (render_w != gdi_.width || render_h != gdi_.height || !gdi_.render_view) {
+        if (!gdi_alloc_surfaces(render_w, render_h)) return false;
     }
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGuiIO& io = ImGui::GetIO();
-    ImVec2 client_size = io.DisplaySize;
-    if (client_size.x > 0 && client_size.y > 0 && io.MousePos.x > -FLT_MAX && io.MousePos.y > -FLT_MAX) {
-        io.MousePos.x *= (float)w / client_size.x;
-        io.MousePos.y *= (float)h / client_size.y;
+    {
+        POINT cursor{};
+        read_cursor_pos(cursor);
+        if (ScreenToClient(window, &cursor)) {
+            io.AddMousePosEvent((float)cursor.x, (float)cursor.y);
+        }
     }
-    io.DisplaySize = ImVec2((float)w, (float)h);
+    DWORD foreground_pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
+    const bool focused = foreground_pid == GetCurrentProcessId();
+    const int buttons[] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+    for (int i = 0; i < 5; ++i)
+        io.AddMouseButtonEvent(i, open_ && focused && (real_GetAsyncKeyState(buttons[i]) & 0x8000));
+    const int wheel_x = gdi_wheel_x_.exchange(0), wheel_y = gdi_wheel_y_.exchange(0);
+    if (open_ && focused && (wheel_x || wheel_y))
+        io.AddMouseWheelEvent(-(float)wheel_x / WHEEL_DELTA, (float)wheel_y / WHEEL_DELTA);
+    // Keep all Win32 input and ImGui layout in client coordinates. AlphaBlend
+    // scales the finished image into the game's smaller bitmap, not the input.
+    io.DisplaySize = ImVec2((float)render_w, (float)render_h);
     // Rendering sleeps while idle; do not age a newly queued toast by that gap.
     io.DeltaTime = std::min(io.DeltaTime, 0.1f);
     ImGui::NewFrame();
@@ -302,8 +340,8 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
         gdi_.context->OMSetRenderTargets(1, gdi_.render_view.GetAddressOf(), nullptr);
         gdi_.context->ClearRenderTargetView(gdi_.render_view.Get(), clear);
         D3D11_VIEWPORT viewport{};
-        viewport.Width = (float)w;
-        viewport.Height = (float)h;
+        viewport.Width = (float)render_w;
+        viewport.Height = (float)render_h;
         viewport.MaxDepth = 1.0f;
         gdi_.context->RSSetViewports(1, &viewport);
 
@@ -315,15 +353,15 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
         if (FAILED(hr)) { gdi_.draw_snapshot.clear(); return false; }
         const auto* src = static_cast<const uint8_t*>(map.pData);
         auto* dst = static_cast<uint8_t*>(gdi_.pixels.bits());
-        const size_t row_bytes = (size_t)w * 4;
+        const size_t row_bytes = (size_t)render_w * 4;
         // Finish any previous GDI read of the DIB before overwriting its pixels.
         GdiFlush();
-        for (int y = 0; y < h; ++y)
+        for (int y = 0; y < render_h; ++y)
             memcpy(dst + (size_t)y * row_bytes, src + (size_t)y * map.RowPitch, row_bytes);
         gdi_.context->Unmap(gdi_.staging_texture.Get(), 0);
     }
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    bool drawn = AlphaBlend(dest_dc, 0, 0, w, h, gdi_.pixels.dc(), 0, 0, w, h, blend) != FALSE;
+    bool drawn = AlphaBlend(dest_dc, 0, 0, w, h, gdi_.pixels.dc(), 0, 0, render_w, render_h, blend) != FALSE;
     if (drawn) GdiFlush();
     // GDI has no Present; force a repaint so the overlay keeps animating even
     // when the game stops redrawing. Cap the rate so an idle game's message

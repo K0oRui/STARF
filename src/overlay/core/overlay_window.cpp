@@ -78,10 +78,10 @@ void StarOverlay::poll_hotkey()
         if (((shiftOnly & 0x8000) != 0) && ((oem3 & 0x8000) != 0))
             down = true;
     }
-    if (down && !hotkey_prev_down_) {
+    const bool was_down = hotkey_prev_down_.exchange(down);
+    if (down && !was_down) {
         toggle_overlay();
     }
-    hotkey_prev_down_ = down;
     // Steam-style screenshot key, works with panel open or closed.
     {
         bool fdown = (real_GetAsyncKeyState(VK_F12) & 0x8000) != 0;
@@ -181,9 +181,8 @@ LRESULT CALLBACK StarOverlay::star_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPAR
 
     if (msg == WM_KEYDOWN && wp == VK_TAB && (g_overlay->real_GetKeyState(VK_SHIFT) & 0x8000)) {
         // Shared edge with poll_hotkey(): skip if polling already claimed it.
-        if (!g_overlay->hotkey_prev_down_) {
+        if (!g_overlay->hotkey_prev_down_.exchange(true)) {
             g_overlay->toggle_overlay();
-            g_overlay->hotkey_prev_down_ = true;
         }
         return 0;
     }

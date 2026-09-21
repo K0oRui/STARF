@@ -17,9 +17,13 @@ void StarOverlay::init_imgui_dx10(IDXGISwapChain* chain, ID3D10Device* device)
 
     style_.setup();
 
-    ImGui_ImplWin32_Init(hwnd_);
-    if (!ImGui_ImplDX10_Init(dx10_device_)) {
+    bool platform_ready = ImGui_ImplWin32_Init(hwnd_);
+    if (!platform_ready || !ImGui_ImplDX10_Init(dx10_device_)) {
         STAR_LOG("init_imgui DX10: ImGui_ImplDX10_Init FAILED");
+        if (platform_ready) ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        dx10_device_->Release(); dx10_device_ = nullptr;
+
         return;
     }
     imgui_initialized_ = true;
@@ -36,7 +40,8 @@ void StarOverlay::render_frame_dx10(IDXGISwapChain* chain)
 {
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    if (!imgui_initialized_ || active_api_ != GraphicsAPI::DX10) return;
+    if (!enabled_ || mode_ == OverlayMode::External || chain != dxgi_chain_ ||
+        !imgui_initialized_ || active_api_ != GraphicsAPI::DX10) return;
 
     if (!dx10_rtv_) {
         ID3D10Texture2D* bb = nullptr;

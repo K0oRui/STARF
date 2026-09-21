@@ -1,7 +1,12 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "overlay/backends/dx12_submission.h"
+#include <windows.h>
 #include <dxgi1_4.h>
 #include <cassert>
 #include <cstdio>
+#include <memory>
 using Microsoft::WRL::ComPtr;
 
 int main() {
@@ -57,5 +62,19 @@ int main() {
     assert(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
     assert(*(unsigned*)mapped == 0x12345678);
     readback->Unmap(0, nullptr);
+    // Retiring a renderer must wait for its actual last frame, not fence 1.
+    auto retired = std::make_unique<star_dx12::Submission>();
+    retired->device = device;
+    retired->fence = gate;
+    retired->completion_value = 7;
+    bool cleaned = false;
+    retired->on_complete = [&] { cleaned = true; };
+    pending.items.push_back(std::move(retired));
+    assert(SUCCEEDED(gate->Signal(3)));
+    star_dx12::reap_submissions();
+    assert(!cleaned && pending.items.size() == 1);
+    assert(SUCCEEDED(gate->Signal(7)));
+    star_dx12::reap_submissions();
+    assert(cleaned && pending.items.empty());
     std::puts("DX12 asynchronous submission smoke passed");
 }

@@ -7,19 +7,24 @@
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_DX8Present(IDirect3DDevice8* device, const RECT* src, const RECT* dst, HWND window, const RGNDATA* rgn)
 {
-    if (g_overlay) g_overlay->on_present_dx8(device);
+    if (g_overlay) g_overlay->on_present_dx8(device, window);
     return g_overlay && g_overlay->orig_dx8_present_
         ? g_overlay->orig_dx8_present_(device, src, dst, window, rgn) : E_FAIL;
 }
 
 HRESULT STDMETHODCALLTYPE StarOverlay::hooked_DX8Reset(IDirect3DDevice8* device, void* params)
 {
-    if (g_overlay) g_overlay->on_reset_dx8();
+    if (g_overlay) g_overlay->on_reset_dx8(device);
     typedef HRESULT(STDMETHODCALLTYPE* DX8ResetFn)(IDirect3DDevice8*, void*);
     auto orig = (DX8ResetFn)g_overlay->orig_dx8_reset_;
     HRESULT hr = orig(device, params);
-    if (SUCCEEDED(hr) && g_overlay && g_overlay->active_api_ == GraphicsAPI::DX8) {
-        ImGui_ImplDX8_CreateDeviceObjects();
+    if (SUCCEEDED(hr) && g_overlay && g_overlay->game_api_ == GraphicsAPI::DX8 &&
+        g_overlay->mode_ != OverlayMode::External) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        if (g_overlay->enabled_ && g_overlay->mode_ != OverlayMode::External &&
+            g_overlay->imgui_initialized_ && g_overlay->active_api_ == GraphicsAPI::DX8 &&
+            g_overlay->dx8_device_ == device)
+            ImGui_ImplDX8_CreateDeviceObjects();
     }
     return hr;
 }
@@ -52,7 +57,7 @@ HRESULT STDMETHODCALLTYPE StarOverlay::hooked_D3D8CreateDevice(IDirect3D8* d3d, 
         }
         if (g_overlay->orig_dx8_present_) {
             g_overlay->dx8_hooked_ = true;
-            if (!g_overlay->api_detected_) { g_overlay->api_detected_ = true; STAR_LOG("DX8 hooked"); }
+            if (!g_overlay->any_graphics_hook_installed_) { g_overlay->any_graphics_hook_installed_ = true; STAR_LOG("DX8 hooked"); }
         }
     }
     return hr;
@@ -75,36 +80,24 @@ void StarOverlay::hook_dx8()
     }
 }
 
-void StarOverlay::on_present_dx8(IDirect3DDevice8* device)
+void StarOverlay::on_present_dx8(IDirect3DDevice8* device, HWND window)
 {
     if (!enabled_ || !device) return;
-    poll_hotkey();
-    note_present();
-    if (game_api_ == GraphicsAPI::None) {
-        game_api_ = GraphicsAPI::DX8;
-        STAR_LOG("Game graphics API: DirectX 8");
-    }
-    if (mode_ == OverlayMode::External) return;
-
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
+    D3DDEVICE_CREATION_PARAMETERS cp{};
+    if (FAILED(device->GetCreationParameters(&cp))) return;
+    if (!window) window = cp.hFocusWindow;
+    if (!accept_backend(GraphicsAPI::DX8, window)) return;
+    note_present();
+    if (mode_ == OverlayMode::External) return;
+    poll_hotkey();
     if (imgui_initialized_ && active_api_ != GraphicsAPI::DX8) return;
-    if (imgui_initialized_ && dx8_device_ != device) {
-        release_icons_dx8();
-        ImGui_ImplDX8_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        imgui_initialized_ = false;
-        active_api_ = GraphicsAPI::None;
-    }
+    if (imgui_initialized_ && dx8_device_ != device) shutdown_renderer();
     dx8_device_ = device;
 
     if (!imgui_initialized_) {
-        D3DDEVICE_CREATION_PARAMETERS cp{};
-        device->GetCreationParameters(&cp);
-        HWND new_hwnd = cp.hFocusWindow;
-        if (!new_hwnd) new_hwnd = GetActiveWindow();
-        hook_window_for(new_hwnd);
+        hook_window_for(window);
 
         ImGui::CreateContext();
         if (!ImGui_ImplWin32_Init(hwnd_)) { ImGui::DestroyContext(); return; }
@@ -139,11 +132,12 @@ void StarOverlay::on_present_dx8(IDirect3DDevice8* device)
     }
 }
 
-void StarOverlay::on_reset_dx8()
+void StarOverlay::on_reset_dx8(IDirect3DDevice8* device)
 {
-    if (mode_ == OverlayMode::External) return;
+    if (mode_ == OverlayMode::External || game_api_ != GraphicsAPI::DX8) return;
     std::lock_guard<std::mutex> lock(render_mutex_);
-    if (active_api_ == GraphicsAPI::DX8 && imgui_initialized_) {
+    if (enabled_ && mode_ != OverlayMode::External && dx8_device_ == device &&
+        active_api_ == GraphicsAPI::DX8 && imgui_initialized_) {
         ImGui_ImplDX8_InvalidateDeviceObjects();
     }
 }

@@ -91,7 +91,19 @@ Icon paths are relative to the `STAR/` directory. You can unlock and reset achie
 
 Shows your account info, achievement progress, and a scrollable list of every achievement with Unlock/Reset buttons per row. Hit "Test notify" to fire a fake achievement notification so you can see how it looks without actually unlocking anything.
 
-Supports DX9, DX11, DX12, OpenGL, and Vulkan. Hooks the present call via MinHook, no game cooperation needed. Hostile titles (crashes, device loss, fence timeouts) automatically fall back to a separate external overlay window; STAR retries hooks after a few launches with exponential backoff and heals itself when a retry succeeds. See `SETUP.md` for the `mode`, `fallback_count`, and `fallback_level` keys.
+Supports DX7, DX8, DX9, DX10, DX11, DX12 (x64), OpenGL, Vulkan, and GDI. Hooks frame presentation via MinHook, no game cooperation needed. Hostile titles (crashes, device loss, fence timeouts) automatically fall back to a separate external overlay window; STAR retries hooks after a few launches with exponential backoff and heals itself when a retry succeeds. See `SETUP.md` for the `mode`, `fallback_count`, and `fallback_level` keys.
+
+The first qualifying presentation on the main game window locks the game API for
+that process. Other APIs pass through without changing overlay rendering, input
+ownership, or screenshots. Resizing and device/context recreation rebuild only
+the selected backend. GDI requires two seconds of sustained drawing before it
+can claim selection, to avoid treating incidental startup painting as the renderer.
+External mode keeps this game API selection but draws its separate window with
+its own DX9/DX11 device. Unity games loaded after graphics initialization recover
+their exact DX12 swapchain/queue or Vulkan device/queue through Unity's native
+plugin interface. Vulkan hooks also cover instance/device function lookups.
+If the required ownership information remains unavailable, auto mode uses the
+external path; STAR does not guess GPU handles.
 
 ---
 
@@ -130,7 +142,13 @@ ctest --test-dir build/x64 -C Release --output-on-failure
 
 Use the x86 preset and build directory for the 32-bit checks. These tests cover
 queued I/O, PNG encoding/decoding, notification ownership, draw reuse, bulk
-achievements, and pixel/GDI helpers; they do not replace testing inside a game.
+achievements, pixel/GDI helpers, and API selection across every backend. Native
+DLL tests also interleave DX9, DX10, DX11, DX12, OpenGL, Vulkan, and GDI with
+helper APIs and exercise resize/reset/context recreation, Vulkan function
+lookups, and Unity graphics objects created before DLL loading. The external
+overlay test grows and shrinks real GPU/readback surfaces offscreen. Native checks skip
+when the required graphics runtime is unavailable; they do not replace testing
+inside a game.
 
 ## logs
 

@@ -3,6 +3,7 @@
 #include "core/settings.h"
 #include "core/storage.h"
 #include "core/config.h"
+#include <MinHook.h>
 #include "steam/steam_client.h"
 #include "steam/isteamnetworkingsockets.h"
 #include "steam/isteamnetworkingutils.h"
@@ -60,8 +61,13 @@ enum EServerMode {
 };
 
 static HMODULE g_dll_module = nullptr;
-static bool g_initialized = false;
+static std::atomic<bool> g_initialized{false};
+static std::mutex g_init_mutex;
+static std::atomic<bool> g_init_requested{false};
+static bool g_injected = false;
 static std::string g_dll_dir;
+
+static bool star_init_internal(bool automatic = false);
 static uintptr_t g_lifetime_counter = 1;
 
 typedef uint64 uint64_steamid;
@@ -98,7 +104,7 @@ void STAR_WriteLog(const char* fmt, ...)
     va_end(args);
 
     char out_buf[1280];
-    snprintf(out_buf, sizeof(out_buf), "[STAR] %s\n", buf);
+    snprintf(out_buf, sizeof(out_buf), "[STAR pid=%lu] %s\n", (unsigned long)GetCurrentProcessId(), buf);
 
     OutputDebugStringA(out_buf);
 
@@ -106,7 +112,7 @@ void STAR_WriteLog(const char* fmt, ...)
     std::lock_guard<std::mutex> lock(log_mutex);
     static std::ofstream stream;
     if (!stream.is_open()) {
-        stream.open(utf8_to_wstring(get_dll_dir() + "\\STAR\\star.log"), std::ios::trunc);
+        stream.open(utf8_to_wstring(get_dll_dir() + "\\STAR\\star.log"), std::ios::app);
         if (!stream.is_open()) {
             wchar_t temp[MAX_PATH];
             if (GetTempPathW(MAX_PATH, temp)) {
@@ -125,15 +131,137 @@ void STAR_WriteLog(const char* fmt, ...)
     }
 }
 
+// ── Process injection ─────────────────────────────────────────────────────
+// When STAR is loaded in a launcher/wrapper process (e.g. Subterra.exe) that
+// spawns the real game process, STAR's overlay hooks are useless in the
+// launcher.  We hook CreateProcess{W,A} so that when the launcher spawns a
+// child, we inject STAR into that child so the overlay works there.
+
+static bool STAR_InjectDll(DWORD target_pid)
+{
+    wchar_t dll_path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(g_dll_module, dll_path, MAX_PATH)) return false;
+
+    HANDLE hproc = OpenProcess(
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+        FALSE, target_pid);
+    if (!hproc) { STAR_LOG("inject: OpenProcess failed pid=%lu err=%lu",
+                           (unsigned long)target_pid, (unsigned long)GetLastError()); return false; }
+
+    size_t path_size = (wcslen(dll_path) + 1) * sizeof(wchar_t);
+    LPVOID remote_buf = VirtualAllocEx(hproc, nullptr, path_size,
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remote_buf) {
+        STAR_LOG("inject: VirtualAllocEx failed err=%lu", (unsigned long)GetLastError());
+        CloseHandle(hproc); return false;
+    }
+    if (!WriteProcessMemory(hproc, remote_buf, dll_path, path_size, nullptr)) {
+        STAR_LOG("inject: WriteProcessMemory failed err=%lu", (unsigned long)GetLastError());
+        VirtualFreeEx(hproc, remote_buf, 0, MEM_RELEASE);
+        CloseHandle(hproc); return false;
+    }
+
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) { VirtualFreeEx(hproc, remote_buf, 0, MEM_RELEASE); CloseHandle(hproc); return false; }
+    FARPROC load_lib = GetProcAddress(k32, "LoadLibraryW");
+    if (!load_lib) { VirtualFreeEx(hproc, remote_buf, 0, MEM_RELEASE); CloseHandle(hproc); return false; }
+
+    HANDLE hthread = CreateRemoteThread(hproc, nullptr, 0,
+        (LPTHREAD_START_ROUTINE)load_lib, remote_buf, 0, nullptr);
+    if (!hthread) {
+        STAR_LOG("inject: CreateRemoteThread failed err=%lu", (unsigned long)GetLastError());
+        VirtualFreeEx(hproc, remote_buf, 0, MEM_RELEASE);
+        CloseHandle(hproc); return false;
+    }
+    WaitForSingleObject(hthread, 5000);
+    CloseHandle(hthread);
+    VirtualFreeEx(hproc, remote_buf, 0, MEM_RELEASE);
+    CloseHandle(hproc);
+    STAR_LOG("inject: injected STAR into pid=%lu", (unsigned long)target_pid);
+    return true;
+}
+
+typedef BOOL (WINAPI *CreateProcessW_fn)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+typedef BOOL (WINAPI *CreateProcessA_fn)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+
+static CreateProcessW_fn orig_CreateProcessW = nullptr;
+static CreateProcessA_fn orig_CreateProcessA = nullptr;
+
+static BOOL WINAPI hooked_CreateProcessW(LPCWSTR app, LPWSTR cmd,
+    LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta,
+    BOOL inherit, DWORD flags, LPVOID env, LPCWSTR cur,
+    LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi)
+{
+    BOOL ret = orig_CreateProcessW(app, cmd, pa, ta, inherit, flags, env, cur, si, pi);
+    if (ret && pi && pi->dwProcessId) {
+        STAR_LOG("CreateProcessW: child pid=%lu injecting", (unsigned long)pi->dwProcessId);
+        STAR_InjectDll(pi->dwProcessId);
+    }
+    return ret;
+}
+
+static BOOL WINAPI hooked_CreateProcessA(LPCSTR app, LPSTR cmd,
+    LPSECURITY_ATTRIBUTES pa, LPSECURITY_ATTRIBUTES ta,
+    BOOL inherit, DWORD flags, LPVOID env, LPCSTR cur,
+    LPSTARTUPINFOA si, LPPROCESS_INFORMATION pi)
+{
+    BOOL ret = orig_CreateProcessA(app, cmd, pa, ta, inherit, flags, env, cur, si, pi);
+    if (ret && pi && pi->dwProcessId) {
+        STAR_LOG("CreateProcessA: child pid=%lu injecting", (unsigned long)pi->dwProcessId);
+        STAR_InjectDll(pi->dwProcessId);
+    }
+    return ret;
+}
+
+static void STAR_hook_create_process()
+{
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return;
+    void* cpw = (void*)GetProcAddress(k32, "CreateProcessW");
+    void* cpa = (void*)GetProcAddress(k32, "CreateProcessA");
+    if (cpw && !orig_CreateProcessW &&
+        MH_CreateHook(cpw, (void*)hooked_CreateProcessW, (void**)&orig_CreateProcessW) == MH_OK)
+        MH_EnableHook(cpw);
+    if (cpa && !orig_CreateProcessA &&
+        MH_CreateHook(cpa, (void*)hooked_CreateProcessA, (void**)&orig_CreateProcessA) == MH_OK)
+        MH_EnableHook(cpa);
+}
+
+// Unity provides the actual graphics objects even when Steam loads after the
+// engine created its device. Present hooks still validate their ownership.
+extern "C" __declspec(dllexport) void __stdcall UnityPluginLoad(IUnityInterfaces* interfaces)
+{
+    StarOverlay::get().set_unity_interfaces(interfaces);
+    STAR_LOG("Unity graphics interfaces registered");
+}
+
+extern "C" __declspec(dllexport) void __stdcall UnityPluginUnload()
+{
+    StarOverlay::get().set_unity_interfaces(nullptr);
+}
+
 static DWORD WINAPI STAR_EarlyHookThread(LPVOID)
 {
     STAR_install_integrity_hooks();
-    // Hook vulkan-1.dll before SteamAPI_Init: Unity-style games create their
-    // Vulkan instance/device before the Steamworks plugin initializes, so the
-    // normal hook path (SteamAPI_Init) misses the creation metadata and the
-    // overlay falls back to external. Hooking here catches it natively.
+    STAR_hook_create_process();
+    // Capture Vulkan creation and DX12 swapchain queues before SteamAPI_Init
+    // when the DLL loads early enough. UnityPluginLoad also supplies exact
+    // engine objects when graphics initialization predates the DLL itself.
     g_overlay = &StarOverlay::get();
-    g_overlay->hook_vulkan_early();
+    g_overlay->hook_graphics_early();
+    // When injected via LoadLibrary (CreateRemoteThread), the host process
+    // will never call SteamAPI_Init.  Self-initialize after a short delay
+    // so the host has time to finish loading its own DLLs first.
+    if (g_injected) {
+        STAR_LOG("Injected: waiting for host to load, then self-initializing");
+        // The host may call SteamAPI_Init itself (tests do). Skip the wait
+        // when it does; only self-initialize if the host never initializes.
+        for (int i = 0; i < 20 && !g_init_requested.load(); ++i) Sleep(100);
+        if (!g_init_requested.load()) star_init_internal(true);
+    }
     return 0;
 }
 
@@ -151,7 +279,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     case DLL_PROCESS_ATTACH:
         g_dll_module = hModule;
         DisableThreadLibraryCalls(hModule);
-        STAR_LOG("STAR loaded (built %s %s)", __DATE__, __TIME__);
+        // lpReserved == NULL means loaded via LoadLibrary (injected), not
+        // during static import resolution.  The host process will never call
+        // SteamAPI_Init so we must self-initialize.
+        g_injected = (lpReserved == nullptr);
+        STAR_LOG("STAR loaded (built %s %s) injected=%d", __DATE__, __TIME__, (int)g_injected);
         CloseHandle(CreateThread(NULL, 0, STAR_EarlyHookThread, NULL, 0, NULL));
         break;
     case DLL_PROCESS_DETACH:
@@ -174,12 +306,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     return TRUE;
 }
 
-static bool star_init_internal()
+static bool star_init_internal(bool automatic)
 {
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+    if (automatic && g_init_requested) return true;
+    g_init_requested = true;
+    if (g_initialized) return true;
     StarSteamRemoteStorage::get().start_async();
     STAR_install_integrity_hooks();
     STAR_install_il2cpp_hooks_deferred();
-    if (g_initialized) return true;
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -271,6 +406,7 @@ STAR_EXPORT ESteamAPIInitResult SteamInternal_SteamAPI_Init(const char* pszInter
 
 STAR_EXPORT void SteamAPI_Shutdown()
 {
+    std::lock_guard<std::mutex> lock(g_init_mutex);
     if (!g_initialized) return;
     StarSteamRemoteStorage::get().stop_async();
     Overlay::get().shutdown();
@@ -493,6 +629,31 @@ STAR_EXPORT void* SteamInternal_FindOrCreateGameServerInterface(HSteamUser hStea
 STAR_EXPORT ISteamClient* SteamClient()
 {
     return reinterpret_cast<ISteamClient*>(StarSteamClient::get().GetClientInterface("SteamClient017"));
+}
+
+STAR_EXPORT ISteamClient* g_pSteamClientGameServer = nullptr;
+
+STAR_EXPORT HSteamUser Steam_GetHSteamUserCurrent()
+{
+    return 1;
+}
+
+STAR_EXPORT void Steam_RegisterInterfaceFuncs(HMODULE hModule)
+{
+    STAR_UNREFERENCED(hModule);
+}
+
+STAR_EXPORT void Steam_RunCallbacks()
+{
+    STAR_RunCallbacks();
+}
+
+STAR_EXPORT bool SteamGameServer_InitSafe(uint32 unIP, uint16 usSteamPort, uint16 usGamePort, uint16 usQueryPort, EServerMode eServerMode, const char* pchVersionString)
+{
+    STAR_UNREFERENCED(unIP); STAR_UNREFERENCED(usSteamPort); STAR_UNREFERENCED(usGamePort);
+    STAR_UNREFERENCED(usQueryPort); STAR_UNREFERENCED(eServerMode); STAR_UNREFERENCED(pchVersionString);
+    star_init_internal();
+    return true;
 }
 
 STAR_EXPORT ISteamUser* SteamUser()

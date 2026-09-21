@@ -1,9 +1,14 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "core/work_queue.h"
 #include "overlay/ui/notification_queue.h"
 #include "overlay/ui/draw_snapshot.h"
 #include <cassert>
-#include <future>
 #include <cstdio>
+#include <future>
+#include <memory>
+#include <vector>
 
 int main() {
     NotificationQueue notifications;

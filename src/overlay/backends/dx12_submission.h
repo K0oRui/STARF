@@ -4,6 +4,7 @@
 #include <vector>
 #include <mutex>
 #include <memory>
+#include <functional>
 
 namespace star_dx12 {
 using Microsoft::WRL::ComPtr;
@@ -15,14 +16,16 @@ struct Submission {
     ComPtr<ID3D12Device> device;
     std::vector<ComPtr<IUnknown>> objects;
     HANDLE event = nullptr;
-    ~Submission() { if (event) CloseHandle(event); }
+    uint64_t completion_value = 1;
+    std::function<void()> on_complete;
+    ~Submission() { if (on_complete) on_complete(); if (event) CloseHandle(event); }
 };
 struct PendingSubmissions {
     std::vector<std::unique_ptr<Submission>> items;
     std::mutex mutex;
     void reap() {
         for (auto it = items.begin(); it != items.end();) {
-            if ((*it)->fence->GetCompletedValue() >= 1 ||
+            if ((*it)->fence->GetCompletedValue() >= (*it)->completion_value ||
                 FAILED((*it)->device->GetDeviceRemovedReason())) it = items.erase(it);
             else ++it;
         }

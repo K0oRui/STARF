@@ -59,7 +59,7 @@ void StarOverlay::hook_dx7()
             status = MH_EnableHook(end_scene);
             if (status == MH_OK) {
                 dx7_hooked_ = true;
-                if (!api_detected_) { api_detected_ = true; STAR_LOG("DX7 hooked"); }
+                if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("DX7 hooked"); }
             } else {
                 MH_RemoveHook(end_scene);
                 orig_dx7_end_scene_ = nullptr;
@@ -76,27 +76,15 @@ void StarOverlay::hook_dx7()
 void StarOverlay::on_end_scene_dx7(IDirect3DDevice7* device)
 {
     if (!enabled_ || !device) return;
-    if (game_api_ == GraphicsAPI::None) {
-        game_api_ = GraphicsAPI::DX7;
-        STAR_LOG("Game graphics API: DirectX 7");
-    }
-    if (mode_ == OverlayMode::External) return;
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
+    HWND window = IsWindow(game_window_) ? game_window_ : find_game_window();
+    if (!accept_backend(GraphicsAPI::DX7, window)) return;
+    note_present();
+    if (mode_ == OverlayMode::External) return;
     if (imgui_initialized_ && active_api_ != GraphicsAPI::DX7) return;
-
-    HWND window = hwnd_;
-    if (!window || !IsWindow(window)) window = find_game_window();
-    if (!window) return;
+    if (imgui_initialized_ && dx7_device_ != device) shutdown_renderer();
     hook_window_for(window);
-    if (imgui_initialized_ && dx7_device_ != device) {
-        release_icons_dx7();
-        ImGui_ImplDX7_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        imgui_initialized_ = false;
-        active_api_ = GraphicsAPI::None;
-    }
     if (!imgui_initialized_) {
         ImGui::CreateContext();
         if (!ImGui_ImplWin32_Init(window)) { ImGui::DestroyContext(); return; }
@@ -113,7 +101,6 @@ void StarOverlay::on_end_scene_dx7(IDirect3DDevice7* device)
         STAR_LOG("ImGui ready (DX7) hwnd=%p", window);
     }
     poll_hotkey();
-    note_present();
     IDirectDrawSurface7* current_target = nullptr;
     if (SUCCEEDED(device->GetRenderTarget(&current_target))) {
         HRESULT surface_status = current_target->IsLost();
@@ -170,9 +157,9 @@ void StarOverlay::release_icons_dx7()
 
 void StarOverlay::maybe_capture_dx7(IDirect3DDevice7* device)
 {
-    if (!enabled_ || mode_ == OverlayMode::External || active_api_ != GraphicsAPI::DX7 ||
-        !device || !screenshots_.consume()) return;
     std::lock_guard<std::mutex> guard(render_mutex_);
+    if (!enabled_ || mode_ == OverlayMode::External || active_api_ != GraphicsAPI::DX7 ||
+        !imgui_initialized_ || !device || device != dx7_device_ || !screenshots_.consume()) return;
     IDirectDrawSurface7* target = nullptr;
     HRESULT hr = device->GetRenderTarget(&target);
     if (FAILED(hr) || !target) return;

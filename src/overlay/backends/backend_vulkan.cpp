@@ -1,9 +1,12 @@
+#define VK_USE_PLATFORM_WIN32_KHR
 #include "overlay/overlay_internal.h"
 #include "core/settings.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_vulkan.h"
 #include <MinHook.h>
 #include <vulkan/vulkan.h>
+#include "../../../third_party/unity/IUnityGraphics.h"
+#include "../../../third_party/unity/IUnityGraphicsVulkan.h"
 #include <memory>
 
 #define VULKAN_FUNCS \
@@ -185,122 +188,211 @@ struct VulkanOverlayData {
     }
 };
 
-int WINAPI StarOverlay::hooked_vkCreateInstance(const void* pCreateInfo, const void* pAllocator, void** pInstance)
+namespace {
+struct VulkanDeviceInfo { void* physical; void* instance; };
+struct VulkanQueueInfo { void* device; uint32_t family; bool graphics; };
+struct VulkanSwapchainInfo {
+    void* device;
+    uint64_t surface, previous;
+    int format;
+    uint32_t count, width, height, usage;
+};
+// Creation callbacks only record metadata. Only an accepted presentation may
+// adopt it into the renderer. All registries use render_mutex_.
+std::unordered_map<void*, void*> physical_instances;
+std::unordered_map<void*, VulkanDeviceInfo> vulkan_devices;
+std::unordered_map<void*, VulkanQueueInfo> vulkan_queues;
+std::unordered_map<uint64_t, HWND> vulkan_windows;
+std::unordered_map<uint64_t, VulkanSwapchainInfo> vulkan_swapchains;
+PFN_vkEnumeratePhysicalDevices original_enumerate = nullptr;
+PFN_vkCreateWin32SurfaceKHR original_surface = nullptr;
+PFN_vkDestroySurfaceKHR original_destroy_surface = nullptr;
+PFN_vkGetDeviceQueue original_get_queue = nullptr;
+PFN_vkGetDeviceQueue2 original_get_queue2 = nullptr;
+PFN_vkGetInstanceProcAddr original_instance_proc = nullptr;
+PFN_vkGetDeviceProcAddr original_device_proc = nullptr;
+
+void record_queue(void* device, uint32_t family, void* queue, bool protected_queue = false)
 {
-    typedef VkResult(VKAPI_PTR* PFN_vkCreateInstance)(const void*, const void*, void**);
+    auto it = vulkan_devices.find(device);
+    if (!queue || it == vulkan_devices.end()) return;
+    auto props = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)GetProcAddress(
+        GetModuleHandleA("vulkan-1.dll"), "vkGetPhysicalDeviceQueueFamilyProperties");
+    if (!props) return;
+    uint32_t count = 0;
+    props((VkPhysicalDevice)it->second.physical, &count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);
+    props((VkPhysicalDevice)it->second.physical, &count, families.data());
+    bool graphics = !protected_queue && family < count &&
+        (families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT);
+    vulkan_queues[queue] = {device, family, graphics};
+}
+}
+
+void* StarOverlay::vulkan_hook_for(const char* name, void* address)
+{
+    if (!name || !address || !g_overlay) return address;
+    // Engines commonly resolve instance/device entry points instead of using
+    // DLL exports. Forward intercepted calls through the loader trampolines so
+    // each handle still reaches its own layer/driver dispatch table.
+#define VK_INTERCEPT(function, original) if (original && strcmp(name, #function) == 0) return (void*)&hooked_##function;
+    VK_INTERCEPT(vkGetInstanceProcAddr, original_instance_proc)
+    VK_INTERCEPT(vkGetDeviceProcAddr, original_device_proc)
+    VK_INTERCEPT(vkCreateInstance, g_overlay->orig_vkCreateInstance_)
+    VK_INTERCEPT(vkEnumeratePhysicalDevices, original_enumerate)
+    VK_INTERCEPT(vkCreateWin32SurfaceKHR, original_surface)
+    VK_INTERCEPT(vkDestroySurfaceKHR, original_destroy_surface)
+    VK_INTERCEPT(vkCreateDevice, g_overlay->orig_vkCreateDevice_)
+    VK_INTERCEPT(vkGetDeviceQueue, original_get_queue)
+    VK_INTERCEPT(vkGetDeviceQueue2, original_get_queue2)
+    VK_INTERCEPT(vkCreateSwapchainKHR, g_overlay->orig_vkCreateSwapchainKHR_)
+    VK_INTERCEPT(vkDestroySwapchainKHR, g_overlay->orig_vkDestroySwapchainKHR_)
+    VK_INTERCEPT(vkDestroyDevice, g_overlay->orig_vkDestroyDevice_)
+    VK_INTERCEPT(vkQueuePresentKHR, g_overlay->orig_vkQueuePresentKHR_)
+#undef VK_INTERCEPT
+    return address;
+}
+
+void* WINAPI StarOverlay::hooked_vkGetInstanceProcAddr(void* instance, const char* name)
+{
+    return vulkan_hook_for(name, (void*)original_instance_proc((VkInstance)instance, name));
+}
+
+void* WINAPI StarOverlay::hooked_vkGetDeviceProcAddr(void* device, const char* name)
+{
+    return vulkan_hook_for(name, (void*)original_device_proc((VkDevice)device, name));
+}
+
+int WINAPI StarOverlay::hooked_vkCreateInstance(const void* info, const void* allocator, void** instance)
+{
     auto orig = (PFN_vkCreateInstance)g_overlay->orig_vkCreateInstance_;
-    VkResult res = orig(pCreateInfo, pAllocator, pInstance);
-    if (res == VK_SUCCESS && pInstance && g_overlay) {
-        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
-        g_overlay->vk_instance_ = *pInstance;
-        g_vk_instance = (VkInstance)*pInstance;
-    }
-    return res;
+    return orig((const VkInstanceCreateInfo*)info, (const VkAllocationCallbacks*)allocator, (VkInstance*)instance);
 }
 
-int WINAPI StarOverlay::hooked_vkCreateDevice(void* physicalDevice, const void* pCreateInfo, const void* pAllocator, void** pDevice)
+int WINAPI StarOverlay::hooked_vkEnumeratePhysicalDevices(void* instance, uint32_t* count, void** devices)
 {
-    typedef VkResult(VKAPI_PTR* PFN_vkCreateDevice)(void*, const void*, const void*, void**);
+    VkResult result = original_enumerate((VkInstance)instance, count, (VkPhysicalDevice*)devices);
+    if (g_overlay && (g_overlay->game_api_ == GraphicsAPI::None || g_overlay->game_api_ == GraphicsAPI::Vulkan) &&
+        devices && count && (result == VK_SUCCESS || result == VK_INCOMPLETE)) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        for (uint32_t i = 0; i < *count; ++i) physical_instances[devices[i]] = instance;
+    }
+    return result;
+}
+
+int WINAPI StarOverlay::hooked_vkCreateWin32SurfaceKHR(void* instance, const void* info, const void* allocator, uint64_t* surface)
+{
+    auto* ci = (const VkWin32SurfaceCreateInfoKHR*)info;
+    VkResult result = original_surface((VkInstance)instance, ci, (const VkAllocationCallbacks*)allocator, (VkSurfaceKHR*)surface);
+    if (result == VK_SUCCESS && g_overlay && ci && surface &&
+        (g_overlay->game_api_ == GraphicsAPI::None || g_overlay->game_api_ == GraphicsAPI::Vulkan)) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        vulkan_windows[*surface] = ci->hwnd;
+    }
+    return result;
+}
+
+void WINAPI StarOverlay::hooked_vkDestroySurfaceKHR(void* instance, uint64_t surface, const void* allocator)
+{
+    if (g_overlay && (g_overlay->game_api_ == GraphicsAPI::None || g_overlay->game_api_ == GraphicsAPI::Vulkan)) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        vulkan_windows.erase(surface);
+        if (g_overlay->vk_surface_ == surface) g_overlay->vk_surface_ = 0;
+    }
+    original_destroy_surface((VkInstance)instance, (VkSurfaceKHR)surface, (const VkAllocationCallbacks*)allocator);
+}
+
+void WINAPI StarOverlay::hooked_vkGetDeviceQueue(void* device, uint32_t family, uint32_t index, void** queue)
+{
+    original_get_queue((VkDevice)device, family, index, (VkQueue*)queue);
+    if (g_overlay && queue &&
+        (g_overlay->game_api_ == GraphicsAPI::None || g_overlay->game_api_ == GraphicsAPI::Vulkan)) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        record_queue(device, family, *queue);
+    }
+}
+
+void WINAPI StarOverlay::hooked_vkGetDeviceQueue2(void* device, const void* info, void** queue)
+{
+    auto* ci = (const VkDeviceQueueInfo2*)info;
+    original_get_queue2((VkDevice)device, ci, (VkQueue*)queue);
+    if (g_overlay && ci && queue &&
+        (g_overlay->game_api_ == GraphicsAPI::None || g_overlay->game_api_ == GraphicsAPI::Vulkan)) {
+        std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        record_queue(device, ci->queueFamilyIndex, *queue, ci->flags != 0);
+    }
+}
+
+int WINAPI StarOverlay::hooked_vkCreateDevice(void* physical, const void* info, const void* allocator, void** device)
+{
     auto orig = (PFN_vkCreateDevice)g_overlay->orig_vkCreateDevice_;
-    VkResult res = orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
-    if (res == VK_SUCCESS && pDevice && g_overlay) {
+    VkResult result = orig((VkPhysicalDevice)physical, (const VkDeviceCreateInfo*)info,
+        (const VkAllocationCallbacks*)allocator, (VkDevice*)device);
+    if (result == VK_SUCCESS && device && g_overlay &&
+        (g_overlay->game_api_ == GraphicsAPI::None || g_overlay->game_api_ == GraphicsAPI::Vulkan)) {
         std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
-        g_overlay->vk_physical_device_ = physicalDevice;
-        g_overlay->vk_device_ = *pDevice;
-
-        auto* ci = static_cast<const VkDeviceCreateInfo*>(pCreateInfo);
-        g_overlay->vk_queue_family_ = UINT32_MAX;
-        // Only a captured graphics queue is eligible for native rendering.
-        auto module = GetModuleHandleA("vulkan-1.dll");
-        auto get_properties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)GetProcAddress(module, "vkGetPhysicalDeviceQueueFamilyProperties");
-        auto get_queue = (PFN_vkGetDeviceQueue)GetProcAddress(module, "vkGetDeviceQueue");
-        if (ci && get_properties && get_queue && ci->queueCreateInfoCount == 1) {
-            uint32_t count = 0;
-            get_properties((VkPhysicalDevice)physicalDevice, &count, nullptr);
-            std::vector<VkQueueFamilyProperties> families(count);
-            get_properties((VkPhysicalDevice)physicalDevice, &count, families.data());
-            const auto& qci = ci->pQueueCreateInfos[0];
-            if (!qci.flags && qci.queueFamilyIndex < count &&
-                (families[qci.queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
-                g_overlay->vk_queue_family_ = qci.queueFamilyIndex;
-                VkQueue graphics_queue{};
-                get_queue((VkDevice)*pDevice, qci.queueFamilyIndex, 0, &graphics_queue);
-                g_overlay->vk_queue_ = graphics_queue;
-            }
-        }
-
-        auto gdpa = (PFN_vkGetDeviceProcAddr)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkGetDeviceProcAddr");
-        if (gdpa) {
-            void* pCreateSwapchain = (void*)gdpa((VkDevice)*pDevice, "vkCreateSwapchainKHR");
-            if (pCreateSwapchain && !g_overlay->orig_vkCreateSwapchainKHR_) {
-                MH_CreateHook(pCreateSwapchain, &hooked_vkCreateSwapchainKHR, (void**)&g_overlay->orig_vkCreateSwapchainKHR_);
-                MH_EnableHook(pCreateSwapchain);
-            }
-        }
+        auto it = physical_instances.find(physical);
+        vulkan_devices[*device] = {physical, it == physical_instances.end() ? nullptr : it->second};
     }
-    return res;
+    return result;
 }
 
-int WINAPI StarOverlay::hooked_vkCreateSwapchainKHR(void* device, const void* pCreateInfo, const void* pAllocator, uint64_t* pSwapchain)
+int WINAPI StarOverlay::hooked_vkCreateSwapchainKHR(void* device, const void* info, const void* allocator, uint64_t* swapchain)
 {
-    typedef VkResult(VKAPI_PTR* PFN_vkCreateSwapchainKHR)(void*, const void*, const void*, uint64_t*);
     auto orig = (PFN_vkCreateSwapchainKHR)g_overlay->orig_vkCreateSwapchainKHR_;
-    VkResult res = orig ? orig(device, pCreateInfo, pAllocator, pSwapchain)
-                        : ((PFN_vkCreateSwapchainKHR)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkCreateSwapchainKHR"))(device, pCreateInfo, pAllocator, pSwapchain);
-    if (res == VK_SUCCESS && pSwapchain && g_overlay) {
+    auto* ci = (const VkSwapchainCreateInfoKHR*)info;
+    VkResult result = orig((VkDevice)device, ci, (const VkAllocationCallbacks*)allocator, (VkSwapchainKHR*)swapchain);
+    if (result == VK_SUCCESS && ci && swapchain && g_overlay &&
+        (g_overlay->game_api_ == GraphicsAPI::None || g_overlay->game_api_ == GraphicsAPI::Vulkan)) {
         std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
-        // Recovery: if vkCreateDevice was missed (game init before SteamAPI_Init),
-        // this still gives us the VkDevice for on_present_vulkan.
-        if (device) g_overlay->vk_device_ = device;
-        auto* ci = static_cast<const VkSwapchainCreateInfoKHR*>(pCreateInfo);
-        if (ci) {
-            g_overlay->vk_swapchain_format_ = ci->imageFormat;
-            g_overlay->vk_min_image_count_ = ci->minImageCount;
-            g_overlay->vk_width_ = ci->imageExtent.width;
-            g_overlay->vk_height_ = ci->imageExtent.height;
-            g_overlay->vk_image_usage_ = ci->imageUsage;
-            g_overlay->vk_swapchain_ = (void*)(uintptr_t)*pSwapchain;
-        }
-        g_overlay->vk_swapchain_recreated_ = true;
-        STAR_LOG("Vulkan swapchain created fmt=%d count=%u device=%p", g_overlay->vk_swapchain_format_, (unsigned)g_overlay->vk_min_image_count_, device);
-        // If vkCreateInstance/vkCreateDevice were missed (game init before our
-        // hooks loaded), recover instance/physical-device/queue-family now.
-        if (!g_overlay->vk_instance_ || !g_overlay->vk_physical_device_ ||
-            g_overlay->vk_queue_family_ == UINT32_MAX)
-            g_overlay->recover_vulkan_metadata();
+        vulkan_swapchains[*swapchain] = {device, (uint64_t)ci->surface, (uint64_t)ci->oldSwapchain,
+            (int)ci->imageFormat, ci->minImageCount, ci->imageExtent.width, ci->imageExtent.height, ci->imageUsage};
     }
-    return res;
+    return result;
 }
 
 void WINAPI StarOverlay::hooked_vkDestroySwapchainKHR(void* device, uint64_t swapchain, const void* allocator)
 {
     if (!g_overlay) return;
+    if (g_overlay->game_api_ != GraphicsAPI::None && g_overlay->game_api_ != GraphicsAPI::Vulkan) {
+        ((PFN_vkDestroySwapchainKHR)g_overlay->orig_vkDestroySwapchainKHR_)((VkDevice)device, (VkSwapchainKHR)swapchain, (const VkAllocationCallbacks*)allocator);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
-        auto* data = (VulkanOverlayData*)g_overlay->vk_data_;
-        if (data && (uintptr_t)data->swapchain == (uintptr_t)swapchain)
+        vulkan_swapchains.erase(swapchain);
+        if (g_overlay->vk_swapchain_ == swapchain && device == g_overlay->vk_device_) {
             g_overlay->cleanup_vulkan();
-        if ((uintptr_t)g_overlay->vk_swapchain_ == (uintptr_t)swapchain) {
-            g_overlay->vk_swapchain_ = nullptr;
+            g_overlay->vk_swapchain_ = 0;
             g_overlay->vk_width_ = g_overlay->vk_height_ = 0;
         }
     }
-    auto original = (PFN_vkDestroySwapchainKHR)g_overlay->orig_vkDestroySwapchainKHR_;
-    original((VkDevice)device, (VkSwapchainKHR)swapchain, (const VkAllocationCallbacks*)allocator);
+    auto orig = (PFN_vkDestroySwapchainKHR)g_overlay->orig_vkDestroySwapchainKHR_;
+    orig((VkDevice)device, (VkSwapchainKHR)swapchain, (const VkAllocationCallbacks*)allocator);
 }
 
 void WINAPI StarOverlay::hooked_vkDestroyDevice(void* device, const void* allocator)
 {
     if (!g_overlay) return;
+    if (g_overlay->game_api_ != GraphicsAPI::None && g_overlay->game_api_ != GraphicsAPI::Vulkan) {
+        ((PFN_vkDestroyDevice)g_overlay->orig_vkDestroyDevice_)((VkDevice)device, (const VkAllocationCallbacks*)allocator);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(g_overlay->render_mutex_);
+        vulkan_devices.erase(device);
+        for (auto it = vulkan_queues.begin(); it != vulkan_queues.end();)
+            if (it->second.device == device) it = vulkan_queues.erase(it); else ++it;
+        for (auto it = vulkan_swapchains.begin(); it != vulkan_swapchains.end();)
+            if (it->second.device == device) it = vulkan_swapchains.erase(it); else ++it;
         if (device == g_overlay->vk_device_) {
             g_overlay->cleanup_vulkan();
             g_overlay->vk_device_ = g_overlay->vk_physical_device_ = g_overlay->vk_queue_ = nullptr;
+            g_overlay->vk_swapchain_ = 0;
         }
     }
-    auto original = (PFN_vkDestroyDevice)g_overlay->orig_vkDestroyDevice_;
-    original((VkDevice)device, (const VkAllocationCallbacks*)allocator);
+    auto orig = (PFN_vkDestroyDevice)g_overlay->orig_vkDestroyDevice_;
+    orig((VkDevice)device, (const VkAllocationCallbacks*)allocator);
 }
 
 int WINAPI StarOverlay::hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo)
@@ -315,8 +407,6 @@ int WINAPI StarOverlay::hooked_vkQueuePresentKHR(void* queue, const void* pPrese
     if (!overlay || !pPresentInfo) return orig((VkQueue)queue, (const VkPresentInfoKHR*)pPresentInfo);
     // Forward a private copy: render_frame_vulkan replaces only the wait list.
     VkPresentInfoKHR present = *static_cast<const VkPresentInfoKHR*>(pPresentInfo);
-    overlay->poll_hotkey();
-    overlay->note_present();
     overlay->on_present_vulkan(queue, &present);
     return orig((VkQueue)queue, &present);
 }
@@ -325,7 +415,7 @@ void StarOverlay::hook_vulkan()
 {
     static std::mutex install_mutex;
     std::lock_guard<std::mutex> install_lock(install_mutex);
-    if (orig_vkQueuePresentKHR_ && orig_vkCreateDevice_ && orig_vkCreateInstance_) { vulkan_hooked_ = true; return; }
+    if (vulkan_hooked_) return;
     HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
     if (!vulkan) vulkan = LoadLibraryA("vulkan-1.dll");
     if (!vulkan) return;
@@ -363,148 +453,110 @@ void StarOverlay::hook_vulkan()
             *original = nullptr;
         }
     };
+    install("vkEnumeratePhysicalDevices", (void*)&hooked_vkEnumeratePhysicalDevices, (void**)&original_enumerate);
+    install("vkCreateWin32SurfaceKHR", (void*)&hooked_vkCreateWin32SurfaceKHR, (void**)&original_surface);
+    install("vkDestroySurfaceKHR", (void*)&hooked_vkDestroySurfaceKHR, (void**)&original_destroy_surface);
+    install("vkGetDeviceQueue", (void*)&hooked_vkGetDeviceQueue, (void**)&original_get_queue);
+    install("vkGetDeviceQueue2", (void*)&hooked_vkGetDeviceQueue2, (void**)&original_get_queue2);
     install("vkDestroySwapchainKHR", (void*)&hooked_vkDestroySwapchainKHR, &orig_vkDestroySwapchainKHR_);
     install("vkDestroyDevice", (void*)&hooked_vkDestroyDevice, &orig_vkDestroyDevice_);
+    install("vkGetDeviceProcAddr", (void*)&hooked_vkGetDeviceProcAddr, (void**)&original_device_proc);
+    install("vkGetInstanceProcAddr", (void*)&hooked_vkGetInstanceProcAddr, (void**)&original_instance_proc);
     if (orig_vkQueuePresentKHR_) {
         vulkan_hooked_ = true;
-        if (!api_detected_) { api_detected_ = true; STAR_LOG("Vulkan hooked"); }
+        if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("Vulkan hooked"); }
     }
-}
-
-void StarOverlay::recover_queue_family()
-{
-    HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkan) return;
-    auto get_queue = (PFN_vkGetDeviceQueue)GetProcAddress(vulkan, "vkGetDeviceQueue");
-    if (!get_queue || vk_queue_family_ != UINT32_MAX || !vk_device_ || !vk_queue_) return;
-    for (uint32_t f = 0; f < 32; f++) {
-        for (uint32_t i = 0; i < 4; i++) {
-            VkQueue q = VK_NULL_HANDLE;
-            get_queue((VkDevice)vk_device_, f, i, &q);
-            if (q == (VkQueue)vk_queue_) { vk_queue_family_ = f; return; }
-        }
-    }
-}
-
-void StarOverlay::recover_physical_device()
-{
-    if (vk_instance_ && vk_physical_device_) return;
-    HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkan) return;
-    auto create_instance = (PFN_vkCreateInstance)orig_vkCreateInstance_;
-    auto enumerate = (PFN_vkEnumeratePhysicalDevices)GetProcAddress(vulkan, "vkEnumeratePhysicalDevices");
-    auto get_props = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)GetProcAddress(vulkan, "vkGetPhysicalDeviceQueueFamilyProperties");
-    if (!create_instance || !enumerate || !get_props) return;
-    VkApplicationInfo app = {};
-    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app.apiVersion = VK_API_VERSION_1_0;
-    VkInstanceCreateInfo ici = {};
-    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    ici.pApplicationInfo = &app;
-    VkInstance inst = VK_NULL_HANDLE;
-    if (create_instance(&ici, nullptr, &inst) != VK_SUCCESS) return;
-    uint32_t count = 0;
-    enumerate(inst, &count, nullptr);
-    std::vector<VkPhysicalDevice> pdevs(count);
-    enumerate(inst, &count, pdevs.data());
-    for (auto pdev : pdevs) {
-        uint32_t fcount = 0;
-        get_props(pdev, &fcount, nullptr);
-        std::vector<VkQueueFamilyProperties> families(fcount);
-        get_props(pdev, &fcount, families.data());
-        for (auto& fam : families) {
-            if (fam.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-                vk_instance_ = inst;
-                vk_physical_device_ = pdev;
-                g_vk_instance = inst;
-                return;
-            }
-        }
-    }
-}
-
-void StarOverlay::recover_vulkan_metadata()
-{
-    recover_queue_family();
-    recover_physical_device();
 }
 
 void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
 {
     if (!enabled_) return;
-    if (game_api_ == GraphicsAPI::None) {
-        game_api_ = GraphicsAPI::Vulkan;
-        STAR_LOG("Game graphics API: Vulkan");
-    }
-    if (mode_ == OverlayMode::External) return;
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
     const auto* pi = static_cast<const VkPresentInfoKHR*>(pPresentInfo);
-    if (!pi || !pi->swapchainCount || !pi->pSwapchains || !pi->pImageIndices) return;
-    // Games that created their Vulkan context before our hooks loaded never
-    // hit vkCreateInstance/vkCreateDevice; adopt the presenting queue so the
-    // swapchain hook can recover the rest.
-    if (!vk_queue_) vk_queue_ = queue;
-    bool metadata_ok = vk_device_ && vk_instance_ && vk_physical_device_ &&
-        vk_width_ && vk_height_ && vk_queue_family_ != UINT32_MAX &&
-        vk_swapchain_ && vk_image_usage_;
-    if (!metadata_ok) {
-        if (vk_swapchain_recreated_) recover_vulkan_metadata();
-        metadata_ok = vk_device_ && vk_instance_ && vk_physical_device_ &&
-            vk_width_ && vk_height_ && vk_queue_family_ != UINT32_MAX &&
-            vk_swapchain_ && vk_image_usage_;
-        if (!metadata_ok) {
-            // Wait for the swapchain hook to fire and recover metadata before
-            // falling back to the external overlay.
-            if (vk_first_missing_tick_ == 0) vk_first_missing_tick_ = GetTickCount();
-            if (GetTickCount() - vk_first_missing_tick_ < 2000) return;
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                STAR_LOG("Vulkan native unavailable: creation metadata missing");
+    if (!pi || pi->swapchainCount != 1 || !pi->pSwapchains || !pi->pImageIndices) return;
+    const uint64_t chain = (uint64_t)pi->pSwapchains[0];
+    auto sc = vulkan_swapchains.find(chain);
+    HWND window = nullptr;
+    if (sc != vulkan_swapchains.end()) {
+        auto surface = vulkan_windows.find(sc->second.surface);
+        if (surface != vulkan_windows.end()) window = surface->second;
+        if (vk_surface_ && vk_surface_ != sc->second.surface) return;
+        if (vk_swapchain_ && vk_swapchain_ != chain &&
+            sc->second.previous != vk_swapchain_) return;
+    } else if (vk_surface_) return; // An unrelated surface cannot trigger fallback.
+    if (vk_queue_ && queue != vk_queue_ && vk_swapchain_ == chain) return;
+    const bool known_surface = window != nullptr;
+    if (!window) window = find_game_window(); // Late injection: detection only, never guessed GPU handles.
+    if (!accept_backend(GraphicsAPI::Vulkan, window)) return;
+    note_present();
+    if (mode_ == OverlayMode::External) return;
+    if (imgui_initialized_ && active_api_ != GraphicsAPI::Vulkan) return;
+    hook_window_for(window);
+    poll_hotkey();
+
+    auto qi = vulkan_queues.find(queue);
+    auto di = sc == vulkan_swapchains.end() ? vulkan_devices.end() : vulkan_devices.find(sc->second.device);
+    if (sc != vulkan_swapchains.end() && (qi == vulkan_queues.end() ||
+        di == vulkan_devices.end() || !di->second.instance)) {
+        if (auto* interfaces = unity_interfaces_.load()) {
+            if (auto* unity = interfaces->Get<IUnityGraphicsVulkan>()) {
+                const auto engine = unity->Instance();
+                if (engine.device == sc->second.device && engine.graphicsQueue == queue &&
+                    engine.instance && engine.physicalDevice) {
+                    vulkan_devices[engine.device] = {engine.physicalDevice, engine.instance};
+                    record_queue(engine.device, engine.queueFamilyIndex, engine.graphicsQueue);
+                    qi = vulkan_queues.find(queue);
+                    di = vulkan_devices.find(engine.device);
+                    STAR_LOG("Vulkan: recovered presenting device and queue from Unity");
+                }
             }
-            if (Settings::get().overlay_mode != "hook") {
-                cleanup_vulkan();
-                mode_ = OverlayMode::External;
-                STAR_LOG("Vulkan: using external overlay for this session (creation metadata unavailable)");
-                start_external_thread();
-            }
-            return;
         }
     }
-    if (!orig_vkDestroySwapchainKHR_ || !orig_vkDestroyDevice_ ||
-        queue != vk_queue_ || pi->swapchainCount != 1 ||
-        (uintptr_t)pi->pSwapchains[0] != (uintptr_t)vk_swapchain_ ||
-        !(vk_image_usage_ & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
-        static bool logged = false;
-        if (!logged) {
-            logged = true;
-            STAR_LOG("Vulkan native unavailable: unsupported queue/swapchain");
-        }
-        if (Settings::get().overlay_mode != "hook") {
+    bool metadata_ok = known_surface && sc != vulkan_swapchains.end() && qi != vulkan_queues.end() &&
+        di != vulkan_devices.end() && di->second.instance && qi->second.graphics &&
+        qi->second.device == sc->second.device && sc->second.width && sc->second.height &&
+        (sc->second.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        orig_vkDestroySwapchainKHR_ && orig_vkDestroyDevice_;
+    if (!metadata_ok) {
+        if (vk_first_missing_tick_ == 0) vk_first_missing_tick_ = GetTickCount();
+        if (GetTickCount() - vk_first_missing_tick_ >= 2000 && Settings::get().overlay_mode != "hook") {
             cleanup_vulkan();
             mode_ = OverlayMode::External;
-            STAR_LOG("Vulkan: using external overlay for this session (unsupported queue/swapchain)");
+            STAR_LOG("Vulkan: using external overlay; presenting device/surface metadata unavailable");
+            STAR_LOG("Vulkan metadata: swapchain=%d queue=%d device=%d instance=%d surface=%d",
+                sc != vulkan_swapchains.end(), qi != vulkan_queues.end(), di != vulkan_devices.end(),
+                di != vulkan_devices.end() && di->second.instance, known_surface);
             start_external_thread();
         }
         return;
     }
-    if (imgui_initialized_ && active_api_ != GraphicsAPI::Vulkan) return;
-    if (vk_swapchain_recreated_ || !imgui_initialized_) {
-        cleanup_vulkan();
-        init_imgui_vulkan(queue, pPresentInfo);
-        vk_swapchain_recreated_ = false;
-    }
-    if (imgui_initialized_ && active_api_ == GraphicsAPI::Vulkan)
-        render_frame_vulkan(queue, pPresentInfo);
+    vk_first_missing_tick_ = 0;
+    bool recreated = vk_swapchain_ != chain;
+    if (recreated) cleanup_vulkan();
+    vk_device_ = sc->second.device;
+    vk_physical_device_ = di->second.physical;
+    vk_instance_ = di->second.instance;
+    g_vk_instance = (VkInstance)vk_instance_;
+    vk_queue_ = queue;
+    vk_queue_family_ = qi->second.family;
+    vk_surface_ = sc->second.surface;
+    vk_swapchain_ = chain;
+    vk_swapchain_format_ = sc->second.format;
+    vk_min_image_count_ = sc->second.count;
+    vk_width_ = sc->second.width;
+    vk_height_ = sc->second.height;
+    vk_image_usage_ = sc->second.usage;
+    if (!imgui_initialized_) init_imgui_vulkan(queue, pPresentInfo);
+    if (imgui_initialized_) render_frame_vulkan(queue, pPresentInfo);
 }
 
 void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 {
     HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkan) return;
+    if (!vulkan) { STAR_LOG("Vulkan reinit: vulkan-1.dll not loaded"); return; }
 
-    if (!resolve_vulkan_funcs(vulkan)) return;
+    if (!resolve_vulkan_funcs(vulkan)) { STAR_LOG("Vulkan reinit: resolve_vulkan_funcs failed"); return; }
 
     auto owner = std::make_unique<VulkanOverlayData>();
     auto* data = owner.get();
@@ -549,7 +601,9 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     rp_info.pDependencies = &dependency;
 
     auto& rp = data->render_pass;
-    if (vkCreateRenderPass((VkDevice)vk_device_, &rp_info, nullptr, &rp) != VK_SUCCESS) return;
+    if (vkCreateRenderPass((VkDevice)vk_device_, &rp_info, nullptr, &rp) != VK_SUCCESS) {
+        STAR_LOG("Vulkan reinit: vkCreateRenderPass failed"); return;
+    }
 
     VkDescriptorPoolSize pool_sizes[] = {
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 257 }
@@ -563,6 +617,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 
     auto& dp = data->descriptor_pool;
     if (vkCreateDescriptorPool((VkDevice)vk_device_, &pool_info, nullptr, &dp) != VK_SUCCESS) {
+        STAR_LOG("Vulkan reinit: vkCreateDescriptorPool failed");
         return;
     }
 
@@ -570,9 +625,13 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     VkSwapchainKHR swapchain = pi->pSwapchains[0];
 
     uint32_t count = 0;
-    if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, nullptr) != VK_SUCCESS || count < 2) return;
+    if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, nullptr) != VK_SUCCESS || count < 2) {
+        STAR_LOG("Vulkan reinit: vkGetSwapchainImagesKHR failed count=%u", count); return;
+    }
     std::vector<VkImage> images(count);
-    if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, images.data()) != VK_SUCCESS) return;
+    if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, images.data()) != VK_SUCCESS) {
+        STAR_LOG("Vulkan reinit: vkGetSwapchainImagesKHR(images) failed"); return;
+    }
     data->swapchain = swapchain;
     data->image_count = count;
 
@@ -581,7 +640,8 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     auto& views = data->image_views;
     auto& fbs = data->framebuffers;
 
-    hook_window_for(find_game_window());
+    hook_window_for(game_window_);
+    if (!hwnd_) { STAR_LOG("Vulkan reinit: no game window found"); return; }
     uint32_t w = vk_width_, h = vk_height_;
 
     for (uint32_t i = 0; i < count; i++) {
@@ -600,7 +660,9 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         view_info.subresourceRange.baseArrayLayer = 0;
         view_info.subresourceRange.layerCount = 1;
 
-        if (vkCreateImageView((VkDevice)vk_device_, &view_info, nullptr, &views[i]) != VK_SUCCESS) return;
+        if (vkCreateImageView((VkDevice)vk_device_, &view_info, nullptr, &views[i]) != VK_SUCCESS) {
+            STAR_LOG("Vulkan reinit: vkCreateImageView failed i=%u", i); return;
+        }
 
         VkFramebufferCreateInfo fb_info = {};
         fb_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -611,7 +673,9 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         fb_info.height = h;
         fb_info.layers = 1;
 
-        if (vkCreateFramebuffer((VkDevice)vk_device_, &fb_info, nullptr, &fbs[i]) != VK_SUCCESS) return;
+        if (vkCreateFramebuffer((VkDevice)vk_device_, &fb_info, nullptr, &fbs[i]) != VK_SUCCESS) {
+            STAR_LOG("Vulkan reinit: vkCreateFramebuffer failed i=%u", i); return;
+        }
     }
 
     VkCommandPoolCreateInfo cp_info = {};
@@ -620,7 +684,9 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     cp_info.queueFamilyIndex = vk_queue_family_;
 
     auto& cp = data->command_pool;
-    if (vkCreateCommandPool((VkDevice)vk_device_, &cp_info, nullptr, &cp) != VK_SUCCESS) return;
+    if (vkCreateCommandPool((VkDevice)vk_device_, &cp_info, nullptr, &cp) != VK_SUCCESS) {
+        STAR_LOG("Vulkan reinit: vkCreateCommandPool failed"); return;
+    }
 
     data->command_buffers.resize(count);
     auto& cbs = data->command_buffers;
@@ -630,6 +696,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cb_info.commandBufferCount = count;
     if (vkAllocateCommandBuffers((VkDevice)vk_device_, &cb_info, cbs.data()) != VK_SUCCESS) {
+        STAR_LOG("Vulkan reinit: vkAllocateCommandBuffers failed");
         cbs.clear(); return;
     }
     data->fences.resize(count);
@@ -639,14 +706,20 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     VkSemaphoreCreateInfo sem_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < count; ++i) {
         if (vkCreateFence(data->device, &fence_info, nullptr, &data->fences[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(data->device, &sem_info, nullptr, &data->present_ready[i]) != VK_SUCCESS) return;
+            vkCreateSemaphore(data->device, &sem_info, nullptr, &data->present_ready[i]) != VK_SUCCESS) {
+            STAR_LOG("Vulkan reinit: vkCreateFence/Semaphore failed i=%u", i); return;
+        }
     }
 
     ImGui::CreateContext();
-    if (!ImGui_ImplWin32_Init(hwnd_)) { ImGui::DestroyContext(); return; }
+    if (!ImGui_ImplWin32_Init(hwnd_)) {
+        STAR_LOG("Vulkan reinit: ImGui_ImplWin32_Init failed hwnd=%p", (void*)hwnd_);
+        ImGui::DestroyContext(); return;
+    }
     hook_window();
 
     if (!ImGui_ImplVulkan_LoadFunctions(&ImGuiVulkanLoader, vulkan)) {
+        STAR_LOG("Vulkan reinit: ImGui_ImplVulkan_LoadFunctions failed");
         ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); return;
     }
 
@@ -682,6 +755,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         vk_data_ = owner.release();
         STAR_LOG("ImGui ready (Vulkan native) images=%u extent=%ux%u", count, w, h);
     } else {
+        STAR_LOG("Vulkan reinit: ImGui_ImplVulkan_Init failed");
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
     }
@@ -1112,7 +1186,7 @@ void StarOverlay::cleanup_vulkan()
         ImGui::DestroyContext();
         imgui_initialized_ = false;
         active_api_ = GraphicsAPI::None;
-        icons_.clear();
+        icons_.clear(); screenshot_icons_.clear(); viewer_icon_.clear();
     }
     delete data;
     vk_data_ = nullptr;

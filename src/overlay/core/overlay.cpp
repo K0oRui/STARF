@@ -15,6 +15,7 @@
 #include <d3d9.h>
 #include <d3d10.h>
 #include <algorithm>
+#include <chrono>
 
 StarOverlay* g_overlay = nullptr;
 
@@ -165,14 +166,93 @@ void StarOverlay::init()
 
     // Retry late-loaded gfx modules (game loads d3d12/vulkan/opengl AFTER SteamAPI_Init).
     retry_stop_ = false;
-    std::thread([this]() {
-        for (int i = 0; i < 30; i++) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+    retry_thread_ = std::thread([this]() {
+        std::unique_lock<std::mutex> lock(retry_mutex_);
+        while (!retry_stop_.load()) {
+            retry_cv_.wait_for(lock, std::chrono::seconds(1));
             if (retry_stop_.load() || !g_overlay) break;
-            if (api_detected_) break;
+            if (game_api_ != GraphicsAPI::None) break;
+            lock.unlock();
             ensure_hooks();
+            lock.lock();
         }
-    }).detach();
+    });
+}
+
+bool StarOverlay::accept_backend(GraphicsAPI api, HWND window)
+{
+    if (!enabled_ || !window || window == ext_hwnd_ || !IsWindowVisible(window)) return false;
+    if (game_api_ != GraphicsAPI::None && game_api_ != api) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    RECT client{};
+    if (pid != GetCurrentProcessId() || !GetClientRect(window, &client) ||
+        client.right < 50 || client.bottom < 50) return false;
+    if (game_window_ && IsWindow(game_window_) && IsWindowVisible(game_window_) &&
+        window != game_window_) return false;
+    if (window != game_window_ && GetAncestor(window, GA_ROOT) != find_game_window()) return false;
+    GraphicsAPI previous = game_api_;
+    if (!game_api_.accept(api, (uintptr_t)window, GetTickCount64())) return false;
+    game_window_ = window;
+    if (previous == GraphicsAPI::None) {
+        const char* names[] = {"None", "DirectX 7", "DirectX 8", "DirectX 9", "DirectX 10",
+            "DirectX 11", "DirectX 12", "OpenGL", "Vulkan", "GDI"};
+        STAR_LOG("Game graphics API locked: %s hwnd=%p", names[(int)api], window);
+    }
+    return true;
+}
+
+// Renderer resources can be rebuilt; the game's API selection cannot change.
+// All callers hold render_mutex_.
+void StarOverlay::shutdown_renderer()
+{
+#ifdef _WIN64
+    if (active_api_ == GraphicsAPI::DX12 && !wait_dx12_idle()) retire_dx12_renderer();
+#endif
+    if (active_api_ == GraphicsAPI::Vulkan) {
+        cleanup_vulkan();
+    } else {
+#ifdef _WIN64
+        if (active_api_ == GraphicsAPI::DX12) icons_.clear();
+#endif
+        else icons_.release_all([this](ImTextureID texture) { release_icon(texture); });
+        if (imgui_initialized_) {
+            switch (active_api_) {
+            case GraphicsAPI::DX7: ImGui_ImplDX7_Shutdown(); break;
+            case GraphicsAPI::DX8: ImGui_ImplDX8_Shutdown(); break;
+            case GraphicsAPI::DX9: ImGui_ImplDX9_Shutdown(); break;
+            case GraphicsAPI::DX10: ImGui_ImplDX10_Shutdown(); break;
+            case GraphicsAPI::DX11:
+            case GraphicsAPI::GDI: ImGui_ImplDX11_Shutdown(); break;
+#ifdef _WIN64
+            case GraphicsAPI::DX12: ImGui_ImplDX12_Shutdown(); break;
+#endif
+            case GraphicsAPI::OpenGL: shutdown_opengl(); break;
+            default: break;
+            }
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+        }
+    }
+    imgui_initialized_ = false;
+    active_api_ = GraphicsAPI::None;
+    cleanup_rtv();
+    cleanup_dx10_rtv();
+#ifdef _WIN64
+    cleanup_dx12();
+#endif
+    gdi_.reset();
+    icons_.clear(); screenshot_icons_.clear(); viewer_icon_.clear();
+    external_draw_snapshot_.clear();
+    if (context_) { context_->Release(); context_ = nullptr; }
+    if (device_) { device_->Release(); device_ = nullptr; }
+    if (dx10_device_) { dx10_device_->Release(); dx10_device_ = nullptr; }
+    dx7_device_ = nullptr;
+    dx8_device_ = nullptr;
+    dx9_device_ = nullptr;
+    dxgi_chain_ = nullptr;
+    gl_context_ = nullptr;
+    gl_dc_ = nullptr;
 }
 
 void StarOverlay::start_external_thread()
@@ -225,9 +305,6 @@ void StarOverlay::ensure_hooks()
     if (!opengl_hooked_) hook_opengl();
     if (!vulkan_hooked_) hook_vulkan();
     if (!gdi_hooked_) hook_gdi();
-#ifdef _WIN64
-    hook_dx12_ecl();
-#endif
 }
 
 uint64_t StarOverlay::total_playtime_sec() const
@@ -273,6 +350,15 @@ std::string StarOverlay::format_playtime(uint64_t secs)
 
 void StarOverlay::shutdown()
 {
+    bool was_enabled = enabled_.exchange(false);
+    if (gdi_message_hook_) {
+        UnhookWindowsHookEx(gdi_message_hook_);
+        gdi_message_hook_ = nullptr;
+        gdi_message_thread_ = 0;
+    }
+    retry_stop_ = true;
+    retry_cv_.notify_all();
+    if (retry_thread_.joinable()) retry_thread_.join();
     screenshots_.stop();
     // A retry session that survived without falling back again means the
     // hostile title healed: clear the backoff so future launches use hooks.
@@ -301,9 +387,7 @@ void StarOverlay::shutdown()
     }
     // Persist playtime even on early shutdown paths.
     Storage::get().save_playtime(total_playtime_sec());
-    bool was_enabled = enabled_;
     std::lock_guard<std::mutex> lock(render_mutex_);
-    GraphicsAPI api_snapshot = active_api_;
 
     while (cursor_show_count_offset_ > 0) {
         if (orig_show_cursor_) orig_show_cursor_(FALSE); else ShowCursor(FALSE);
@@ -319,67 +403,8 @@ void StarOverlay::shutdown()
         wnd_proc_orig_ = nullptr;
     }
 
-    if (active_api_ == GraphicsAPI::Vulkan) cleanup_vulkan();
-
-    if (imgui_initialized_) {
-        if (active_api_ == GraphicsAPI::DX11) {
-            ImGui_ImplDX11_Shutdown();
-        } else if (active_api_ == GraphicsAPI::DX10) {
-            ImGui_ImplDX10_Shutdown();
-#ifdef _WIN64
-        } else if (active_api_ == GraphicsAPI::DX12) {
-            wait_dx12_idle();
-            ImGui_ImplDX12_Shutdown();
-#endif
-        } else if (active_api_ == GraphicsAPI::DX9) {
-            ImGui_ImplDX9_Shutdown();
-        } else if (active_api_ == GraphicsAPI::DX8) {
-            ImGui_ImplDX8_Shutdown();
-        } else if (active_api_ == GraphicsAPI::DX7) {
-            ImGui_ImplDX7_Shutdown();
-        } else if (active_api_ == GraphicsAPI::OpenGL) {
-            ImGui_ImplOpenGL3_Shutdown();
-        } else if (active_api_ == GraphicsAPI::Vulkan) {
-            ImGui_ImplVulkan_Shutdown();
-        } else if (active_api_ == GraphicsAPI::GDI) {
-            ImGui_ImplDX11_Shutdown();
-        }
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        imgui_initialized_ = false;
-        active_api_ = GraphicsAPI::None;
-    }
-
-    cleanup_rtv();
-    cleanup_dx10_rtv();
-#ifdef _WIN64
-    cleanup_dx12();
-#endif
+    shutdown_renderer();
     cleanup_vulkan();
-    gdi_.reset();
-
-    if (api_snapshot == GraphicsAPI::DX11) {
-        icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
-    } else if (api_snapshot == GraphicsAPI::DX10) {
-        icons_.release_all([](ImTextureID v) { ((ID3D10ShaderResourceView*)v)->Release(); });
-    } else if (api_snapshot == GraphicsAPI::DX9) {
-        // MANAGED-pool IDirect3DTexture9* icons.
-        icons_.release_all([](ImTextureID v) { ((IDirect3DTexture9*)v)->Release(); });
-        dx9_device_ = nullptr;
-    } else if (api_snapshot == GraphicsAPI::DX8) {
-        release_icons_dx8();
-    } else if (api_snapshot == GraphicsAPI::DX7) {
-        release_icons_dx7();
-    } else if (api_snapshot == GraphicsAPI::GDI) {
-        icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
-    }
-    // OpenGL icon textures belong to the game's GL context, which may be gone
-    // at shutdown; the OS/driver reclaims them with the context.
-    icons_.clear();
-    screenshot_icons_.clear(); viewer_icon_.clear();
-    if (context_) { context_->Release(); context_ = nullptr; }
-    if (device_)  { device_->Release();  device_  = nullptr; }
-    if (dx10_device_) { dx10_device_->Release(); dx10_device_ = nullptr; }
     hooks_installed_ = false;
     // NOTE: do NOT MH_DisableHook(MH_ALL_HOOKS)/Remove/Uninitialize here.
     // MinHook is shared with integrity hooks (STAR_install_integrity_hooks).

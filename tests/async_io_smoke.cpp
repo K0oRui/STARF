@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "core/storage.h"
 #include "core/settings.h"
 #include "core/callbacks.h"
@@ -7,8 +10,13 @@
 #include "overlay/overlay.h"
 #include "overlay/capture/screenshot_service.h"
 #include <cassert>
-#include <filesystem>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <vector>
 
 void STAR_WriteLog(const char*, ...) {}
 Settings& Settings::get() { static Settings settings; return settings; }

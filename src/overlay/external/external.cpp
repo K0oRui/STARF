@@ -10,6 +10,9 @@
 #include "imgui_impl_dx9.h"
 #include <d3d9.h>
 #include <d3d11.h>
+#ifdef _WIN64
+#include "overlay/backends/dx12_submission.h"
+#endif
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -97,13 +100,15 @@ bool StarOverlay::external_create_window(int x, int y, int w, int h)
         STAR_LOG("External: CreateWindowEx failed err=%lu", (unsigned long)GetLastError());
         return false;
     }
-    ext_w_ = w;
-    ext_h_ = h;
     return true;
 }
 
 void StarOverlay::external_free_surfaces()
 {
+    cleanup_rtv();
+    ext_w_ = ext_h_ = 0;
+    external_draw_snapshot_.clear();
+    ext_prev_.clear();
     ext_pixels_.reset();
     if (ext_d3d9_sys_) { ext_d3d9_sys_->Release(); ext_d3d9_sys_ = nullptr; }
     if (ext_d3d9_rt_) { ext_d3d9_rt_->Release(); ext_d3d9_rt_ = nullptr; }
@@ -154,11 +159,18 @@ bool StarOverlay::external_alloc_surfaces(int w, int h)
         external_free_surfaces();
         return false;
     }
+    // These dimensions describe the allocated buffers, not the tracked window.
+    ext_w_ = w;
+    ext_h_ = h;
+    STAR_LOG("External: surfaces ready (%dx%d)", w, h);
     return true;
 }
 
 bool StarOverlay::external_create_device()
 {
+    RECT rc{};
+    GetClientRect(ext_hwnd_, &rc);
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
     // Match the game's API when known: DX9 games get a D3D9 overlay window
     // (lighter on old machines). Everything else uses D3D11 with feature
     // level fallback (11_0 -> 9_3, then WARP software rendering).
@@ -182,7 +194,7 @@ bool StarOverlay::external_create_device()
             if (SUCCEEDED(hr) && dev) {
                 ext_use_d3d9_ = true;
                 ext_d3d9_dev_ = dev;
-                if (!external_alloc_surfaces(ext_w_, ext_h_)) {
+                if (!external_alloc_surfaces(w, h)) {
                     STAR_LOG("External: D3D9 surface alloc failed");
                     dev->Release(); ext_d3d9_dev_ = nullptr;
                     ext_use_d3d9_ = false;
@@ -217,7 +229,7 @@ bool StarOverlay::external_create_device()
     }
     device_ = dev;
     context_ = ctx;
-    if (!external_alloc_surfaces(ext_w_, ext_h_)) {
+    if (!external_alloc_surfaces(w, h)) {
         STAR_LOG("External: surface alloc failed");
         context_->Release(); context_ = nullptr;
         device_->Release(); device_ = nullptr;
@@ -228,7 +240,9 @@ bool StarOverlay::external_create_device()
 
 void StarOverlay::external_track_game_window()
 {
-    HWND game = find_game_window();
+    std::lock_guard<std::mutex> lock(render_mutex_);
+    HWND game = IsWindow(game_window_) ? game_window_ :
+        (game_api_ == GraphicsAPI::None ? find_game_window() : nullptr);
     ext_game_hwnd_ = game;
     {
         static HWND logged_game = nullptr;
@@ -265,10 +279,6 @@ void StarOverlay::external_track_game_window()
     SetWindowPos(ext_hwnd_, HWND_TOPMOST, rc.left, rc.top, w, h,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
     ext_visible_ = true;
-    if (w != ext_w_ || h != ext_h_) {
-        ext_w_ = w;
-        ext_h_ = h;
-    }
 }
 
 void StarOverlay::external_cursor_open()
@@ -334,6 +344,9 @@ void StarOverlay::external_render_frame()
 {
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
+#ifdef _WIN64
+    star_dx12::reap_submissions();
+#endif
     // Click-through state lives here (not below the surface checks) so a
     // bailed frame can never leave an invisible window swallowing the mouse.
     {
@@ -346,23 +359,20 @@ void StarOverlay::external_render_frame()
             SetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE, ex);
         }
     }
-    if (!imgui_initialized_ || !ext_pixels_.bits()) return;
+    if (!imgui_initialized_) return;
     if (ext_use_d3d9_) {
-        if (!ext_d3d9_dev_ || !ext_d3d9_rt_ || !ext_d3d9_sys_) return;
+        if (!ext_d3d9_dev_) return;
     } else {
-        if (!device_ || !context_ || !ext_rt_tex_) return;
+        if (!device_ || !context_) return;
     }
 
     RECT rc{};
     GetClientRect(ext_hwnd_, &rc);
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
     if (w != ext_w_ || h != ext_h_) {
-        cleanup_rtv();
         if (!external_alloc_surfaces(w, h)) return;
-        external_draw_snapshot_.clear();
-        ext_w_ = w;
-        ext_h_ = h;
     }
 
     if (ext_use_d3d9_) {
@@ -499,6 +509,8 @@ void StarOverlay::external_thread_proc()
     // D3D11. The present hooks sniff the API even in external mode.
     for (int i = 0; i < 30 && game_api_ == GraphicsAPI::None; i++)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::unique_lock<std::mutex> renderer_lock(render_mutex_);
+    shutdown_renderer();
     if (!external_create_device()) {
         STAR_LOG("External overlay: device failed, giving up");
         DestroyWindow(ext_hwnd_);
@@ -533,6 +545,8 @@ void StarOverlay::external_thread_proc()
     }
     imgui_initialized_ = true;
     active_api_ = ext_use_d3d9_ ? GraphicsAPI::DX9 : GraphicsAPI::DX11;
+    if (ext_use_d3d9_) dx9_device_ = ext_d3d9_dev_;
+    renderer_lock.unlock();
     ext_visible_ = false;
     ShowWindow(ext_hwnd_, SW_HIDE);
     STAR_LOG("External overlay ready (%dx%d, %s)", ext_w_, ext_h_,
@@ -551,7 +565,10 @@ void StarOverlay::external_thread_proc()
         }
         if (ext_stop_.load()) break;
 
-        poll_hotkey(); // single poller in this mode (no present hooks)
+        {
+            std::lock_guard<std::mutex> lock(render_mutex_);
+            poll_hotkey(); // Game callbacks only detect/count presents in external mode.
+        }
 
         // Screenshots have no present hook to ride on here: consume directly.
         // Duplication never touches game state, so this is always safe.
@@ -585,23 +602,10 @@ void StarOverlay::external_thread_proc()
         }
     }
 
-    if (imgui_initialized_) {
-        if (ext_use_d3d9_) ImGui_ImplDX9_Shutdown();
-        else ImGui_ImplDX11_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        imgui_initialized_ = false;
-        active_api_ = GraphicsAPI::None;
-    }
-    cleanup_rtv();
-    icons_.release_all([](ImTextureID v) { ((ID3D11ShaderResourceView*)v)->Release(); });
-    if (ext_use_d3d9_) {
-        if (ext_d3d9_dev_) { ext_d3d9_dev_->Release(); ext_d3d9_dev_ = nullptr; }
-        ext_use_d3d9_ = false;
-    } else {
-        if (context_) { context_->Release(); context_ = nullptr; }
-        if (device_) { device_->Release(); device_ = nullptr; }
-    }
+    renderer_lock.lock();
+    shutdown_renderer();
+    if (ext_d3d9_dev_) { ext_d3d9_dev_->Release(); ext_d3d9_dev_ = nullptr; }
+    ext_use_d3d9_ = false;
     external_free_surfaces();
     if (ext_cur_init_) external_cursor_close(); // never leave the OS cursor parked hidden
     if (ext_hwnd_) { DestroyWindow(ext_hwnd_); ext_hwnd_ = nullptr; }
