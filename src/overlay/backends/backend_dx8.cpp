@@ -57,7 +57,7 @@ HRESULT STDMETHODCALLTYPE StarOverlay::hooked_D3D8CreateDevice(IDirect3D8* d3d, 
         }
         if (g_overlay->orig_dx8_present_) {
             g_overlay->dx8_hooked_ = true;
-            if (!g_overlay->any_graphics_hook_installed_) { g_overlay->any_graphics_hook_installed_ = true; STAR_LOG("DX8 hooked"); }
+            STAR_LOG("DX8 hooked");
         }
     }
     return hr;
@@ -82,7 +82,7 @@ void StarOverlay::hook_dx8()
 
 void StarOverlay::on_present_dx8(IDirect3DDevice8* device, HWND window)
 {
-    if (!enabled_ || !device) return;
+    if (!enabled_ || !device || !backend_mine({GraphicsAPI::DX8})) return;
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
     D3DDEVICE_CREATION_PARAMETERS cp{};
@@ -91,6 +91,7 @@ void StarOverlay::on_present_dx8(IDirect3DDevice8* device, HWND window)
     if (!accept_backend(GraphicsAPI::DX8, window)) return;
     note_present();
     if (mode_ == OverlayMode::External) return;
+    if (migrate_if_tiny_frame(window)) return;
     poll_hotkey();
     if (imgui_initialized_ && active_api_ != GraphicsAPI::DX8) return;
     if (imgui_initialized_ && dx8_device_ != device) shutdown_renderer();
@@ -177,17 +178,29 @@ void StarOverlay::maybe_capture_dx8(IDirect3DDevice8* device)
     if (FAILED(device->GetRenderTarget(&rt)) || !rt) return;
     D3DSURFACE_DESC desc{};
     rt->GetDesc(&desc);
+    // CopyRects performs no format conversion, so the scratch surface must
+    // match the render target format exactly. The old code hardcoded
+    // A8R8G8B8, which fails for the most common DX8 target (X8R8G8B8) and
+    // made every screenshot fall into a broken front-buffer path.
     IDirect3DSurface8* sys = nullptr;
-    HRESULT hr = device->CreateImageSurface(desc.Width, desc.Height, D3DFMT_A8R8G8B8, &sys);
+    HRESULT hr = device->CreateImageSurface(desc.Width, desc.Height, desc.Format, &sys);
     if (SUCCEEDED(hr) && sys) hr = device->CopyRects(rt, nullptr, 0, sys, nullptr);
-    if (FAILED(hr) && sys) {
-        // Multisampled render target: fall back to the front buffer (which
-        // must be created in the display mode format).
-        sys->Release(); sys = nullptr;
+    UINT cap_w = desc.Width, cap_h = desc.Height;
+    D3DFORMAT cap_fmt = desc.Format;
+    if (FAILED(hr)) {
+        // Multisampled render target: fall back to the front buffer, which
+        // must be sized/formatted like the display mode (not the backbuffer).
+        if (sys) { sys->Release(); sys = nullptr; }
         D3DDISPLAYMODE mode{};
-        if (SUCCEEDED(device->GetDisplayMode(&mode)) &&
-            SUCCEEDED(device->CreateImageSurface(desc.Width, desc.Height, mode.Format, &sys)) && sys)
-            hr = device->GetFrontBuffer(sys);
+        if (SUCCEEDED(device->GetDisplayMode(&mode)) && mode.Width && mode.Height &&
+            SUCCEEDED(device->CreateImageSurface(mode.Width, mode.Height, mode.Format, &sys)) && sys &&
+            SUCCEEDED(device->GetFrontBuffer(sys))) {
+            hr = S_OK;
+            cap_w = mode.Width; cap_h = mode.Height; cap_fmt = mode.Format;
+        } else {
+            hr = E_FAIL;
+            if (sys) { sys->Release(); sys = nullptr; }
+        }
     }
     rt->Release();
     if (FAILED(hr) || !sys) {
@@ -197,14 +210,31 @@ void StarOverlay::maybe_capture_dx8(IDirect3DDevice8* device)
     }
     D3DLOCKED_RECT lr{};
     if (SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
-        std::vector<uint8_t> rgba((size_t)desc.Width * desc.Height * 4);
-        D3DSURFACE_DESC sdesc{};
-        sys->GetDesc(&sdesc);
-        if (sdesc.Format == D3DFMT_R5G6B5) {
-            for (UINT y = 0; y < desc.Height; y++) {
+        std::vector<uint8_t> rgba((size_t)cap_w * cap_h * 4);
+        bool converted = true;
+        switch (cap_fmt) {
+        case D3DFMT_A8R8G8B8:
+        case D3DFMT_X8R8G8B8:
+            copy_pixels32(rgba.data(), (size_t)cap_w * 4, lr.pBits, lr.Pitch,
+                          cap_w, cap_h, true);
+            break;
+        case D3DFMT_R8G8B8: {
+            // 24-bit, BGR byte order, rows padded to Pitch.
+            for (UINT y = 0; y < cap_h; y++) {
+                const uint8_t* s = (const uint8_t*)lr.pBits + (size_t)y * lr.Pitch;
+                uint8_t* d = rgba.data() + (size_t)y * cap_w * 4;
+                for (UINT x = 0; x < cap_w; x++) {
+                    d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = 255;
+                    s += 3; d += 4;
+                }
+            }
+            break;
+        }
+        case D3DFMT_R5G6B5:
+            for (UINT y = 0; y < cap_h; y++) {
                 const uint16_t* s = (const uint16_t*)((const uint8_t*)lr.pBits + (size_t)y * lr.Pitch);
-                uint8_t* d = rgba.data() + (size_t)y * desc.Width * 4;
-                for (UINT x = 0; x < desc.Width; x++) {
+                uint8_t* d = rgba.data() + (size_t)y * cap_w * 4;
+                for (UINT x = 0; x < cap_w; x++) {
                     uint16_t p = s[x];
                     d[0] = (uint8_t)(((p >> 11) & 0x1F) * 255 / 31);
                     d[1] = (uint8_t)(((p >> 5) & 0x3F) * 255 / 63);
@@ -213,13 +243,47 @@ void StarOverlay::maybe_capture_dx8(IDirect3DDevice8* device)
                     d += 4;
                 }
             }
-        } else {
-            copy_pixels32(rgba.data(), (size_t)desc.Width * 4, lr.pBits, lr.Pitch,
-                          desc.Width, desc.Height, true);
+            break;
+        case D3DFMT_X1R5G5B5:
+        case D3DFMT_A1R5G5B5:
+            for (UINT y = 0; y < cap_h; y++) {
+                const uint16_t* s = (const uint16_t*)((const uint8_t*)lr.pBits + (size_t)y * lr.Pitch);
+                uint8_t* d = rgba.data() + (size_t)y * cap_w * 4;
+                for (UINT x = 0; x < cap_w; x++) {
+                    uint16_t p = s[x];
+                    d[0] = (uint8_t)(((p >> 10) & 0x1F) * 255 / 31);
+                    d[1] = (uint8_t)(((p >> 5) & 0x1F) * 255 / 31);
+                    d[2] = (uint8_t)((p & 0x1F) * 255 / 31);
+                    d[3] = 255;
+                    d += 4;
+                }
+            }
+            break;
+        case D3DFMT_A4R4G4B4:
+        case D3DFMT_X4R4G4B4:
+            for (UINT y = 0; y < cap_h; y++) {
+                const uint16_t* s = (const uint16_t*)((const uint8_t*)lr.pBits + (size_t)y * lr.Pitch);
+                uint8_t* d = rgba.data() + (size_t)y * cap_w * 4;
+                for (UINT x = 0; x < cap_w; x++) {
+                    uint16_t p = s[x];
+                    d[0] = (uint8_t)(((p >> 8) & 0xF) * 255 / 15);
+                    d[1] = (uint8_t)(((p >> 4) & 0xF) * 255 / 15);
+                    d[2] = (uint8_t)((p & 0xF) * 255 / 15);
+                    d[3] = 255;
+                    d += 4;
+                }
+            }
+            break;
+        default:
+            STAR_LOG("Screenshot: DX8 unsupported format %d", (int)cap_fmt);
+            converted = false;
+            break;
         }
         sys->UnlockRect();
-        std::string path = ScreenshotService::next_path();
-        screenshots_.save_async(path, std::move(rgba), (int)desc.Width, (int)desc.Height);
+        if (converted) {
+            std::string path = ScreenshotService::next_path();
+            screenshots_.save_async(path, std::move(rgba), (int)cap_w, (int)cap_h);
+        }
     }
     sys->Release();
 }

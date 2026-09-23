@@ -23,7 +23,7 @@ void StarOverlay::hook_opengl()
         if (s == MH_OK) {
             MH_EnableHook(pSwapBuffers);
             opengl_hooked_ = true;
-            if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("OpenGL hooked"); }
+            STAR_LOG("OpenGL hooked");
         }
     }
     void* pDeleteContext = (void*)GetProcAddress(opengl_dll, "wglDeleteContext");
@@ -68,12 +68,13 @@ void StarOverlay::shutdown_opengl()
 
 void StarOverlay::on_present_opengl(HDC hdc)
 {
-    if (!enabled_ || !wglGetCurrentContext() || wglGetCurrentDC() != hdc) return;
+    if (!enabled_ || !wglGetCurrentContext() || wglGetCurrentDC() != hdc || !backend_mine({GraphicsAPI::OpenGL})) return;
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock() || !accept_backend(GraphicsAPI::OpenGL, WindowFromDC(hdc))) return;
     if (gl_context_ && gl_context_ != wglGetCurrentContext()) return;
     note_present();
     if (mode_ == OverlayMode::External) return;
+    if (migrate_if_tiny_frame(WindowFromDC(hdc))) return;
     if (imgui_initialized_ && active_api_ != GraphicsAPI::OpenGL) return;
     hook_window_for(WindowFromDC(hdc));
     poll_hotkey();

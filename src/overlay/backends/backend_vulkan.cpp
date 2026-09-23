@@ -420,30 +420,6 @@ void StarOverlay::hook_vulkan()
     if (!vulkan) vulkan = LoadLibraryA("vulkan-1.dll");
     if (!vulkan) return;
 
-    void* pCreateInstance = (void*)GetProcAddress(vulkan, "vkCreateInstance");
-    void* pCreateDevice = (void*)GetProcAddress(vulkan, "vkCreateDevice");
-    void* pQueuePresent = (void*)GetProcAddress(vulkan, "vkQueuePresentKHR");
-    void* pCreateSwapchain = (void*)GetProcAddress(vulkan, "vkCreateSwapchainKHR");
-
-    if (pCreateInstance && !orig_vkCreateInstance_) {
-        if (MH_CreateHook(pCreateInstance, &hooked_vkCreateInstance, (void**)&orig_vkCreateInstance_) == MH_OK)
-            MH_EnableHook(pCreateInstance);
-    }
-    if (pCreateDevice && !orig_vkCreateDevice_) {
-        if (MH_CreateHook(pCreateDevice, &hooked_vkCreateDevice, (void**)&orig_vkCreateDevice_) == MH_OK)
-            MH_EnableHook(pCreateDevice);
-    }
-    if (pQueuePresent && !orig_vkQueuePresentKHR_) {
-        if (MH_CreateHook(pQueuePresent, &hooked_vkQueuePresentKHR, (void**)&orig_vkQueuePresentKHR_) == MH_OK) {
-            MH_EnableHook(pQueuePresent);
-        }
-    }
-    // Loader export: catches swapchain recreates even when vkCreateDevice was missed.
-    if (pCreateSwapchain && !orig_vkCreateSwapchainKHR_) {
-        if (MH_CreateHook(pCreateSwapchain, &hooked_vkCreateSwapchainKHR, (void**)&orig_vkCreateSwapchainKHR_) == MH_OK) {
-            MH_EnableHook(pCreateSwapchain);
-        }
-    }
     auto install = [&](const char* name, void* detour, void** original) {
         if (*original) return;
         void* target = (void*)GetProcAddress(vulkan, name);
@@ -453,6 +429,11 @@ void StarOverlay::hook_vulkan()
             *original = nullptr;
         }
     };
+    install("vkCreateInstance", (void*)&hooked_vkCreateInstance, (void**)&orig_vkCreateInstance_);
+    install("vkCreateDevice", (void*)&hooked_vkCreateDevice, (void**)&orig_vkCreateDevice_);
+    install("vkQueuePresentKHR", (void*)&hooked_vkQueuePresentKHR, (void**)&orig_vkQueuePresentKHR_);
+    // Loader export: catches swapchain recreates even when vkCreateDevice was missed.
+    install("vkCreateSwapchainKHR", (void*)&hooked_vkCreateSwapchainKHR, (void**)&orig_vkCreateSwapchainKHR_);
     install("vkEnumeratePhysicalDevices", (void*)&hooked_vkEnumeratePhysicalDevices, (void**)&original_enumerate);
     install("vkCreateWin32SurfaceKHR", (void*)&hooked_vkCreateWin32SurfaceKHR, (void**)&original_surface);
     install("vkDestroySurfaceKHR", (void*)&hooked_vkDestroySurfaceKHR, (void**)&original_destroy_surface);
@@ -464,13 +445,13 @@ void StarOverlay::hook_vulkan()
     install("vkGetInstanceProcAddr", (void*)&hooked_vkGetInstanceProcAddr, (void**)&original_instance_proc);
     if (orig_vkQueuePresentKHR_) {
         vulkan_hooked_ = true;
-        if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("Vulkan hooked"); }
+        STAR_LOG("Vulkan hooked");
     }
 }
 
 void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
 {
-    if (!enabled_) return;
+    if (!enabled_ || !backend_mine({GraphicsAPI::Vulkan})) return;
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
     const auto* pi = static_cast<const VkPresentInfoKHR*>(pPresentInfo);
@@ -547,6 +528,7 @@ void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
     vk_width_ = sc->second.width;
     vk_height_ = sc->second.height;
     vk_image_usage_ = sc->second.usage;
+    if (migrate_if_tiny_frame((int)vk_width_, (int)vk_height_)) return;
     if (!imgui_initialized_) init_imgui_vulkan(queue, pPresentInfo);
     if (imgui_initialized_) render_frame_vulkan(queue, pPresentInfo);
 }
@@ -554,9 +536,9 @@ void StarOverlay::on_present_vulkan(void* queue, const void* pPresentInfo)
 void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 {
     HMODULE vulkan = GetModuleHandleA("vulkan-1.dll");
-    if (!vulkan) { STAR_LOG("Vulkan reinit: vulkan-1.dll not loaded"); return; }
+    if (!vulkan) { STAR_LOG_WARN("Vulkan reinit: vulkan-1.dll not loaded"); return; }
 
-    if (!resolve_vulkan_funcs(vulkan)) { STAR_LOG("Vulkan reinit: resolve_vulkan_funcs failed"); return; }
+    if (!resolve_vulkan_funcs(vulkan)) { STAR_LOG_WARN("Vulkan reinit: resolve_vulkan_funcs failed"); return; }
 
     auto owner = std::make_unique<VulkanOverlayData>();
     auto* data = owner.get();
@@ -602,7 +584,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 
     auto& rp = data->render_pass;
     if (vkCreateRenderPass((VkDevice)vk_device_, &rp_info, nullptr, &rp) != VK_SUCCESS) {
-        STAR_LOG("Vulkan reinit: vkCreateRenderPass failed"); return;
+        STAR_LOG_WARN("Vulkan reinit: vkCreateRenderPass failed"); return;
     }
 
     VkDescriptorPoolSize pool_sizes[] = {
@@ -617,7 +599,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 
     auto& dp = data->descriptor_pool;
     if (vkCreateDescriptorPool((VkDevice)vk_device_, &pool_info, nullptr, &dp) != VK_SUCCESS) {
-        STAR_LOG("Vulkan reinit: vkCreateDescriptorPool failed");
+        STAR_LOG_WARN("Vulkan reinit: vkCreateDescriptorPool failed");
         return;
     }
 
@@ -626,11 +608,11 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 
     uint32_t count = 0;
     if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, nullptr) != VK_SUCCESS || count < 2) {
-        STAR_LOG("Vulkan reinit: vkGetSwapchainImagesKHR failed count=%u", count); return;
+        STAR_LOG_WARN("Vulkan reinit: vkGetSwapchainImagesKHR failed count=%u", count); return;
     }
     std::vector<VkImage> images(count);
     if (vkGetSwapchainImagesKHR((VkDevice)vk_device_, swapchain, &count, images.data()) != VK_SUCCESS) {
-        STAR_LOG("Vulkan reinit: vkGetSwapchainImagesKHR(images) failed"); return;
+        STAR_LOG_WARN("Vulkan reinit: vkGetSwapchainImagesKHR(images) failed"); return;
     }
     data->swapchain = swapchain;
     data->image_count = count;
@@ -641,7 +623,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     auto& fbs = data->framebuffers;
 
     hook_window_for(game_window_);
-    if (!hwnd_) { STAR_LOG("Vulkan reinit: no game window found"); return; }
+    if (!hwnd_) { STAR_LOG_WARN("Vulkan reinit: no game window found"); return; }
     uint32_t w = vk_width_, h = vk_height_;
 
     for (uint32_t i = 0; i < count; i++) {
@@ -661,7 +643,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         view_info.subresourceRange.layerCount = 1;
 
         if (vkCreateImageView((VkDevice)vk_device_, &view_info, nullptr, &views[i]) != VK_SUCCESS) {
-            STAR_LOG("Vulkan reinit: vkCreateImageView failed i=%u", i); return;
+            STAR_LOG_WARN("Vulkan reinit: vkCreateImageView failed i=%u", i); return;
         }
 
         VkFramebufferCreateInfo fb_info = {};
@@ -674,7 +656,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         fb_info.layers = 1;
 
         if (vkCreateFramebuffer((VkDevice)vk_device_, &fb_info, nullptr, &fbs[i]) != VK_SUCCESS) {
-            STAR_LOG("Vulkan reinit: vkCreateFramebuffer failed i=%u", i); return;
+            STAR_LOG_WARN("Vulkan reinit: vkCreateFramebuffer failed i=%u", i); return;
         }
     }
 
@@ -685,7 +667,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
 
     auto& cp = data->command_pool;
     if (vkCreateCommandPool((VkDevice)vk_device_, &cp_info, nullptr, &cp) != VK_SUCCESS) {
-        STAR_LOG("Vulkan reinit: vkCreateCommandPool failed"); return;
+        STAR_LOG_WARN("Vulkan reinit: vkCreateCommandPool failed"); return;
     }
 
     data->command_buffers.resize(count);
@@ -696,7 +678,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cb_info.commandBufferCount = count;
     if (vkAllocateCommandBuffers((VkDevice)vk_device_, &cb_info, cbs.data()) != VK_SUCCESS) {
-        STAR_LOG("Vulkan reinit: vkAllocateCommandBuffers failed");
+        STAR_LOG_WARN("Vulkan reinit: vkAllocateCommandBuffers failed");
         cbs.clear(); return;
     }
     data->fences.resize(count);
@@ -707,19 +689,18 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
     for (uint32_t i = 0; i < count; ++i) {
         if (vkCreateFence(data->device, &fence_info, nullptr, &data->fences[i]) != VK_SUCCESS ||
             vkCreateSemaphore(data->device, &sem_info, nullptr, &data->present_ready[i]) != VK_SUCCESS) {
-            STAR_LOG("Vulkan reinit: vkCreateFence/Semaphore failed i=%u", i); return;
+            STAR_LOG_WARN("Vulkan reinit: vkCreateFence/Semaphore failed i=%u", i); return;
         }
     }
 
     ImGui::CreateContext();
     if (!ImGui_ImplWin32_Init(hwnd_)) {
-        STAR_LOG("Vulkan reinit: ImGui_ImplWin32_Init failed hwnd=%p", (void*)hwnd_);
+        STAR_LOG_WARN("Vulkan reinit: ImGui_ImplWin32_Init failed hwnd=%p", (void*)hwnd_);
         ImGui::DestroyContext(); return;
     }
-    hook_window();
 
     if (!ImGui_ImplVulkan_LoadFunctions(&ImGuiVulkanLoader, vulkan)) {
-        STAR_LOG("Vulkan reinit: ImGui_ImplVulkan_LoadFunctions failed");
+        STAR_LOG_WARN("Vulkan reinit: ImGui_ImplVulkan_LoadFunctions failed");
         ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); return;
     }
 
@@ -755,7 +736,7 @@ void StarOverlay::init_imgui_vulkan(void* queue, const void* pPresentInfo)
         vk_data_ = owner.release();
         STAR_LOG("ImGui ready (Vulkan native) images=%u extent=%ux%u", count, w, h);
     } else {
-        STAR_LOG("Vulkan reinit: ImGui_ImplVulkan_Init failed");
+        STAR_LOG_WARN("Vulkan reinit: ImGui_ImplVulkan_Init failed");
         ImGui_ImplWin32_Shutdown();
         ImGui::DestroyContext();
     }

@@ -1,4 +1,5 @@
 #include "overlay/overlay_internal.h"
+#include "overlay/core/pixel_copy.h"
 #include "core/settings.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -214,9 +215,9 @@ void StarOverlay::hook_gdi()
     bool dib = install("StretchDIBits", gdi32, &hooked_StretchDIBits, orig_stretchdibits_);
     bool setdib = install("SetDIBitsToDevice", gdi32, &hooked_SetDIBitsToDevice, orig_setdibitstodevice_);
     gdi_hooked_ = bitblt && stretch && dib && setdib;
-    STAR_LOG("hook_gdi: bitblt=%d stretch=%d dib=%d setdib=%d hooked=%d any_hook_installed=%d",
-        (int)bitblt, (int)stretch, (int)dib, (int)setdib, (int)gdi_hooked_, (int)any_graphics_hook_installed_);
-    if (gdi_hooked_ && !any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("GDI hooked"); }
+    STAR_LOG("hook_gdi: bitblt=%d stretch=%d dib=%d setdib=%d hooked=%d",
+        (int)bitblt, (int)stretch, (int)dib, (int)setdib, (int)gdi_hooked_);
+    if (gdi_hooked_) STAR_LOG("GDI hooked");
 }
 
 bool StarOverlay::gdi_init_device()
@@ -230,15 +231,14 @@ bool StarOverlay::gdi_init_device()
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     D3D_FEATURE_LEVEL level{};
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
-        &device, &level, &context);
-    if (FAILED(hr)) {
+    HRESULT hr = E_FAIL;
+    for (D3D_DRIVER_TYPE driver : {D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP}) {
         device.Reset();
         context.Reset();
-        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+        hr = D3D11CreateDevice(nullptr, driver, nullptr,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
             &device, &level, &context);
+        if (SUCCEEDED(hr)) break;
     }
     if (FAILED(hr)) {
         STAR_LOG("GDI renderer: device creation failed hr=0x%08x", (unsigned)hr);
@@ -281,6 +281,11 @@ bool StarOverlay::gdi_alloc_surfaces(int w, int h)
 bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
 {
     if (!enabled_ || !dest_dc || w <= 0 || h <= 0 || w > 16384 || h > 16384) return false;
+    // Tiny software framebuffer with visible UI: hook-drawn text would inherit
+    // the game's pixels and upscale to mush, so migrate to the external window
+    // (native resolution) instead. Gated on visible UI so a bare screenshot
+    // never triggers it.
+    if (gdi_wants_draw() && migrate_if_tiny_frame(w, h)) return false;
     maybe_capture_gdi(dest_dc, w, h);
     if (!gdi_wants_draw()) return true;
     RECT client{};
@@ -339,10 +344,7 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
         const float clear[4]{};
         gdi_.context->OMSetRenderTargets(1, gdi_.render_view.GetAddressOf(), nullptr);
         gdi_.context->ClearRenderTargetView(gdi_.render_view.Get(), clear);
-        D3D11_VIEWPORT viewport{};
-        viewport.Width = (float)render_w;
-        viewport.Height = (float)render_h;
-        viewport.MaxDepth = 1.0f;
+        D3D11_VIEWPORT viewport{0.f, 0.f, (float)render_w, (float)render_h, 0.f, 1.0f};
         gdi_.context->RSSetViewports(1, &viewport);
 
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -353,12 +355,12 @@ bool StarOverlay::render_gdi(HWND window, HDC dest_dc, int w, int h)
         if (FAILED(hr)) { gdi_.draw_snapshot.clear(); return false; }
         const auto* src = static_cast<const uint8_t*>(map.pData);
         auto* dst = static_cast<uint8_t*>(gdi_.pixels.bits());
-        const size_t row_bytes = (size_t)render_w * 4;
         // Finish any previous GDI read of the DIB before overwriting its pixels.
         GdiFlush();
-        for (int y = 0; y < render_h; ++y)
-            memcpy(dst + (size_t)y * row_bytes, src + (size_t)y * map.RowPitch, row_bytes);
+        copy_pixels32(dst, (size_t)render_w * 4, src, map.RowPitch, (size_t)render_w, (size_t)render_h, false);
         gdi_.context->Unmap(gdi_.staging_texture.Get(), 0);
+        // AlphaBlend expects premultiplied alpha; the renderer is straight.
+        premultiply_inplace(dst, (size_t)render_w, (size_t)render_h);
     }
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     bool drawn = AlphaBlend(dest_dc, 0, 0, w, h, gdi_.pixels.dc(), 0, 0, render_w, render_h, blend) != FALSE;

@@ -152,6 +152,13 @@ void ImGui_ImplDX8_RenderDrawData(ImDrawData* draw_data)
     bd->pd3dDevice->GetTransform(D3DTS_VIEW, &last_view);
     bd->pd3dDevice->GetTransform(D3DTS_PROJECTION, &last_projection);
 
+    // Backup the viewport: clipping below is done by shrinking it per draw
+    // command (DX8 has no scissor rect), and the viewport is not part of the
+    // state block, so without this the game would keep rendering into the
+    // last toast/panel clip rectangle after we return.
+    D3DVIEWPORT8 last_viewport{};
+    bd->pd3dDevice->GetViewport(&last_viewport);
+
     // Allocate buffers
     CUSTOMVERTEX* vtx_dst;
     ImDrawIdx* idx_dst;
@@ -268,6 +275,9 @@ void ImGui_ImplDX8_RenderDrawData(ImDrawData* draw_data)
     bd->pd3dDevice->SetTransform(D3DTS_WORLD, &last_world);
     bd->pd3dDevice->SetTransform(D3DTS_VIEW, &last_view);
     bd->pd3dDevice->SetTransform(D3DTS_PROJECTION, &last_projection);
+
+    // Restore the viewport the game had (see backup above).
+    bd->pd3dDevice->SetViewport(&last_viewport);
 
     // Restore the DX8 state
     bd->pd3dDevice->ApplyStateBlock(d3d8_state_block);

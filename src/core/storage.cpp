@@ -18,7 +18,8 @@ void Storage::init(uint32_t app_id, uint64_t steam_id)
     ensure_dir(base_path_);
     ensure_dir(remote_dir_);
 
-    STAR_LOG("Storage initialized at: %s", base_path_.c_str());
+    STAR_LOG("Storage initialized: app=%u user=%s", app_id,
+        STAR_MaskSteamId(steam_id).c_str());
 }
 
 static bool create_dir_recursive(const std::string& path)

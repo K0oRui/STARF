@@ -59,7 +59,7 @@ void StarOverlay::hook_dx7()
             status = MH_EnableHook(end_scene);
             if (status == MH_OK) {
                 dx7_hooked_ = true;
-                if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("DX7 hooked"); }
+                STAR_LOG("DX7 hooked");
             } else {
                 MH_RemoveHook(end_scene);
                 orig_dx7_end_scene_ = nullptr;
@@ -75,13 +75,14 @@ void StarOverlay::hook_dx7()
 
 void StarOverlay::on_end_scene_dx7(IDirect3DDevice7* device)
 {
-    if (!enabled_ || !device) return;
+    if (!enabled_ || !device || !backend_mine({GraphicsAPI::DX7})) return;
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
     HWND window = IsWindow(game_window_) ? game_window_ : find_game_window();
     if (!accept_backend(GraphicsAPI::DX7, window)) return;
     note_present();
     if (mode_ == OverlayMode::External) return;
+    if (migrate_if_tiny_frame(window)) return;
     if (imgui_initialized_ && active_api_ != GraphicsAPI::DX7) return;
     if (imgui_initialized_ && dx7_device_ != device) shutdown_renderer();
     hook_window_for(window);
@@ -113,8 +114,7 @@ void StarOverlay::on_end_scene_dx7(IDirect3DDevice7* device)
         }
     }
     if (!ImGui_ImplDX7_NewFrame()) {
-        static bool logged = false;
-        if (!logged) { STAR_LOG("DX7 font texture upload failed"); logged = true; }
+        STAR_LOG_ONCE("DX7 font texture upload failed");
         return;
     }
     ImGui_ImplWin32_NewFrame();

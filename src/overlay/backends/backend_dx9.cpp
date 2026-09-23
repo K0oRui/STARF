@@ -58,13 +58,13 @@ void StarOverlay::hook_dx9()
 
     // We only need the vtable, so try several device flavors (HAL/SW first,
     // NULLREF fallback). XNA/D3D9Ex games share the same vtable layout.
-    struct Dx9Attempt { int devtype; DWORD behavior; const char* name; };
+    struct Dx9Attempt { int devtype; DWORD behavior; };
     const Dx9Attempt attempts[] = {
-        { D3DDEVTYPE_HAL,    D3DCREATE_SOFTWARE_VERTEXPROCESSING, "HAL/SW" },
-        { D3DDEVTYPE_HAL,    D3DCREATE_HARDWARE_VERTEXPROCESSING, "HAL/HW" },
-        { D3DDEVTYPE_HAL,    D3DCREATE_MIXED_VERTEXPROCESSING,    "HAL/MIXED" },
-        { D3DDEVTYPE_NULLREF, D3DCREATE_SOFTWARE_VERTEXPROCESSING, "NULLREF/SW" },
-        { D3DDEVTYPE_REF,    D3DCREATE_SOFTWARE_VERTEXPROCESSING, "REF/SW" },
+        { D3DDEVTYPE_HAL,    D3DCREATE_SOFTWARE_VERTEXPROCESSING },
+        { D3DDEVTYPE_HAL,    D3DCREATE_HARDWARE_VERTEXPROCESSING },
+        { D3DDEVTYPE_HAL,    D3DCREATE_MIXED_VERTEXPROCESSING },
+        { D3DDEVTYPE_NULLREF, D3DCREATE_SOFTWARE_VERTEXPROCESSING },
+        { D3DDEVTYPE_REF,    D3DCREATE_SOFTWARE_VERTEXPROCESSING },
     };
     IDirect3DDevice9* device = nullptr;
     HRESULT hr = E_FAIL;
@@ -95,13 +95,13 @@ void StarOverlay::hook_dx9()
     d3d->Release();
     if (orig_dx9_present_) {
         dx9_hooked_ = true;
-        if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("DX9 hooked"); }
+        STAR_LOG("DX9 hooked");
     }
 }
 
 void StarOverlay::on_present_dx9(IDirect3DDevice9* device, HWND window)
 {
-    if (!enabled_ || !device) return;
+    if (!enabled_ || !device || !backend_mine({GraphicsAPI::DX9})) return;
     std::unique_lock<std::mutex> lock(render_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) return;
     D3DDEVICE_CREATION_PARAMETERS cp{};
@@ -116,6 +116,7 @@ void StarOverlay::on_present_dx9(IDirect3DDevice9* device, HWND window)
     if (!accept_backend(GraphicsAPI::DX9, window)) return;
     note_present();
     if (mode_ == OverlayMode::External) return;
+    if (migrate_if_tiny_frame(window)) return;
     poll_hotkey();
     if (imgui_initialized_ && active_api_ != GraphicsAPI::DX9) return;
     if (imgui_initialized_ && dx9_device_ != device) shutdown_renderer();

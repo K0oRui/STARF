@@ -49,7 +49,7 @@ static bool ver_is(const char* ver, const char* code)
 void* StarSteamClient::GetClientInterface(const char* ver)
 {
     StarSteamClient* o = this;
-    STAR_LOG("GetClientInterface: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetClientInterface: %s", ver ? ver : "(null)");
     // ISteamClient018-021 contain GetISteamGameSearch at vtable slot 19, shifting
     // every later slot by one vs. the unversioned layout. All flat
     // SteamAPI_ISteamClient_* exports are compiled against the unversioned layout,
@@ -77,22 +77,22 @@ void* StarSteamClient::GetClientInterface(const char* ver)
     if (ver_is(ver, "001") || ver_is(ver, "002") || ver_is(ver, "003") || ver_is(ver, "004") ||
         ver_is(ver, "005") || ver_is(ver, "006") || ver_is(ver, "007") || ver_is(ver, "008") ||
         ver_is(ver, "009") || ver_is(ver, "010") || ver_is(ver, "011")) {
-        STAR_LOG("GetClientInterface: unsupported legacy version '%s'", ver ? ver : "(null)");
+        STAR_LOG_WARN("GetClientInterface: unsupported legacy version '%s'", ver ? ver : "(null)");
         return nullptr;
     }
     return static_cast<ISteamClient*>(o);
 }
 
-HSteamPipe StarSteamClient::CreateSteamPipe() { STAR_LOG("CreateSteamPipe"); return 1; }
+HSteamPipe StarSteamClient::CreateSteamPipe() { STAR_LOG_TRACE("CreateSteamPipe"); return 1; }
 bool StarSteamClient::BReleaseSteamPipe(HSteamPipe hSteamPipe) { STAR_UNREFERENCED(hSteamPipe); return true; }
-HSteamUser StarSteamClient::ConnectToGlobalUser(HSteamPipe hSteamPipe) { STAR_UNREFERENCED(hSteamPipe); STAR_LOG("ConnectToGlobalUser"); return 1; }
+HSteamUser StarSteamClient::ConnectToGlobalUser(HSteamPipe hSteamPipe) { STAR_UNREFERENCED(hSteamPipe); STAR_LOG_TRACE("ConnectToGlobalUser"); return 1; }
 HSteamUser StarSteamClient::CreateLocalUser(HSteamPipe* phSteamPipe, EAccountType eAccountType) { STAR_UNREFERENCED(eAccountType); if(phSteamPipe) *phSteamPipe=1; return 1; }
 void StarSteamClient::ReleaseUser(HSteamPipe hSteamPipe, HSteamUser hUser) { STAR_UNREFERENCED(hSteamPipe); STAR_UNREFERENCED(hUser); }
 
 ISteamUser* StarSteamClient::GetISteamUser(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamUser: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamUser: %s", ver ? ver : "(null)");
     StarSteamUser* o = &StarSteamUser::get();
 
     if (ver_is(ver, "001") || ver_is(ver, "002") || ver_is(ver, "004") ||
@@ -128,7 +128,7 @@ void StarSteamClient::SetLocalIPBinding(uint32 ip, uint16 port) { STAR_UNREFEREN
 ISteamFriends* StarSteamClient::GetISteamFriends(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamFriends: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamFriends: %s", ver ? ver : "(null)");
     StarSteamFriends* o = &StarSteamFriends::get();
 
     if (ver_is(ver, "001") || ver_is(ver, "002") || ver_is(ver, "003") || ver_is(ver, "004") ||
@@ -147,7 +147,7 @@ ISteamFriends* StarSteamClient::GetISteamFriends(HSteamUser h, HSteamPipe p, con
 ISteamUtils* StarSteamClient::GetISteamUtils(HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamUtils: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamUtils: %s", ver ? ver : "(null)");
     StarSteamUtils* o = &StarSteamUtils::get();
     if (ver_is(ver, "001")) return STAR_VER(ISteamUtils, 001, o);
     if (ver_is(ver, "002")) return STAR_VER(ISteamUtils, 002, o);
@@ -177,7 +177,7 @@ void* StarSteamClient::GetISteamGenericInterface(HSteamUser h, HSteamPipe p, con
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
     if (!ver) return nullptr;
-    STAR_LOG("GetISteamGenericInterface: %s", ver);
+    STAR_LOG_TRACE("GetISteamGenericInterface: %s", ver);
 
     if (strstr(ver, "SteamMatchMakingServers")) return &StarSteamMatchmakingServers::get();
     if (strstr(ver, "SteamMatchMaking") || strstr(ver, "SteamMatchmaking")) return &StarSteamMatchmaking::get();
@@ -207,14 +207,14 @@ void* StarSteamClient::GetISteamGenericInterface(HSteamUser h, HSteamPipe p, con
     if (strstr(ver, "STEAMPARENTALSETTINGS")) return &StarSteamParentalSettings::get();
     if (strstr(ver, "SteamParentalSettings")) return &StarSteamParentalSettings::get();
     if (strstr(ver, "STEAMPARTIES") || strstr(ver, "SteamParties")) return &StarSteamParties::get();
-    STAR_LOG("GetISteamGenericInterface: unhandled interface '%s', returning dummy pointer", ver);
+    STAR_LOG_WARN("GetISteamGenericInterface: unhandled interface '%s', returning dummy pointer", ver);
     return g_dummy_interface;
 }
 
 ISteamUserStats* StarSteamClient::GetISteamUserStats(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamUserStats: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamUserStats: %s", ver ? ver : "(null)");
     StarSteamUserStats* o = &StarSteamUserStats::get();
     if (ver_is(ver, "001")) return STAR_VER(ISteamUserStats, 001, o);
     if (ver_is(ver, "002")) return STAR_VER(ISteamUserStats, 002, o);
@@ -240,7 +240,7 @@ ISteamGameServerStats* StarSteamClient::GetISteamGameServerStats(HSteamUser h, H
 ISteamApps* StarSteamClient::GetISteamApps(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamApps: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamApps: %s", ver ? ver : "(null)");
     StarSteamApps* a = &StarSteamApps::get();
     if (ver_is(ver, "001")) return STAR_VER(ISteamApps, 001, a);
     if (ver_is(ver, "002")) return STAR_VER(ISteamApps, 002, a);
@@ -256,14 +256,14 @@ ISteamApps* StarSteamClient::GetISteamApps(HSteamUser h, HSteamPipe p, const cha
 ISteamNetworking* StarSteamClient::GetISteamNetworking(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamNetworking: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamNetworking: %s", ver ? ver : "(null)");
     return &StarSteamNetworking::get();
 }
 
 ISteamRemoteStorage* StarSteamClient::GetISteamRemoteStorage(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamRemoteStorage: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamRemoteStorage: %s", ver ? ver : "(null)");
     StarSteamRemoteStorage* o = &StarSteamRemoteStorage::get();
     if (ver_is(ver, "001")) return STAR_VER(ISteamRemoteStorage, 001, o);
     if (ver_is(ver, "002")) return STAR_VER(ISteamRemoteStorage, 002, o);
@@ -286,7 +286,7 @@ ISteamRemoteStorage* StarSteamClient::GetISteamRemoteStorage(HSteamUser h, HStea
 ISteamScreenshots* StarSteamClient::GetISteamScreenshots(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamScreenshots: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamScreenshots: %s", ver ? ver : "(null)");
     return &StarSteamScreenshots::get();
 }
 
@@ -298,7 +298,7 @@ bool StarSteamClient::BShutdownIfAllPipesClosed() { return false; }
 ISteamHTTP* StarSteamClient::GetISteamHTTP(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamHTTP: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamHTTP: %s", ver ? ver : "(null)");
     return &StarSteamHTTP::get();
 }
 
@@ -311,14 +311,14 @@ void* StarSteamClient::DEPRECATED_GetISteamUnifiedMessages(HSteamUser h, HSteamP
 ISteamController* StarSteamClient::GetISteamController(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamController: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamController: %s", ver ? ver : "(null)");
     return reinterpret_cast<ISteamController*>(&StarSteamController::get());
 }
 
 ISteamUGC* StarSteamClient::GetISteamUGC(HSteamUser h, HSteamPipe p, const char* ver)
 {
     STAR_UNREFERENCED(h); STAR_UNREFERENCED(p);
-    STAR_LOG("GetISteamUGC: %s", ver ? ver : "(null)");
+    STAR_LOG_TRACE("GetISteamUGC: %s", ver ? ver : "(null)");
     return reinterpret_cast<ISteamUGC*>(&StarSteamUGC::get());
 }
 

@@ -56,6 +56,9 @@ HRESULT STDMETHODCALLTYPE create_composition(IDXGIFactory2* factory, IUnknown* d
 
 void StarOverlay::hook_dx12_factory(IDXGIFactory* factory)
 {
+    static std::mutex install_mutex;
+    std::lock_guard<std::mutex> install_lock(install_mutex);
+    if (!factory) return;
     auto install = [](void* target, void* hook, void** original) {
         if (*original) return;
         if (MH_CreateHook(target, hook, original) == MH_OK && MH_EnableHook(target) != MH_OK) {
@@ -449,11 +452,7 @@ void StarOverlay::render_frame_dx12(IDXGISwapChain* chain)
     if (wait_value != 0 && fence->GetCompletedValue() < wait_value) {
         if (FAILED(fence->SetEventOnCompletion(wait_value, fence_event)) ||
             WaitForSingleObject(fence_event, 1000) != WAIT_OBJECT_0) {
-            static bool logged_timeout = false;
-            if (!logged_timeout) {
-                logged_timeout = true;
-                STAR_LOG("DX12 frame fence timeout, skipping frames until GPU recovers");
-            }
+            STAR_LOG_ONCE("DX12 frame fence timeout, skipping frames until GPU recovers");
             if (++dx12_timeout_streak_ >= 30) {
                 dx12_timeout_streak_ = 0;
                 switch_to_external("DX12 frame fence never completes");

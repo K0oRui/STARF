@@ -4,18 +4,43 @@
 #include <d3d11.h>
 #include <d3d12.h>
 
+void StarOverlay::hook_dxgi_early()
+{
+#ifdef _WIN64
+    // Lightweight early-boot path: capture the DX12 presenting queue without
+    // the dummy window + D3D11 HARDWARE device that hook_dxgi() needs for
+    // Present/ResizeBuffers vtables. Never force-load dxgi.dll here; if the
+    // game hasn't pulled it in yet, the full hook at SteamAPI_Init time plus
+    // the retry thread (ensure_hooks) will cover it.
+    HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+    if (!dxgi) return;
+
+    auto try_hook_factory = [&](const char* proc, REFIID iid) {
+        using CreateFn = HRESULT(WINAPI*)(REFIID, void**);
+        auto create = (CreateFn)GetProcAddress(dxgi, proc);
+        IDXGIFactory* factory = nullptr;
+        if (create && SUCCEEDED(create(iid, (void**)&factory)) && factory) {
+            hook_dx12_factory(factory);
+            factory->Release();
+            return true;
+        }
+        return false;
+    };
+    if (try_hook_factory("CreateDXGIFactory1", __uuidof(IDXGIFactory1))) return;
+    // Fallback for downlevel dxgi without CreateDXGIFactory1 export.
+    try_hook_factory("CreateDXGIFactory", __uuidof(IDXGIFactory));
+#endif
+}
+
 void StarOverlay::hook_dxgi()
 {
     static std::mutex install_mutex;
     std::lock_guard<std::mutex> install_lock(install_mutex);
     if (orig_present_ && orig_resize_) { dxgi_hooked_ = true; return; }
 
-    WNDCLASSEXA wc{};
-    wc.cbSize = sizeof(wc); wc.lpfnWndProc = DefWindowProcA;
-    wc.hInstance = GetModuleHandleA(nullptr); wc.lpszClassName = "STAR_Dummy";
-    RegisterClassExA(&wc);
+    // "STAR_Dummy" is registered once in init; re-registering always fails.
     HWND dummy = CreateWindowExA(0,"STAR_Dummy","",WS_OVERLAPPEDWINDOW,0,0,4,4,
-                                 nullptr,nullptr,wc.hInstance,nullptr);
+                                 nullptr,nullptr,GetModuleHandleA(nullptr),nullptr);
     if (!dummy) { STAR_LOG("DXGI: dummy window failed"); return; }
 
     DXGI_SWAP_CHAIN_DESC sd{};
@@ -35,22 +60,17 @@ void StarOverlay::hook_dxgi()
     }
 
     void** vt = *(void***)dsc;
-    MH_STATUS s1 = orig_present_ ? MH_OK : MH_CreateHook(vt[8],  &hooked_Present,       (void**)&orig_present_);
-    if (s1 == MH_OK) MH_EnableHook(vt[8]);
-    else if (!orig_present_) STAR_LOG("DXGI: Present hook failed");
-    MH_STATUS s2 = orig_resize_ ? MH_OK : MH_CreateHook(vt[13], &hooked_ResizeBuffers, (void**)&orig_resize_);
-    if (s2 == MH_OK) MH_EnableHook(vt[13]);
-    else if (!orig_resize_) STAR_LOG("DXGI: ResizeBuffers hook failed");
+    auto hook_vt = [](void* target, void* detour, void** orig, const char* name) {
+        if (*orig) return;
+        if (MH_CreateHook(target, detour, orig) == MH_OK) MH_EnableHook(target);
+        else STAR_LOG("DXGI: %s hook failed", name);
+    };
+    hook_vt(vt[8], &hooked_Present, (void**)&orig_present_, "Present");
+    hook_vt(vt[13], &hooked_ResizeBuffers, (void**)&orig_resize_, "ResizeBuffers");
 
     IDXGISwapChain1* dsc1 = nullptr;
     if (SUCCEEDED(dsc->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&dsc1))) {
-        void** vt1 = *(void***)dsc1;
-        if (!orig_present1_) {
-            MH_STATUS s3 = MH_CreateHook(vt1[22], &hooked_Present1, (void**)&orig_present1_);
-            if (s3 == MH_OK) {
-                MH_EnableHook(vt1[22]);
-            }
-        }
+        hook_vt((*(void***)dsc1)[22], &hooked_Present1, (void**)&orig_present1_, "Present1");
         dsc1->Release();
     }
 
@@ -62,16 +82,14 @@ void StarOverlay::hook_dxgi()
     }
 #endif
     IDXGISwapChain3* dsc3 = nullptr;
-    if (!orig_resize1_ && SUCCEEDED(dsc->QueryInterface(IID_PPV_ARGS(&dsc3)))) {
-        void** vt3 = *(void***)dsc3;
-        if (MH_CreateHook(vt3[39], &hooked_ResizeBuffers1, (void**)&orig_resize1_) == MH_OK)
-            MH_EnableHook(vt3[39]);
+    if (SUCCEEDED(dsc->QueryInterface(IID_PPV_ARGS(&dsc3)))) {
+        hook_vt((*(void***)dsc3)[39], &hooked_ResizeBuffers1, (void**)&orig_resize1_, "ResizeBuffers1");
         dsc3->Release();
     }
     dsc->Release(); ddev->Release(); DestroyWindow(dummy);
     if (orig_present_) {
         dxgi_hooked_ = true;
-        if (!any_graphics_hook_installed_) { any_graphics_hook_installed_ = true; STAR_LOG("DXGI hooked"); }
+        STAR_LOG("DXGI hooked");
     }
 
 }
@@ -117,7 +135,7 @@ HRESULT STDMETHODCALLTYPE StarOverlay::hooked_ResizeBuffers1(IDXGISwapChain3* ch
 void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
 {
     STAR_UNREFERENCED(si); STAR_UNREFERENCED(fl);
-    if (!enabled_) return;
+    if (!enabled_ || !backend_mine({GraphicsAPI::DX10, GraphicsAPI::DX11, GraphicsAPI::DX12})) return;
     // Detect from the presenting device, never from loaded DLLs or hook setup.
     GraphicsAPI this_api = GraphicsAPI::None;
     {
@@ -147,6 +165,7 @@ void StarOverlay::on_present(IDXGISwapChain* chain, UINT si, UINT fl)
     if (FAILED(chain->GetDesc(&sd)) || !accept_backend(this_api, sd.OutputWindow)) return;
     note_present();
     if (mode_ == OverlayMode::External) return;
+    if (migrate_if_tiny_frame((int)sd.BufferDesc.Width, (int)sd.BufferDesc.Height)) return;
     if (imgui_initialized_ && active_api_ != this_api) return;
     if (dxgi_chain_ && dxgi_chain_ != chain) shutdown_renderer();
     dxgi_chain_ = chain;
