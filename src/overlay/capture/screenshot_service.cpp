@@ -25,16 +25,13 @@ std::string ScreenshotService::next_path()
     Storage::ensure_dir(base_dir);
     SYSTEMTIME st{};
     GetLocalTime(&st);
-    static std::atomic<unsigned> sequence{0};
     char base[128];
-    snprintf(base, sizeof(base), "STAR_%u_%04d%02d%02d_%02d%02d%02d_%u",
-        Settings::get().app_id, (int)st.wYear, (int)st.wMonth, (int)st.wDay,
-        (int)st.wHour, (int)st.wMinute, (int)st.wSecond, sequence.fetch_add(1));
+    snprintf(base, sizeof(base), "STAR_%04d%02d%02d_%02d%02d%02d",
+        (int)st.wYear, (int)st.wMonth, (int)st.wDay,
+        (int)st.wHour, (int)st.wMinute, (int)st.wSecond);
     for (int i = 0; i < 100; i++) {
-        char full[MAX_PATH];
-        if (i == 0) snprintf(full, sizeof(full), "%s\\%s.png", base_dir.c_str(), base);
-        else snprintf(full, sizeof(full), "%s\\%s_%d.png", base_dir.c_str(), base, i);
-        if (GetFileAttributesA(full) == INVALID_FILE_ATTRIBUTES) return full;
+        std::string full = base_dir + "\\" + base + (i == 0 ? ".png" : "_" + std::to_string(i) + ".png");
+        if (GetFileAttributesA(full.c_str()) == INVALID_FILE_ATTRIBUTES) return full;
     }
     return "";
 }
@@ -53,10 +50,9 @@ bool ScreenshotService::save_rgba_png(const std::string& path, const uint8_t* rg
         px[i * 4 + 3] = 255;
     }
     const uint8_t* data = px.data();
-    bool com_here = false;
     HRESULT cohr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    if (cohr == S_OK) com_here = true;
-    else if (FAILED(cohr) && cohr != RPC_E_CHANGED_MODE) return false;
+    if (FAILED(cohr) && cohr != RPC_E_CHANGED_MODE) return false;
+    bool com_here = (cohr == S_OK);
 
     bool ok = false;
     IWICImagingFactory* factory = nullptr;
@@ -65,9 +61,7 @@ bool ScreenshotService::save_rgba_png(const std::string& path, const uint8_t* rg
         IWICStream* stream = nullptr;
         IWICBitmapEncoder* encoder = nullptr;
         IWICBitmapFrameEncode* frame = nullptr;
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-        std::wstring wpath((size_t)(wlen > 0 ? wlen : 1), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+        std::wstring wpath = utf8_to_wstring(path);
         if (SUCCEEDED(factory->CreateStream(&stream)) && stream &&
             SUCCEEDED(stream->InitializeFromFilename(wpath.c_str(), GENERIC_WRITE)) &&
             SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) && encoder &&

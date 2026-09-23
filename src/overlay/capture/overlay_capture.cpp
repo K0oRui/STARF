@@ -1,4 +1,5 @@
 #include "overlay/overlay_internal.h"
+#include <algorithm>
 #include <d3d9.h>
 #include <d3d10.h>
 #include <d3d11.h>
@@ -171,7 +172,9 @@ void StarOverlay::capture_desktop_duplication()
 {
     // Zero game-state interaction: own D3D11 device + DXGI desktop duplication.
     // For titles whose buffers fault on any foreign access (ACEVO), and any
-    // exclusive-fullscreen game. Captures the primary output.
+    // exclusive-fullscreen game. Captures the game window only: the desktop
+    // frame is cropped to the game client area (full frame if the window
+    // cannot be determined, so a screenshot never silently dies).
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory)) || !factory)
         return;
@@ -197,27 +200,26 @@ void StarOverlay::capture_desktop_duplication()
         factory->Release();
         return;
     }
+    auto release_dev = [&] { if (ctx) ctx->Release(); if (ddev) ddev->Release(); };
     IDXGIOutput1* out1 = nullptr;
     hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&out1);
+    // Duplication frames are in output coordinates; the crop needs the origin
+    // (non-primary outputs don't start at 0,0).
+    DXGI_OUTPUT_DESC out_desc{};
+    if (SUCCEEDED(hr) && out1) out1->GetDesc(&out_desc);
     output->Release();
     adapter->Release();
     factory->Release();
     if (FAILED(hr) || !out1) {
-        if (ctx) ctx->Release();
-        if (ddev) ddev->Release();
+        release_dev();
         return;
     }
     IDXGIOutputDuplication* dup = nullptr;
     hr = out1->DuplicateOutput(ddev, &dup);
     out1->Release();
     if (FAILED(hr) || !dup) {
-        static bool logged_dup = false;
-        if (!logged_dup) {
-            logged_dup = true;
-            STAR_LOG("Screenshot: desktop duplication unavailable hr=0x%08x", (unsigned)hr);
-        }
-        if (ctx) ctx->Release();
-        if (ddev) ddev->Release();
+        STAR_LOG_ONCE("Screenshot: desktop duplication unavailable hr=0x%08x", (unsigned)hr);
+        release_dev();
         return;
     }
 
@@ -229,8 +231,7 @@ void StarOverlay::capture_desktop_duplication()
     }
     if (!res) {
         dup->Release();
-        if (ctx) ctx->Release();
-        if (ddev) ddev->Release();
+        release_dev();
         return;
     }
     ID3D11Texture2D* tex = nullptr;
@@ -239,8 +240,7 @@ void StarOverlay::capture_desktop_duplication()
     if (FAILED(hr) || !tex) {
         dup->ReleaseFrame();
         dup->Release();
-        if (ctx) ctx->Release();
-        if (ddev) ddev->Release();
+        release_dev();
         return;
     }
     D3D11_TEXTURE2D_DESC desc{};
@@ -251,8 +251,7 @@ void StarOverlay::capture_desktop_duplication()
         tex->Release();
         dup->ReleaseFrame();
         dup->Release();
-        if (ctx) ctx->Release();
-        if (ddev) ddev->Release();
+        release_dev();
         return;
     }
     D3D11_TEXTURE2D_DESC sd = desc;
@@ -263,38 +262,60 @@ void StarOverlay::capture_desktop_duplication()
         ctx->CopyResource(staging, tex);
         D3D11_MAPPED_SUBRESOURCE map{};
         if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
-            std::vector<uint8_t> rgba((size_t)desc.Width * desc.Height * 4);
+            // Crop to the game client area (output-relative). No overlap
+            // (window on another output, minimized resolution race) falls
+            // back to the full frame rather than failing the screenshot.
+            RECT crop{ 0, 0, (LONG)desc.Width, (LONG)desc.Height };
+            HWND game = IsWindow(ext_game_hwnd_) ? ext_game_hwnd_ : find_game_window();
+            if (game) {
+                RECT client{};
+                if (GetClientRect(game, &client) && client.right > 0 && client.bottom > 0) {
+                    POINT org{ client.left, client.top };
+                    if (ClientToScreen(game, &org)) {
+                        LONG ox = out_desc.DesktopCoordinates.left;
+                        LONG oy = out_desc.DesktopCoordinates.top;
+                        LONG l = std::max<LONG>(org.x, ox);
+                        LONG t = std::max<LONG>(org.y, oy);
+                        LONG r = std::min<LONG>(org.x + client.right, ox + (LONG)desc.Width);
+                        LONG b = std::min<LONG>(org.y + client.bottom, oy + (LONG)desc.Height);
+                        if (r > l && b > t)
+                            crop = { l - ox, t - oy, r - ox, b - oy };
+                    }
+                }
+            }
+            int cw = (int)(crop.right - crop.left), ch = (int)(crop.bottom - crop.top);
+            std::vector<uint8_t> rgba((size_t)cw * ch * 4);
             uint64_t bright = 0;
-            for (UINT y = 0; y < desc.Height; y++) {
-                const uint8_t* s = (const uint8_t*)map.pData + (size_t)y * map.RowPitch;
-                uint8_t* d = rgba.data() + (size_t)y * desc.Width * 4;
+            for (int y = 0; y < ch; y++) {
+                const uint8_t* s = (const uint8_t*)map.pData + (size_t)(crop.top + y) * map.RowPitch +
+                    (size_t)crop.left * 4;
+                uint8_t* d = rgba.data() + (size_t)y * cw * 4;
                 if (bgra) {
-                    for (UINT x = 0; x < desc.Width; x++) {
+                    for (int x = 0; x < cw; x++) {
                         d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
                         bright += (uint64_t)d[0] + d[1] + d[2];
                         s += 4; d += 4;
                     }
                 } else {
-                    memcpy(d, s, (size_t)desc.Width * 4);
-                    for (size_t i = 0; i < (size_t)desc.Width * 4; i += 4)
+                    memcpy(d, s, (size_t)cw * 4);
+                    for (int i = 0; i < cw * 4; i += 4)
                         bright += (uint64_t)d[i] + d[i + 1] + d[i + 2];
                 }
             }
             ctx->Unmap(staging, 0);
             std::string path = ScreenshotService::next_path();
-            // All-black desktop frame = exclusive/independent-flip fullscreen
+            // All-black frame = exclusive/independent-flip fullscreen
             // bypassing DWM; tell the user how to fix it instead of silence.
-            double mean = (double)bright / ((double)desc.Width * desc.Height * 3.0);
+            double mean = (double)bright / ((double)cw * ch * 3.0);
             bool dark = mean < 4.0;
             if (dark) STAR_LOG("Screenshot looks black (exclusive fullscreen?)");
-            screenshots_.save_async(path, std::move(rgba), (int)desc.Width, (int)desc.Height, dark);
+            screenshots_.save_async(path, std::move(rgba), cw, ch, dark);
         }
         staging->Release();
     }
     tex->Release();
     dup->ReleaseFrame();
     dup->Release();
-    if (ctx) ctx->Release();
-    if (ddev) ddev->Release();
+    release_dev();
 }
 
