@@ -1,6 +1,5 @@
 #include "steam/steam_video.h"
 #include "core/callbacks.h"
-#include "steam/isteamvideo.h"
 
 StarSteamVideo& StarSteamVideo::get() { static StarSteamVideo i; return i; }
 void StarSteamVideo::GetVideoURL(AppId_t a)

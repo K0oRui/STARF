@@ -1,5 +1,4 @@
 #include "steam/steam_game_server.h"
-#include "core/callbacks.h"
 #include "core/settings.h"
 
 StarSteamGameServer& StarSteamGameServer::get() { static StarSteamGameServer i; return i; }

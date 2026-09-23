@@ -3,7 +3,7 @@
 StarSteamScreenshots& StarSteamScreenshots::get() { static StarSteamScreenshots i; return i; }
 ScreenshotHandle StarSteamScreenshots::WriteScreenshot(void* p, uint32 c, int w, int h) { STAR_UNREFERENCED(p); STAR_UNREFERENCED(c); STAR_UNREFERENCED(w); STAR_UNREFERENCED(h); return INVALID_SCREENSHOT_HANDLE; }
 ScreenshotHandle StarSteamScreenshots::AddScreenshotToLibrary(const char* f, const char* t, int w, int h) { STAR_UNREFERENCED(f); STAR_UNREFERENCED(t); STAR_UNREFERENCED(w); STAR_UNREFERENCED(h); return INVALID_SCREENSHOT_HANDLE; }
-void StarSteamScreenshots::TriggerScreenshot() { StarOverlay::get().request_screenshot(); }
+void StarSteamScreenshots::TriggerScreenshot() { Overlay::get().request_screenshot(); }
 void StarSteamScreenshots::HookScreenshots(bool b) { STAR_UNREFERENCED(b); }
 bool StarSteamScreenshots::SetLocation(ScreenshotHandle h, const char* l) { STAR_UNREFERENCED(h); STAR_UNREFERENCED(l); return false; }
 bool StarSteamScreenshots::TagUser(ScreenshotHandle h, CSteamID s) { STAR_UNREFERENCED(h); STAR_UNREFERENCED(s); return false; }

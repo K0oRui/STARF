@@ -1,6 +1,5 @@
 #include "steam/steam_game_server_stats.h"
 #include "core/callbacks.h"
-#include "steam/isteamgameserverstats.h"
 
 StarSteamGameServerStats& StarSteamGameServerStats::get() { static StarSteamGameServerStats i; return i; }
 SteamAPICall_t StarSteamGameServerStats::RequestUserStats(CSteamID s) { GSStatsReceived_t r{}; r.m_eResult=k_EResultOK; r.m_steamIDUser=s; return STAR_PostCallResult(GSStatsReceived_t::k_iCallback, &r, sizeof(r)); }

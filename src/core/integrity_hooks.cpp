@@ -149,7 +149,7 @@ static HANDLE WINAPI hooked_CreateFileW(
 {
     std::wstring new_path;
     if (resolve_redirect_w(lpFileName, new_path)) {
-        STAR_LOG("CreateFileW: Redirecting %ls to %ls", lpFileName, new_path.c_str());
+        STAR_LOG_RATE("CreateFileW", 5000, "CreateFileW: Redirecting %ls to %ls", lpFileName, new_path.c_str());
         return orig_CreateFileW(
             new_path.c_str(),
             dwDesiredAccess,
@@ -194,7 +194,7 @@ static HANDLE WINAPI hooked_CreateFileA(
 {
     std::string new_path;
     if (resolve_redirect_a(lpFileName, new_path)) {
-        STAR_LOG("CreateFileA: Redirecting %s to %s", lpFileName, new_path.c_str());
+        STAR_LOG_RATE("CreateFileA", 5000, "CreateFileA: Redirecting %s to %s", lpFileName, new_path.c_str());
         return orig_CreateFileA(
             new_path.c_str(),
             dwDesiredAccess,
@@ -220,7 +220,7 @@ static DWORD WINAPI hooked_GetFileAttributesW(LPCWSTR lpFileName)
 {
     std::wstring new_path;
     if (resolve_redirect_w(lpFileName, new_path)) {
-        STAR_LOG("GetFileAttributesW: Redirecting %ls to %ls", lpFileName, new_path.c_str());
+        STAR_LOG_RATE("GetFileAttributesW", 5000, "GetFileAttributesW: Redirecting %ls to %ls", lpFileName, new_path.c_str());
         return orig_GetFileAttributesW(new_path.c_str());
     }
     return orig_GetFileAttributesW(lpFileName);
@@ -230,7 +230,7 @@ static DWORD WINAPI hooked_GetFileAttributesA(LPCSTR lpFileName)
 {
     std::string new_path;
     if (resolve_redirect_a(lpFileName, new_path)) {
-        STAR_LOG("GetFileAttributesA: Redirecting %s to %s", lpFileName, new_path.c_str());
+        STAR_LOG_RATE("GetFileAttributesA", 5000, "GetFileAttributesA: Redirecting %s to %s", lpFileName, new_path.c_str());
         return orig_GetFileAttributesA(new_path.c_str());
     }
     return orig_GetFileAttributesA(lpFileName);
@@ -243,7 +243,7 @@ static BOOL WINAPI hooked_GetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_IN
 {
     std::wstring new_path;
     if (resolve_redirect_w(lpFileName, new_path)) {
-        STAR_LOG("GetFileAttributesExW: Redirecting %ls to %ls", lpFileName, new_path.c_str());
+        STAR_LOG_RATE("GetFileAttributesExW", 5000, "GetFileAttributesExW: Redirecting %ls to %ls", lpFileName, new_path.c_str());
         return orig_GetFileAttributesExW(new_path.c_str(), fInfoLevelId, lpFileInformation);
     }
     return orig_GetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
@@ -256,7 +256,7 @@ static BOOL WINAPI hooked_GetFileAttributesExA(LPCSTR lpFileName, GET_FILEEX_INF
 {
     std::string new_path;
     if (resolve_redirect_a(lpFileName, new_path)) {
-        STAR_LOG("GetFileAttributesExA: Redirecting %s to %s", lpFileName, new_path.c_str());
+        STAR_LOG_RATE("GetFileAttributesExA", 5000, "GetFileAttributesExA: Redirecting %s to %s", lpFileName, new_path.c_str());
         return orig_GetFileAttributesExA(new_path.c_str(), fInfoLevelId, lpFileInformation);
     }
     return orig_GetFileAttributesExA(lpFileName, fInfoLevelId, lpFileInformation);
@@ -268,11 +268,11 @@ static bool install_hook(LPVOID pTarget, LPVOID pDetour, LPVOID* ppOriginal, con
 {
     if (!pTarget) return false;
     if (MH_CreateHook(pTarget, pDetour, ppOriginal) != MH_OK) {
-        STAR_LOG("STAR_install_integrity_hooks: MH_CreateHook failed for %s", name);
+        STAR_LOG_ERROR("STAR_install_integrity_hooks: MH_CreateHook failed for %s", name);
         return false;
     }
     if (MH_EnableHook(pTarget) != MH_OK) {
-        STAR_LOG("STAR_install_integrity_hooks: MH_EnableHook failed for %s", name);
+        STAR_LOG_ERROR("STAR_install_integrity_hooks: MH_EnableHook failed for %s", name);
         MH_RemoveHook(pTarget);
         return false;
     }

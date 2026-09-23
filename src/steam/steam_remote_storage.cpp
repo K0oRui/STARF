@@ -1,76 +1,69 @@
 #include "steam/steam_remote_storage.h"
 #include "core/storage.h"
 #include "core/callbacks.h"
-#include "core/settings.h"
-#include "steam/isteamremotestorage.h"
 #include <time.h>
 
 StarSteamRemoteStorage& StarSteamRemoteStorage::get()
 {
-    static StarSteamRemoteStorage instance;
-    return instance;
+    static auto* instance = new StarSteamRemoteStorage;
+    return *instance;
 }
 
 bool StarSteamRemoteStorage::FileWrite(const char* pchFile, const void* pvData, int32 cubData)
 {
-    if (!pchFile) return false;
+    if (!pchFile || cubData < 0 || (cubData && !pvData)) return false;
     return Storage::get().write_remote_file(pchFile, pvData, (size_t)cubData);
 }
 
 int32 StarSteamRemoteStorage::FileRead(const char* pchFile, void* pvData, int32 cubDataToRead)
 {
-    if (!pchFile || !pvData) return 0;
+    if (!pchFile || !pvData || cubDataToRead <= 0) return 0;
     std::vector<uint8_t> buf;
-    if (!Storage::get().read_remote_file(pchFile, buf)) return 0;
+    if (!Storage::get().read_remote_file(pchFile, buf, 0, (size_t)cubDataToRead)) return 0;
     int32 to_copy = std::min(cubDataToRead, (int32)buf.size());
     memcpy(pvData, buf.data(), to_copy);
     return to_copy;
 }
 
-SteamAPICall_t StarSteamRemoteStorage::FileWriteAsync(const char* pchFile, const void* pvData, uint32 cubData)
+SteamAPICall_t StarSteamRemoteStorage::FileWriteAsync(const char* file, const void* data, uint32 size)
 {
-    bool ok = FileWrite(pchFile, pvData, (int32)cubData);
-    RemoteStorageFileWriteAsyncComplete_t result{};
-    result.m_eResult = ok ? k_EResultOK : k_EResultFail;
-    return STAR_PostCallResult(RemoteStorageFileWriteAsyncComplete_t::k_iCallback, &result, sizeof(result));
+    if (!file || (size && !data) || size > 128u * 1024u * 1024u) return k_uAPICallInvalid;
+    std::vector<uint8_t> copy(size);
+    if (size) memcpy(copy.data(), data, size);
+    auto handle = STAR_ReserveCallHandle();
+    bool accepted = worker_.submit([file = std::string(file), copy = std::move(copy), handle] {
+        RemoteStorageFileWriteAsyncComplete_t result{};
+        result.m_eResult = Storage::get().write_remote_file(file, copy.data(), copy.size()) ? k_EResultOK : k_EResultFail;
+        STAR_PostCallResult(RemoteStorageFileWriteAsyncComplete_t::k_iCallback, &result, sizeof(result), false, handle);
+    }, size);
+    return accepted ? handle : k_uAPICallInvalid;
 }
 
-SteamAPICall_t StarSteamRemoteStorage::FileReadAsync(const char* pchFile, uint32 nOffset, uint32 cubToRead)
+SteamAPICall_t StarSteamRemoteStorage::FileReadAsync(const char* file, uint32 offset, uint32 count)
 {
-    RemoteStorageFileReadAsyncComplete_t result{};
-    result.m_eResult = k_EResultFail;
-    result.m_nOffset = nOffset;
-    result.m_cubRead = 0;
-
-    if (pchFile) {
-        std::vector<uint8_t> buf;
-        if (Storage::get().read_remote_file(pchFile, buf)) {
-            uint32 available = (nOffset < (uint32)buf.size()) ? (uint32)(buf.size() - nOffset) : 0;
-            uint32 to_read   = (cubToRead == 0 || cubToRead > available) ? available : cubToRead;
-
-            SteamAPICall_t handle = STAR_ReserveCallHandle();
-
-            result.m_hFileReadAsync = handle;
+    if (!file) return k_uAPICallInvalid;
+    auto handle = STAR_ReserveCallHandle();
+    bool accepted = worker_.submit([this, file = std::string(file), offset, count, handle] {
+        RemoteStorageFileReadAsyncComplete_t result{};
+        result.m_hFileReadAsync = handle;
+        result.m_nOffset = offset;
+        result.m_eResult = k_EResultFail;
+        PendingAsyncRead read;
+        if (Storage::get().read_remote_file(file, read.data, offset, count ? count : SIZE_MAX)) {
+            result.m_cubRead = (uint32)read.data.size();
             result.m_eResult = k_EResultOK;
-            result.m_cubRead = to_read;
-
-            PendingAsyncRead pr;
-            pr.data.assign(buf.begin() + nOffset, buf.begin() + nOffset + to_read);
-            pending_reads_[handle] = std::move(pr);
-
-            STAR_PostCallResult(RemoteStorageFileReadAsyncComplete_t::k_iCallback, &result, sizeof(result), false, handle);
-            return handle;
+            std::lock_guard<std::mutex> lock(reads_mutex_);
+            pending_reads_[handle] = std::move(read);
         }
-    }
-
-    result.m_hFileReadAsync = k_uAPICallInvalid;
-    return STAR_PostCallResult(RemoteStorageFileReadAsyncComplete_t::k_iCallback, &result, sizeof(result));
+        STAR_PostCallResult(RemoteStorageFileReadAsyncComplete_t::k_iCallback, &result, sizeof(result), false, handle);
+    });
+    return accepted ? handle : k_uAPICallInvalid;
 }
-
 
 bool StarSteamRemoteStorage::FileReadAsyncComplete(SteamAPICall_t hReadCall, void* pvBuffer, uint32 cubToRead)
 {
     if (!pvBuffer) return false;
+    std::lock_guard<std::mutex> lock(reads_mutex_);
     auto it = pending_reads_.find(hReadCall);
     if (it == pending_reads_.end()) return false;
     uint32 copy_sz = std::min(cubToRead, (uint32)it->second.data.size());

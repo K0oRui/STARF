@@ -39,7 +39,6 @@ public:
     bool overlay_show_playtime = false;  // session playtime HUD (top-left)
     bool overlay_play_sound = true;      // achievement unlock sound
     std::string overlay_notify_pos = "bottom_right"; // top_left|top_right|bottom_left|bottom_right
-    bool overlay_dx12_render = true;     // DX12 overlay drawing (off = API-only, escape hatch)
     std::string overlay_mode = "auto";   // auto | hook | external
     std::string overlay_font;            // custom TTF (abs path or STAR-relative), empty = system font
 

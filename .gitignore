@@ -4,7 +4,6 @@
 
 # --- Build Directories ---
 /build/
-/build64/
 /dist/
 /out/
 CMakeCache.txt

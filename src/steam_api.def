@@ -1,7 +1,14 @@
 EXPORTS
+    UnityPluginLoad
+    UnityPluginUnload
     GetHSteamPipe
     GetHSteamUser
+    g_pSteamClientGameServer
     STAR_install_integrity_hooks
+    Steam_GetHSteamUserCurrent
+    Steam_RegisterInterfaceFuncs
+    Steam_RunCallbacks
+    SteamGameServer_InitSafe
     SteamAPI_GetHSteamPipe
     SteamAPI_GetHSteamUser
     SteamAPI_GetSteamInstallPath

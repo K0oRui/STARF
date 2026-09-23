@@ -1,6 +1,5 @@
 #include "steam/steam_matchmaking.h"
 #include "core/callbacks.h"
-#include "steam/isteammatchmaking.h"
 
 StarSteamMatchmaking& StarSteamMatchmaking::get() { static StarSteamMatchmaking i; return i; }
 CSteamID StarSteamMatchmaking::GetLobbyByIndex(int iLobby) { STAR_UNREFERENCED(iLobby); return k_steamIDNil; }

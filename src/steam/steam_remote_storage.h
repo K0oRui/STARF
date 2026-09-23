@@ -1,4 +1,5 @@
 #pragma once
+#include "core/work_queue.h"
 #include "core/star_common.h"
 #include "steam/isteamremotestorage001.h"
 #include "steam/isteamremotestorage002.h"
@@ -111,6 +112,8 @@ public:
     SteamAPICall_t EnumeratePublishedWorkshopFiles(EWorkshopEnumerationType eEnumerationType, uint32 unStartIndex, uint32 unCount, uint32 unDays, SteamParamStringArray_t* pTags, SteamParamStringArray_t* pUserTags) override;
     SteamAPICall_t UGCDownloadToLocation(UGCHandle_t hContent, const char* pchLocation, uint32 unPriority) override;
 
+    void start_async() { worker_.start(); }
+    void stop_async() { worker_.stop(); }
 private:
     StarSteamRemoteStorage() = default;
 
@@ -119,6 +122,8 @@ private:
     std::vector<std::string> cached_filelist_;
     UGCFileWriteStreamHandle_t next_stream_handle_ = 1;
 
+    WorkQueue worker_;
+    std::mutex reads_mutex_;
     struct PendingAsyncRead { std::vector<uint8_t> data; };
     std::map<SteamAPICall_t, PendingAsyncRead> pending_reads_;
 };

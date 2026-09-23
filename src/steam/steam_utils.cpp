@@ -1,7 +1,8 @@
 #include "steam/steam_utils.h"
+#include <wrl/client.h>
 #include "core/callbacks.h"
+#include "core/logging.h"
 #include "core/settings.h"
-#include "steam/isteamutils.h"
 #include <wincodec.h>
 #pragma comment(lib, "WindowsCodecs.lib")
 
@@ -202,45 +203,56 @@ int StarSteamUtils::StoreImage(uint32_t w, uint32_t h, const std::vector<uint8_t
 namespace {
 // WIC needs COM on THIS thread; overlay Present hooks run on the game's
 // render thread, which may never have called CoInitialize.
+// The imaging factory is cached per thread: CoCreateInstance costs
+// milliseconds and was previously paid once per thumbnail/size query.
+// Lifetime note: the cached factory intentionally outlives any single
+// WicFrame, whose destructor only balances the CoInitializeEx it performed.
+// Reuse always goes through WicFrame::open(), which re-initializes COM first,
+// so the cached pointer is never touched on an uninitialized apartment.
+IWICImagingFactory* wic_factory_for_thread()
+{
+    thread_local Microsoft::WRL::ComPtr<IWICImagingFactory> cached;
+    if (!cached) {
+        IWICImagingFactory* raw = nullptr;
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_IWICImagingFactory, (void**)&raw);
+        if (SUCCEEDED(hr) && raw) cached.Attach(raw);
+        else STAR_LOG_WARN("WIC: factory failed hr=0x%08x", (unsigned)hr);
+    }
+    return cached.Get();
+}
 struct WicFrame {
-    IWICImagingFactory* factory = nullptr;
-    IWICBitmapDecoder* decoder = nullptr;
-    IWICBitmapFrameDecode* frame = nullptr;
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
     bool com_here = false;
     ~WicFrame() {
-        if (frame) frame->Release();
-        if (decoder) decoder->Release();
-        if (factory) factory->Release();
         if (com_here) CoUninitialize();
     }
     bool open(const std::string& path) {
         HRESULT cohr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         if (cohr == S_OK) com_here = true;
         else if (FAILED(cohr) && cohr != RPC_E_CHANGED_MODE) {
-            STAR_LOG("WIC: CoInitializeEx failed hr=0x%08x for %s", (unsigned)cohr, path.c_str());
+            STAR_LOG_WARN("WIC: CoInitializeEx failed hr=0x%08x for %s", (unsigned)cohr, path.c_str());
             return false;
         }
-        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-            IID_IWICImagingFactory, (void**)&factory);
-        if (FAILED(hr) || !factory) {
-            STAR_LOG("WIC: factory failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
+        factory = wic_factory_for_thread();
+        if (!factory) {
             return false;
         }
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-        if (wlen <= 0) {
-            STAR_LOG("WIC: bad path %s", path.c_str());
+        std::wstring wpath = utf8_to_wstring(path);
+        if (wpath.empty()) {
+            STAR_LOG_WARN("WIC: bad path %s", path.c_str());
             return false;
         }
-        std::wstring wpath((size_t)wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
-        hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+        HRESULT hr = factory->CreateDecoderFromFilename(wpath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
         if (FAILED(hr) || !decoder) {
-            STAR_LOG("WIC: no decoder hr=0x%08x for %s", (unsigned)hr, path.c_str());
+            STAR_LOG_WARN("WIC: no decoder hr=0x%08x for %s", (unsigned)hr, path.c_str());
             return false;
         }
         hr = decoder->GetFrame(0, &frame);
         if (FAILED(hr) || !frame) {
-            STAR_LOG("WIC: no frame hr=0x%08x for %s", (unsigned)hr, path.c_str());
+            STAR_LOG_WARN("WIC: no frame hr=0x%08x for %s", (unsigned)hr, path.c_str());
             return false;
         }
         return true;
@@ -248,44 +260,16 @@ struct WicFrame {
 };
 } // namespace
 
-int StarSteamUtils::LoadImageFromFile(const std::string& path){
-    if (path.empty()) return 0;
-
-    WicFrame fr;
-    if (!fr.open(path)) return 0;
-
-    IWICFormatConverter* converter = nullptr;
-    fr.factory->CreateFormatConverter(&converter);
-    if (!converter) {
-        STAR_LOG("WIC: no converter for %s", path.c_str());
-        return 0;
-    }
-
-    HRESULT hr = converter->Initialize(fr.frame, GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone,
-        nullptr, 0.0, WICBitmapPaletteTypeCustom);
-    if (FAILED(hr)) {
-        STAR_LOG("WIC: convert failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
-        converter->Release();
-        return 0;
-    }
-
-    UINT w = 0, h = 0;
-    converter->GetSize(&w, &h);
-    if (w == 0 || h == 0 || w > 4096 || h > 4096) {
-        STAR_LOG("WIC: bad size %ux%u for %s", w, h, path.c_str());
-        converter->Release();
-        return 0;
-    }
-
-    std::vector<uint8_t> rgba((size_t)w * h * 4);
-    hr = converter->CopyPixels(nullptr, w * 4, (UINT)rgba.size(), rgba.data());
-    converter->Release();
-    if (FAILED(hr)) {
-        STAR_LOG("WIC: CopyPixels failed hr=0x%08x for %s", (unsigned)hr, path.c_str());
-        return 0;
-    }
-
-    return StoreImage(w, h, rgba);
+int StarSteamUtils::LoadImageFromFile(const std::string& path) {
+    std::lock_guard<std::mutex> lock(image_load_mutex_);
+    auto it = image_handles_.find(path);
+    if (it != image_handles_.end()) return it->second;
+    std::vector<uint8_t> rgba;
+    int w = 0, h = 0;
+    if (!LoadIconFile(path, rgba, w, h)) return 0;
+    int handle = StoreImage(w, h, rgba);
+    image_handles_[path] = handle;
+    return handle;
 }
 
 bool StarSteamUtils::GetImageFileSize(const std::string& path, uint32* w, uint32* h){
@@ -299,16 +283,41 @@ bool StarSteamUtils::GetImageFileSize(const std::string& path, uint32* w, uint32
     return true;
 }
 
-bool StarSteamUtils::LoadIconFile(const std::string& full_path, std::vector<uint8_t>& rgba, int& w, int& h)
+bool StarSteamUtils::LoadIconFile(const std::string& path, std::vector<uint8_t>& rgba,
+                                     int& w, int& h, int max_side)
 {
-    rgba.clear(); w = 0; h = 0;
-    int handle = LoadImageFromFile(full_path);
-    if (handle <= 0) return false;
-    uint32 uw = 0, uh = 0;
-    if (!GetImageSize(handle, &uw, &uh) || uw == 0 || uh == 0) return false;
-    w = (int)uw; h = (int)uh;
-    rgba.resize((size_t)uw * uh * 4);
-    return GetImageRGBA(handle, rgba.data(), (int)rgba.size());
+    rgba.clear(); w = h = 0;
+    WicFrame fr;
+    if (path.empty() || !fr.open(path)) return false;
+    UINT width = 0, height = 0;
+    if (FAILED(fr.frame->GetSize(&width, &height)) || !width || !height ||
+        width > 16384 || height > 16384) return false;
+    Microsoft::WRL::ComPtr<IWICBitmapScaler> scaler;
+    IWICBitmapSource* source = fr.frame.Get();
+    if (max_side > 0 && (width > (UINT)max_side || height > (UINT)max_side)) {
+        double scale = (double)max_side / std::max(width, height);
+        width = std::max(1u, (UINT)(width * scale));
+        height = std::max(1u, (UINT)(height * scale));
+        // Fant is the sharpest but far slowest scaler: brutal for 4K -> 256px
+        // thumbnails. Thumbs are shown at ~48px so Linear is plenty; the
+        // larger preview uses Cubic as the quality/speed balance.
+        WICBitmapInterpolationMode mode = max_side <= 512
+            ? WICBitmapInterpolationModeLinear
+            : WICBitmapInterpolationModeCubic;
+        if (FAILED(fr.factory->CreateBitmapScaler(&scaler)) ||
+            FAILED(scaler->Initialize(fr.frame.Get(), width, height, mode))) return false;
+        source = scaler.Get();
+    }
+    Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+    if (FAILED(fr.factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(source, GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) return false;
+    rgba.resize((size_t)width * height * 4);
+    if (FAILED(converter->CopyPixels(nullptr, width * 4, (UINT)rgba.size(), rgba.data()))) {
+        rgba.clear(); return false;
+    }
+    w = (int)width; h = (int)height;
+    return true;
 }
 
 bool StarSteamUtils::LoadSummaryIcon(std::vector<uint8_t>& rgba, int& w, int& h)

@@ -1,6 +1,5 @@
 #include "steam/steam_inventory.h"
 #include "core/callbacks.h"
-#include "steam/isteaminventory.h"
 
 StarSteamInventory& StarSteamInventory::get() { static StarSteamInventory i; return i; }
 

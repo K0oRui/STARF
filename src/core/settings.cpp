@@ -16,7 +16,7 @@ static void write_default_file(const std::string& path, const char* content)
     if (probe.is_open()) return; // never overwrite user files
     std::ofstream out(utf8_to_wstring(path));
     if (!out.is_open()) {
-        STAR_LOG("bootstrap: cannot create %s", path.c_str());
+        STAR_LOG_ERROR("bootstrap: cannot create %s", path.c_str());
         return;
     }
     out << content;
@@ -28,7 +28,7 @@ static void write_default_file(const std::string& path, const char* content)
 static void bootstrap_star_folder(const std::string& dir)
 {
     if (!Storage::ensure_dir(dir)) {
-        STAR_LOG("bootstrap: cannot create settings dir %s", dir.c_str());
+        STAR_LOG_ERROR("bootstrap: cannot create settings dir %s", dir.c_str());
         return;
     }
     Storage::ensure_dir(dir + "\\Fonts"); // custom overlay TTFs live here
@@ -66,7 +66,8 @@ static void bootstrap_star_folder(const std::string& dir)
         "# Screenshots go to Documents\\STAR\\screenshots\\<appid>\\.\n"
         "# enabled: true | false - master switch. false = no hooks, no window.\n"
         "enabled = true\n"
-        "# mode: auto | hook | external - auto tries hooks, falls back to external window if title hostile.\n"
+        "# mode: auto | hook | external - auto tries hooks every launch, falls back to external window for that session if title hostile or tiny.\n"
+        "#       A crash under hooks pins the next launch to external for one session. hook = never auto-fall back. external = always use the window.\n"
         "mode = auto\n"
         "# scale: 0.75 - 2.0 - UI size multiplier. Needs game restart.\n"
         "scale = 1.25\n"
@@ -80,8 +81,6 @@ static void bootstrap_star_folder(const std::string& dir)
         "play_sound = true\n"
         "# notify_pos: top_left | top_right | bottom_left | bottom_right (tl | tr | bl | br work too)\n"
         "notify_pos = bottom_right\n"
-        "# dx12_render: true | false - DX12 in-backbuffer drawing. Leave true; auto disables on hostile titles.\n"
-        "dx12_render = true\n"
         "# font: custom TTF for the overlay. Put the file in STAR/Fonts and name it here (e.g. poppins.ttf).\n"
         "# Absolute paths work too. Empty = system font. Needs game restart.\n"
         "font = \n");
@@ -152,7 +151,7 @@ void Settings::load(const std::string& dir)
 
     STAR_LOG("App ID: %u", app_id);
     if (app_id == 0) {
-        STAR_LOG("WARNING: no App ID found - put the numeric App ID in STAR/steam_appid.txt "
+        STAR_LOG_WARN("WARNING: no App ID found - put the numeric App ID in STAR/steam_appid.txt "
             "(or steam_appid.txt next to the game EXE). Saves and achievements need it.");
     }
 
@@ -198,7 +197,7 @@ void Settings::load(const std::string& dir)
         }
         if (!lang_found) {
             if (!supported_languages.empty()) {
-                STAR_LOG("Configured language '%s' not found in languages.star. Falling back to '%s'", language.c_str(), supported_languages.front().c_str());
+                STAR_LOG_WARN("Configured language '%s' not found in languages.star. Falling back to '%s'", language.c_str(), supported_languages.front().c_str());
                 language = supported_languages.front();
             } else {
                 supported_languages.push_back(language);
@@ -237,16 +236,13 @@ void Settings::load(const std::string& dir)
         IniFile ini;
         if (ini.load(dir + "\\overlay.star")) {
             overlay_enabled = ini.get_bool("", "enabled", true);
-            overlay_scale = ini.get_float("", "scale", 1.25f);
-            if (overlay_scale < 0.75f) overlay_scale = 0.75f;
-            if (overlay_scale > 2.0f) overlay_scale = 2.0f;
+            overlay_scale = std::clamp(ini.get_float("", "scale", 1.25f), 0.75f, 2.0f);
             overlay_accent = ini.get("", "accent", "blue");
             std::transform(overlay_accent.begin(), overlay_accent.end(), overlay_accent.begin(),
                 [](unsigned char c) { return (char)tolower(c); });
             overlay_show_fps = ini.get_bool("", "show_fps", false);
             overlay_show_playtime = ini.get_bool("", "show_playtime", false);
             overlay_play_sound = ini.get_bool("", "play_sound", true);
-            overlay_dx12_render = ini.get_bool("", "dx12_render", true);
             overlay_font = ini.get("", "font", "");
             overlay_mode = ini.get("", "mode", "auto");
             std::transform(overlay_mode.begin(), overlay_mode.end(), overlay_mode.begin(),
@@ -288,11 +284,11 @@ void Settings::load(const std::string& dir)
                     }
                 }
             } catch (...) {
-                STAR_LOG("Failed to parse achievements.json");
+                STAR_LOG_WARN("Failed to parse achievements.json");
             }
         }
     }
 
     STAR_LOG("Settings loaded: app_id=%u name='%s' achievements=%zu dlcs=%zu",
-        app_id, account_name.c_str(), achievements.size(), dlc_list.size());
+        app_id, STAR_MaskName(account_name).c_str(), achievements.size(), dlc_list.size());
 }

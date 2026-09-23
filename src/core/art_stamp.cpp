@@ -44,7 +44,7 @@ void stamp_star_configs(const std::string& dir)
 
         std::ofstream out(wfile_path, std::ios::trunc);
         if (!out.is_open()) {
-            STAR_LOG("stamp_star_configs: failed to open for write: %s", file_path.c_str());
+            STAR_LOG_WARN("stamp_star_configs: failed to open for write: %s", file_path.c_str());
             continue;
         }
         out << k_sentinel << "\n" << k_art << "\n" << rest << buf;

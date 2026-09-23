@@ -21,7 +21,7 @@ public:
 
     std::string remote_path(const std::string& filename);
     bool write_remote_file(const std::string& filename, const void* data, size_t size);
-    bool read_remote_file(const std::string& filename, std::vector<uint8_t>& out);
+    bool read_remote_file(const std::string& filename, std::vector<uint8_t>& out, size_t offset = 0, size_t count = SIZE_MAX);
     bool remote_file_exists(const std::string& filename);
     bool delete_remote_file(const std::string& filename);
     std::vector<std::string> list_remote_files();

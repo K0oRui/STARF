@@ -18,7 +18,8 @@ void Storage::init(uint32_t app_id, uint64_t steam_id)
     ensure_dir(base_path_);
     ensure_dir(remote_dir_);
 
-    STAR_LOG("Storage initialized at: %s", base_path_.c_str());
+    STAR_LOG("Storage initialized: app=%u user=%s", app_id,
+        STAR_MaskSteamId(steam_id).c_str());
 }
 
 static bool create_dir_recursive(const std::string& path)
@@ -174,17 +175,19 @@ bool Storage::write_remote_file(const std::string& filename, const void* data, s
     return f.good();
 }
 
-bool Storage::read_remote_file(const std::string& filename, std::vector<uint8_t>& out)
+bool Storage::read_remote_file(const std::string& filename, std::vector<uint8_t>& out, size_t offset, size_t count)
 {
     std::string path = remote_path(filename);
     if (!file_exists_w(path)) path = remote_path_legacy(remote_dir_, filename);
     std::ifstream f(utf8_to_wstring(path), std::ios::binary | std::ios::ate);
     if (!f.is_open()) return false;
-    size_t sz = (size_t)f.tellg();
-    f.seekg(0);
-    out.resize(sz);
-    f.read(reinterpret_cast<char*>(out.data()), sz);
-    return true;
+    auto end = f.tellg();
+    if (end < 0 || offset > (size_t)end) return false;
+    size_t size = std::min(count, (size_t)end - offset);
+    f.seekg((std::streamoff)offset);
+    out.resize(size);
+    if (size) f.read(reinterpret_cast<char*>(out.data()), size);
+    return f.good();
 }
 
 bool Storage::remote_file_exists(const std::string& filename)
@@ -201,7 +204,6 @@ bool Storage::delete_remote_file(const std::string& filename)
     return ok;
 }
 
-#include "core/storage.h"
 #include <filesystem>
 
 std::vector<std::string> Storage::list_remote_files()
