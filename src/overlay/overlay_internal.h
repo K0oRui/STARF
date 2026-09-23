@@ -17,6 +17,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <initializer_list>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -34,7 +35,7 @@ public:
     void init() override;
     void shutdown() override;
 
-    void hook_graphics_early() { hook_vulkan(); hook_dxgi(); }
+    void hook_graphics_early() { hook_vulkan(); hook_dxgi_early(); }
     void set_unity_interfaces(IUnityInterfaces* interfaces) { unity_interfaces_ = interfaces; }
 
     void push_achievement(const std::string& name, const std::string& desc,
@@ -57,14 +58,8 @@ public:
 
     enum class OverlayMode { Hook, External };
     std::atomic<OverlayMode> mode_{OverlayMode::Hook};
-    // Auto-fallback backoff (see switch_to_external): fallback_count_ is the
-    // number of sessions to skip before retrying hook mode; fallback_level_
-    // grows the skip window on repeated failures (1,3,7,15,31,63). Persisted
-    // in overlay.star; cleared when a retry session ends without falling back.
-    int fallback_count_ = 0;
-    int fallback_level_ = 0;
-    bool retry_session_ = false;
-    bool fell_back_this_session_ = false;
+    // Session-only mode: auto re-evaluates every launch (see init and
+    // switch_to_external). Nothing persists the hook/external decision.
 
     // ---- external window mode (no game hooks; own transparent window) ----
     HWND ext_hwnd_ = nullptr;
@@ -89,8 +84,9 @@ public:
     bool ext_visible_ = false;
     bool fg_ok_ = true;
     // Decoupled panel cursor (external mode): the game owns the OS cursor
-    // (locked/hidden/warped); the panel drives a virtual one from motion
-    // deltas so warps can never trap it. Screen coords.
+    // (locked/hidden); the panel mirrors its absolute position each frame
+    // (game warps are swallowed by the input hooks while open), clamped to
+    // the game rect. Screen coords.
     float ext_cur_x_ = 0, ext_cur_y_ = 0;
     POINT ext_last_real_ = {};
     bool ext_cur_init_ = false;
@@ -129,9 +125,18 @@ private:
     HDC gl_dc_ = nullptr;
     // Call with render_mutex_ held, before input, capture, or renderer work.
     bool accept_backend(GraphicsAPI api, HWND window);
+    // Single-backend fast path: true while unselected or locked to one of apis.
+    bool backend_mine(std::initializer_list<GraphicsAPI> apis) const {
+        GraphicsAPI sel = game_api_;
+        if (sel == GraphicsAPI::None) return true;
+        for (GraphicsAPI api : apis)
+            if (sel == api) return true;
+        return false;
+    }
     void shutdown_renderer();
 
     void hook_dxgi();
+    void hook_dxgi_early();
     void on_present(IDXGISwapChain* chain, UINT sync_interval, UINT flags);
     void on_resize_buffers(IDXGISwapChain* chain, UINT bc, UINT w, UINT h, DXGI_FORMAT fmt, UINT fl);
     void render_frame(IDXGISwapChain* chain);
@@ -282,12 +287,24 @@ private:
 
     void render_notifications(float dt);
     void render_panel();
-    void panel_header(ImFont* fsmall, ImFont* ftitle, float pw);
+    void panel_header(ImFont* fsmall, ImFont* ftitle);
     void panel_screenshots(ImFont* fsmall, float sw, float sh);
-    void panel_achievements(ImFont* fsmall, ImFont* ftitle, float pw, float sw, float sh);
+    void panel_achievements(ImFont* fsmall, ImFont* ftitle, float sw, float sh);
     void panel_display(ImFont* fsmall);
     void panel_notes(ImFont* fsmall);
     void panel_achievement_list(ImFont* fsmall, ImFont* ftitle);
+    // Single styled-button core: every panel button funnels through here.
+    bool styled_button(const char* label, const ImVec2& size, ImVec2 pad,
+                       ImVec4 bg, ImVec4 hov, ImVec4 act, ImVec4 text);
+    // Migrate to the external overlay when the game frame is too small for
+    // hook-drawn text (see kTinyFrameW/H). Returns true when it migrated, in
+    // which case the caller must skip hook drawing this frame.
+    bool migrate_if_tiny_frame(int w, int h);
+    bool migrate_if_tiny_frame(HWND window);
+    // Accent-tinted pill toggle (HUD/corner/filter tabs share one style).
+    bool pill_button(const char* label, const ImVec2& size, bool active);
+    // Muted default button (Screenshot/Close/Cancel share one style).
+    bool muted_button(const char* label, const ImVec2& size, ImVec2 pad, ImVec4 text);
     void render_hud();
     // Shared per-present UI build: panel animation, panel, notifications, HUD,
     // then ImGui::Render(). Backend-specific draw data submission follows.
@@ -318,6 +335,8 @@ private:
     void maybe_capture_vulkan(void* queue, const void* pPresentInfo);
     void hook_window();
     void hook_window_for(HWND h);
+    // WndProc swap honoring ANSI/Unicode windows. Returns the previous proc.
+    static WNDPROC swap_wndproc(HWND h, WNDPROC p);
     void toggle_overlay();
     void start_external_thread();
     void switch_to_external(const char* reason);
@@ -335,7 +354,6 @@ private:
     bool  opengl_hooked_     = false;
     bool  vulkan_hooked_     = false;
     bool  gdi_hooked_        = false;
-    std::atomic<bool> any_graphics_hook_installed_{false};
     std::atomic<bool> hotkey_prev_down_{false};
     bool  f12_prev_down_     = false;
     ScreenshotService screenshots_;
@@ -366,17 +384,15 @@ private:
     bool  open_              = false;
     float panel_anim_        = 0.0f;
     float panel_target_      = 0.0f;
-    float panel_anim_t0_     = 0.0f;
-    float last_frame_time_   = 0.0f;
+    double panel_anim_t0_    = 0.0;
+    double last_frame_time_  = 0.0;
     int   cursor_show_count_offset_ = 0;
 
     char  achievement_filter_[64] = {};
     int   filter_mode_       = 0; // 0=all, 1=unlocked, 2=locked
-    bool  bulk_confirm_pending_ = false;
     bool  bulk_is_unlock_ = true;
     int   session_unlocks_ = 0;
     std::string viewer_file_;
-    bool  viewer_pending_ = false;
     NotesStore notes_;
 
     ID3D11Device*           device_        = nullptr;

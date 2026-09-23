@@ -1,4 +1,5 @@
 #include "overlay/overlay_internal.h"
+#include "core/config.h"
 #include "core/settings.h"
 #include "core/storage.h"
 #include "imgui.h"
@@ -16,8 +17,83 @@
 #include <d3d10.h>
 #include <algorithm>
 #include <chrono>
+#include <fstream>
+#include <string>
 
 StarOverlay* g_overlay = nullptr;
+
+namespace {
+// Crash-pin sentinel: STAR/overlay.session holds the pid of the session that
+// started hooks. A clean shutdown deletes it (only its owner may); a stale
+// pid next launch means the hooks session died -> pin external for exactly
+// one session, then re-evaluate.
+std::string crash_pin_path()
+{
+    const std::string& dir = Settings::get().settings_dir;
+    if (dir.empty()) return {};
+    return dir + "\\overlay.session";
+}
+
+void write_crash_pin()
+{
+    std::string path = crash_pin_path();
+    if (path.empty()) return;
+    char own[32];
+    snprintf(own, sizeof(own), "%lu", (unsigned long)GetCurrentProcessId());
+    std::ofstream out(utf8_to_wstring(path), std::ios::trunc);
+    if (out.is_open()) out << own << "\n";
+}
+
+bool pid_alive(DWORD pid)
+{
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    DWORD code = 0;
+    bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+}
+
+// True when a previous hooks session crashed: the sentinel is consumed
+// (deleted) and the caller must start external this session. A pid that is
+// still alive belongs to a concurrent sharer of STAR/ (e.g. launcher) and is
+// re-stamped, never pinned.
+bool consume_crash_pin()
+{
+    std::string path = crash_pin_path();
+    if (path.empty()) return false;
+    std::ifstream in(utf8_to_wstring(path));
+    if (!in.is_open()) return false;
+    std::string pid_str;
+    std::getline(in, pid_str);
+    in.close();
+    char own[32];
+    snprintf(own, sizeof(own), "%lu", (unsigned long)GetCurrentProcessId());
+    if (pid_str == own) return false;
+    DWORD pid = 0;
+    try { pid = (DWORD)std::stoul(pid_str); } catch (...) { pid = 0; }
+    if (pid != 0 && pid_alive(pid)) {
+        write_crash_pin();
+        return false;
+    }
+    DeleteFileW(utf8_to_wstring(path).c_str());
+    return true;
+}
+
+void clear_crash_pin()
+{
+    std::string path = crash_pin_path();
+    if (path.empty()) return;
+    std::ifstream in(utf8_to_wstring(path));
+    if (!in.is_open()) return;
+    std::string pid_str;
+    std::getline(in, pid_str);
+    in.close();
+    char own[32];
+    snprintf(own, sizeof(own), "%lu", (unsigned long)GetCurrentProcessId());
+    if (pid_str == own) DeleteFileW(utf8_to_wstring(path).c_str());
+}
+} // namespace
 
 StarOverlay& StarOverlay::get()
 {
@@ -41,31 +117,44 @@ void StarOverlay::init()
     Storage::get().load_playtime(base_playtime_sec_);
     notes_.load();
     mode_ = (Settings::get().overlay_mode == "external") ? OverlayMode::External : OverlayMode::Hook;
-    // "auto" (default) starts on hooks and falls back to external if the
-    // title proves hostile (see switch_to_external).
+    // "auto" (default) re-evaluates every launch: always starts on hooks and
+    // falls back to external within the session if the title proves hostile
+    // or tiny (see switch_to_external). Nothing persists the decision, except
+    // the crash pin: a stale sentinel means the last hooks session died, so
+    // play it safe for exactly one session.
     if (!enabled_) return;
+    // One-time migration: pre-session-fallback builds persisted mode=external
+    // together with nonzero fallback_count/fallback_level on auto-fallback.
+    // An explicit user choice of external has no such keys and is respected.
+    {
+        IniFile ini;
+        if (!Settings::get().settings_dir.empty() &&
+            ini.load(Settings::get().settings_dir + "\\overlay.star")) {
+            int fc = ini.get_int("", "fallback_count", 0);
+            int fl = ini.get_int("", "fallback_level", 0);
+            if (fc != 0 || fl != 0) {
+                if (mode_ == OverlayMode::External) {
+                    STAR_LOG("Migrating stale auto-fallback state to mode=auto "
+                        "(was external with fallback_count=%d fallback_level=%d)", fc, fl);
+                    mode_ = OverlayMode::Hook;
+                    save_overlay_key("mode", "auto");
+                }
+                save_overlay_key("fallback_count", "0");
+                save_overlay_key("fallback_level", "0");
+            }
+        }
+    }
+    if (mode_ == OverlayMode::Hook) {
+        if (Settings::get().overlay_mode == "auto" && consume_crash_pin()) {
+            mode_ = OverlayMode::External;
+            STAR_LOG("Previous session crashed under hooks - starting external this session");
+        } else {
+            write_crash_pin();
+        }
+    }
     screenshots_.start();
     icon_decode_stop_ = false;
     icon_decode_thread_ = std::thread(&StarOverlay::icon_decode_worker, this);
-    fallback_count_ = Settings::get().overlay_fallback_count;
-    fallback_level_ = Settings::get().overlay_fallback_level;
-    retry_session_ = false;
-    fell_back_this_session_ = false;
-    if (mode_ == OverlayMode::External && fallback_count_ > 0) {
-        // A previous session fell back to external. Skip this one too, then
-        // retry hooks once the skip window runs out (exponential backoff).
-        // The persisted mode stays "external" until a retry session either
-        // ends cleanly (shutdown clears it) or falls back again (which grows
-        // the window), so a crash mid-retry just skips again next launch.
-        if (--fallback_count_ == 0) {
-            mode_ = OverlayMode::Hook;
-            retry_session_ = true;
-            STAR_LOG("Overlay backoff done - retrying hook mode this session");
-        } else {
-            save_overlay_key("fallback_count", std::to_string(fallback_count_));
-            STAR_LOG("Overlay staying external (backoff %d sessions left)", fallback_count_);
-        }
-    }
     if (hooks_installed_) return;
     MH_STATUS mh_init = MH_Initialize();
     if (mh_init != MH_OK && mh_init != MH_ERROR_ALREADY_INITIALIZED) STAR_LOG("MinHook init failed status=%d", (int)mh_init);
@@ -78,71 +167,28 @@ void StarOverlay::init()
     HMODULE user32 = GetModuleHandleA("user32.dll");
     if (!user32) user32 = LoadLibraryA("user32.dll");
     if (user32) {
-        void* pShowCursor = (void*)GetProcAddress(user32, "ShowCursor");
-        if (!orig_show_cursor_ && MH_CreateHook(pShowCursor, &hooked_ShowCursor, (void**)&orig_show_cursor_) == MH_OK) {
-            MH_EnableHook(pShowCursor);
-            STAR_LOG("ShowCursor hooked");
-        }
-        void* pClipCursor = (void*)GetProcAddress(user32, "ClipCursor");
-        if (!orig_clip_cursor_ && MH_CreateHook(pClipCursor, &hooked_ClipCursor, (void**)&orig_clip_cursor_) == MH_OK) {
-            MH_EnableHook(pClipCursor);
-            STAR_LOG("ClipCursor hooked");
-        }
-        void* pSetCursor = (void*)GetProcAddress(user32, "SetCursor");
-        if (!orig_set_cursor_ && MH_CreateHook(pSetCursor, &hooked_SetCursor, (void**)&orig_set_cursor_) == MH_OK) {
-            MH_EnableHook(pSetCursor);
-            STAR_LOG("SetCursor hooked");
-        }
-
-        // Input blackout hooks: lie to game-side polling while open_.
-        // Our own polling below always goes through orig_* (real state).
-        void* pAsyncKey = (void*)GetProcAddress(user32, "GetAsyncKeyState");
-        if (pAsyncKey && !orig_get_async_key_ &&
-            MH_CreateHook(pAsyncKey, &hooked_GetAsyncKeyState, (void**)&orig_get_async_key_) == MH_OK) {
-            MH_EnableHook(pAsyncKey);
-            STAR_LOG("GetAsyncKeyState hooked");
-        }
-        void* pKbState = (void*)GetProcAddress(user32, "GetKeyboardState");
-        if (pKbState && !orig_get_keyboard_state_ &&
-            MH_CreateHook(pKbState, &hooked_GetKeyboardState, (void**)&orig_get_keyboard_state_) == MH_OK) {
-            MH_EnableHook(pKbState);
-            STAR_LOG("GetKeyboardState hooked");
-        }
-        void* pKeyState = (void*)GetProcAddress(user32, "GetKeyState");
-        if (pKeyState && !orig_get_key_ &&
-            MH_CreateHook(pKeyState, &hooked_GetKeyState, (void**)&orig_get_key_) == MH_OK) {
-            MH_EnableHook(pKeyState);
-            STAR_LOG("GetKeyState hooked");
-        }
-        void* pCursorPos = (void*)GetProcAddress(user32, "GetCursorPos");
-        if (pCursorPos && !orig_get_cursor_pos_ &&
-            MH_CreateHook(pCursorPos, &hooked_GetCursorPos, (void**)&orig_get_cursor_pos_) == MH_OK) {
-            MH_EnableHook(pCursorPos);
-            STAR_LOG("GetCursorPos hooked");
-        }
-        // Unity-style cursor lock warps to center every frame via SetCursorPos.
-        // Drop those warps while open so the panel mouse stays free; physical
-        // mouse movement never goes through here so ImGui still tracks.
-        void* pSetCursorPos = (void*)GetProcAddress(user32, "SetCursorPos");
-        if (pSetCursorPos && !orig_set_cursor_pos_ &&
-            MH_CreateHook(pSetCursorPos, &hooked_SetCursorPos, (void**)&orig_set_cursor_pos_) == MH_OK) {
-            MH_EnableHook(pSetCursorPos);
-            STAR_LOG("SetCursorPos hooked");
-        }
-        // Same warps can arrive as injected input (Unity centers via
-        // SendInput/mouse_event on some versions). Drop injected mouse
-        // motion while open; physical mouse never travels this path.
-        void* pSendInput = (void*)GetProcAddress(user32, "SendInput");
-        if (pSendInput && !orig_send_input_ &&
-            MH_CreateHook(pSendInput, &hooked_SendInput, (void**)&orig_send_input_) == MH_OK) {
-            MH_EnableHook(pSendInput);
-            STAR_LOG("SendInput hooked");
-        }
-        void* pMouseEvent = (void*)GetProcAddress(user32, "mouse_event");
-        if (pMouseEvent && !orig_mouse_event_ &&
-            MH_CreateHook(pMouseEvent, &hooked_mouse_event, (void**)&orig_mouse_event_) == MH_OK) {
-            MH_EnableHook(pMouseEvent);
-            STAR_LOG("mouse_event hooked");
+        // Cursor/input hooks: while open_, the game is lied to about cursor
+        // and keyboard state (Unity re-centers via SetCursorPos/SendInput, so
+        // those warps are dropped too). Our own polling uses orig_* (truth).
+        struct User32Hook { const char* name; void* detour; void** orig; };
+        const User32Hook hooks[] = {
+            {"ShowCursor", (void*)&hooked_ShowCursor, (void**)&orig_show_cursor_},
+            {"ClipCursor", (void*)&hooked_ClipCursor, (void**)&orig_clip_cursor_},
+            {"SetCursor", (void*)&hooked_SetCursor, (void**)&orig_set_cursor_},
+            {"GetAsyncKeyState", (void*)&hooked_GetAsyncKeyState, (void**)&orig_get_async_key_},
+            {"GetKeyboardState", (void*)&hooked_GetKeyboardState, (void**)&orig_get_keyboard_state_},
+            {"GetKeyState", (void*)&hooked_GetKeyState, (void**)&orig_get_key_},
+            {"GetCursorPos", (void*)&hooked_GetCursorPos, (void**)&orig_get_cursor_pos_},
+            {"SetCursorPos", (void*)&hooked_SetCursorPos, (void**)&orig_set_cursor_pos_},
+            {"SendInput", (void*)&hooked_SendInput, (void**)&orig_send_input_},
+            {"mouse_event", (void*)&hooked_mouse_event, (void**)&orig_mouse_event_},
+        };
+        for (const auto& hook : hooks) {
+            void* target = (void*)GetProcAddress(user32, hook.name);
+            if (target && !*hook.orig && MH_CreateHook(target, hook.detour, hook.orig) == MH_OK) {
+                MH_EnableHook(target);
+                STAR_LOG("%s hooked", hook.name);
+            }
         }
     }
 
@@ -151,10 +197,14 @@ void StarOverlay::init()
         // ECL interception never touch GPU state); only drawing is skipped.
         // User32 (cursor/input-blackout) hooks stay; they never touch
         // rendering and are proven safe.
-        hooks_installed_ = true;
         start_external_thread();
     }
 
+    // Hook install is NOT backend use: hooks are pure passthrough detectors
+    // until the first real present locks selection. Exactly one backend ever
+    // initializes/draws (per-present single-backend guards + BackendSelection,
+    // with GDI additionally requiring sustained drawing); the rest stay
+    // passthrough and the retry thread stops once locked.
     hook_dx9();
     hook_dx8();
     hook_dx7();
@@ -214,8 +264,9 @@ void StarOverlay::shutdown_renderer()
     } else {
 #ifdef _WIN64
         if (active_api_ == GraphicsAPI::DX12) icons_.clear();
+        else
 #endif
-        else icons_.release_all([this](ImTextureID texture) { release_icon(texture); });
+        icons_.release_all([this](ImTextureID texture) { release_icon(texture); });
         if (imgui_initialized_) {
             switch (active_api_) {
             case GraphicsAPI::DX7: ImGui_ImplDX7_Shutdown(); break;
@@ -266,33 +317,44 @@ void StarOverlay::start_external_thread()
 
 void StarOverlay::switch_to_external(const char* reason)
 {
-    // Hook rendering proved hostile (GPU fault / endless fence timeouts).
-    // Remember "external" itself so the next launch
-    // goes straight to the working UI. API emulation + input hooks stay.
-    // The fallback is not permanent: an exponential backoff (1,3,7,15,31,63
-    // skipped sessions) retries hook mode on later launches, so a transient
-    // GPU hiccup heals itself. Explicit "hook" mode never auto-falls back.
+    // Hook rendering proved hostile or the frame proved tiny: fall back to
+    // external for the rest of this session only. Explicit "hook" mode never
+    // auto-falls back. Nothing is persisted, so the next launch re-evaluates.
     if (mode_ == OverlayMode::External) return;
     if (Settings::get().overlay_mode == "hook") {
         STAR_LOG("Hook mode hostile (%s) - staying on hooks (mode=hook is explicit)", reason);
         return;
     }
     mode_ = OverlayMode::External;
-    fell_back_this_session_ = true;
-    fallback_level_ = std::min(fallback_level_ + 1, 6);
-    fallback_count_ = (1 << fallback_level_) - 1;
-    save_overlay_key("mode", "external");
-    save_overlay_key("fallback_count", std::to_string(fallback_count_));
-    save_overlay_key("fallback_level", std::to_string(fallback_level_));
-    STAR_LOG("Switching to external overlay (%s) - backoff level %d (%d sessions)",
-        reason, fallback_level_, fallback_count_);
+    STAR_LOG("Switching to external overlay (%s) for this session", reason);
     start_external_thread();
+}
+
+bool StarOverlay::migrate_if_tiny_frame(int w, int h)
+{
+    // Pre-checked so a game that stays tiny (or explicit mode=hook) never
+    // spams the switch log once per present.
+    if (mode_ == OverlayMode::External || Settings::get().overlay_mode == "hook") return false;
+    if (w >= kTinyFrameW && h >= kTinyFrameH) return false;
+    if (w <= 0 || h <= 0) return false;
+    char why[64];
+    snprintf(why, sizeof(why), "tiny frame %dx%d", w, h);
+    switch_to_external(why);
+    return mode_ == OverlayMode::External;
+}
+
+bool StarOverlay::migrate_if_tiny_frame(HWND window)
+{
+    if (!window) return false;
+    RECT rc{};
+    if (!GetClientRect(window, &rc)) return false;
+    return migrate_if_tiny_frame(rc.right - rc.left, rc.bottom - rc.top);
 }
 
 void StarOverlay::ensure_hooks()
 {
     if (!enabled_ || !g_overlay) return;
-    // Each hook fn is now idempotent (checks orig_* / hooked flag), so safe to retry.
+    // Each hook fn is idempotent, so retrying pre-lock is safe.
     if (!dxgi_hooked_) hook_dxgi();
     if (!dx9_hooked_) hook_dx9();
     if (!dx8_hooked_) hook_dx8();
@@ -345,7 +407,7 @@ std::string StarOverlay::format_playtime(uint64_t secs)
 
 void StarOverlay::shutdown()
 {
-    bool was_enabled = enabled_.exchange(false);
+    enabled_ = false;
     if (gdi_message_hook_) {
         UnhookWindowsHookEx(gdi_message_hook_);
         gdi_message_hook_ = nullptr;
@@ -355,14 +417,6 @@ void StarOverlay::shutdown()
     retry_cv_.notify_all();
     if (retry_thread_.joinable()) retry_thread_.join();
     screenshots_.stop();
-    // A retry session that survived without falling back again means the
-    // hostile title healed: clear the backoff so future launches use hooks.
-    if (retry_session_ && !fell_back_this_session_) {
-        save_overlay_key("mode", "auto");
-        save_overlay_key("fallback_count", "0");
-        save_overlay_key("fallback_level", "0");
-        STAR_LOG("Overlay retry session clean - backoff cleared");
-    }
     if (icon_decode_thread_.joinable()) {
         {
             std::lock_guard<std::mutex> lock(icon_decode_mutex_);
@@ -390,11 +444,7 @@ void StarOverlay::shutdown()
     }
 
     if (hwnd_ && wnd_proc_orig_) {
-        if (IsWindowUnicode(hwnd_)) {
-            SetWindowLongPtrW(hwnd_, GWLP_WNDPROC, (LONG_PTR)wnd_proc_orig_);
-        } else {
-            SetWindowLongPtrA(hwnd_, GWLP_WNDPROC, (LONG_PTR)wnd_proc_orig_);
-        }
+        swap_wndproc(hwnd_, wnd_proc_orig_);
         wnd_proc_orig_ = nullptr;
     }
 
@@ -410,6 +460,8 @@ void StarOverlay::shutdown()
     retry_stop_ = true;
     enabled_ = false;
     open_ = false;
-    if (!was_enabled) return;
+    // Reaching here means a clean exit: a crash or kill never gets this far,
+    // so its sentinel survives and pins the next launch.
+    clear_crash_pin();
 }
 

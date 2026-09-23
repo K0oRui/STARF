@@ -64,14 +64,11 @@ SHORT StarOverlay::real_GetKeyState(int vk)
 
 BOOL StarOverlay::caller_in_self_module(void* caller)
 {
-    static HMODULE self_base = nullptr;
-    static bool resolved = false;
-    if (!resolved) {
-        resolved = true;
+    static HMODULE self_base = [] {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery((void*)&hooked_GetCursorPos, &mbi, sizeof(mbi)))
-            self_base = (HMODULE)mbi.AllocationBase;
-    }
+        return VirtualQuery((void*)&hooked_GetCursorPos, &mbi, sizeof(mbi))
+            ? (HMODULE)mbi.AllocationBase : nullptr;
+    }();
     MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(caller, &mbi, sizeof(mbi))) return false;
     return self_base && mbi.AllocationBase == self_base;
@@ -104,10 +101,8 @@ SHORT WINAPI StarOverlay::hooked_GetKeyState(int vkey)
 BOOL WINAPI StarOverlay::hooked_GetCursorPos(LPPOINT pt)
 {
     auto* o = g_overlay;
-    if (!o || !o->orig_get_cursor_pos_) {
-        return o ? (o->orig_get_cursor_pos_ ? o->orig_get_cursor_pos_(pt) : FALSE)
-                 : ::GetCursorPos(pt);
-    }
+    if (!o) return ::GetCursorPos(pt);
+    if (!o->orig_get_cursor_pos_) return FALSE;
     // ImGui's own backend polls through here too; give our own code the truth.
     if (caller_in_self_module(_ReturnAddress())) return o->orig_get_cursor_pos_(pt);
     if (o->open_) {
@@ -143,13 +138,6 @@ static bool strip_mouse_motion(MOUSEINPUT& mi)
     mi.dx = 0;
     mi.dy = 0;
     return true;
-}
-
-static bool is_injected_mouse_move(const MOUSEINPUT& mi)
-{
-    // Pure motion (no buttons/wheel in the same packet) is a cursor warp.
-    MOUSEINPUT c = mi;
-    return strip_mouse_motion(c) && (c.dwFlags & kMouseButtonBits) == 0;
 }
 
 UINT WINAPI StarOverlay::hooked_SendInput(UINT nInputs, LPINPUT pInputs, int cbSize)
@@ -188,7 +176,8 @@ void WINAPI StarOverlay::hooked_mouse_event(DWORD dwFlags, DWORD dx, DWORD dy, D
         mi.dwFlags = dwFlags;
         mi.dx = (LONG)dx;
         mi.dy = (LONG)dy;
-        if (is_injected_mouse_move(mi)) return; // pure warp: drop it
+        MOUSEINPUT c = mi;
+        if (strip_mouse_motion(c) && (c.dwFlags & kMouseButtonBits) == 0) return; // pure warp: drop it
         if (strip_mouse_motion(mi)) {
             // Mixed packet: forward buttons/wheel, drop the motion.
             if (o->orig_mouse_event_) o->orig_mouse_event_(mi.dwFlags, 0, 0, dwData, dwExtraInfo);

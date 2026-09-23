@@ -3,6 +3,7 @@
 // for hostile titles (e.g. engines whose backbuffers fault on foreign access).
 // Reuses the same panel/toast/HUD/icon code as the hook path.
 #include "overlay/overlay_internal.h"
+#include "overlay/core/pixel_copy.h"
 #include "core/settings.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -316,23 +317,26 @@ void StarOverlay::external_cursor_frame()
 {
     POINT real{};
     read_cursor_pos(real);
-    int dx = real.x - ext_last_real_.x;
-    int dy = real.y - ext_last_real_.y;
-    ext_last_real_ = real;
-    // Small deltas = physical mouse; huge jumps = game warps (ignored).
-    if (dx > -300 && dx < 300 && dy > -300 && dy < 300) {
-        ext_cur_x_ += dx;
-        ext_cur_y_ += dy;
-    }
     HWND anchor = ext_game_hwnd_ ? ext_game_hwnd_ : ext_hwnd_;
     RECT rc{};
     GetWindowRect(anchor, &rc);
     if (rc.right > rc.left) {
-        if (ext_cur_x_ < rc.left) ext_cur_x_ = (float)rc.left;
-        if (ext_cur_x_ >= rc.right) ext_cur_x_ = (float)(rc.right - 1);
-        if (ext_cur_y_ < rc.top) ext_cur_y_ = (float)rc.top;
-        if (ext_cur_y_ >= rc.bottom) ext_cur_y_ = (float)(rc.bottom - 1);
+        // Absolute mapping: while the panel is open the game's cursor warps
+        // (SetCursorPos/SendInput/mouse_event) are swallowed by the input
+        // hooks, so the OS cursor tracks the physical mouse 1:1. The old
+        // delta accumulation drifted, froze on fast flicks that tripped the
+        // warp filter, and jittered from any unhooked warp source.
+        // Positions far outside the game rect (e.g. mid alt-tab) are ignored
+        // rather than teleporting the panel cursor.
+        if (real.x >= rc.left - 64 && real.x < rc.right + 64 &&
+            real.y >= rc.top - 64 && real.y < rc.bottom + 64) {
+            LONG cx = real.x < rc.left ? rc.left : (real.x >= rc.right ? rc.right - 1 : real.x);
+            LONG cy = real.y < rc.top ? rc.top : (real.y >= rc.bottom ? rc.bottom - 1 : real.y);
+            ext_cur_x_ = (float)cx;
+            ext_cur_y_ = (float)cy;
+        }
     }
+    ext_last_real_ = real;
     // Keep the OS cursor parked in case the game re-showed it.
     if (probe_cursor_count() >= 0) show_cursor(FALSE);
     RECT wr{};
@@ -349,38 +353,22 @@ void StarOverlay::external_render_frame()
 #endif
     // Click-through state lives here (not below the surface checks) so a
     // bailed frame can never leave an invisible window swallowing the mouse.
-    {
-        LONG_PTR ex = GetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE);
-        bool want_click = open_;
-        bool has_click = (ex & WS_EX_TRANSPARENT) == 0;
-        if (want_click != has_click) {
-            if (want_click) ex &= ~WS_EX_TRANSPARENT;
-            else ex |= WS_EX_TRANSPARENT;
-            SetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE, ex);
-        }
-    }
+    LONG_PTR ex = GetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE);
+    LONG_PTR want_ex = open_ ? (ex & ~WS_EX_TRANSPARENT) : (ex | WS_EX_TRANSPARENT);
+    if (want_ex != ex) SetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE, want_ex);
     if (!imgui_initialized_) return;
-    if (ext_use_d3d9_) {
-        if (!ext_d3d9_dev_) return;
-    } else {
-        if (!device_ || !context_) return;
-    }
+    if (ext_use_d3d9_ ? !ext_d3d9_dev_ : (!device_ || !context_)) return;
 
     RECT rc{};
     GetClientRect(ext_hwnd_, &rc);
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return;
-    if (w != ext_w_ || h != ext_h_) {
-        if (!external_alloc_surfaces(w, h)) return;
-    }
+    if ((w != ext_w_ || h != ext_h_) && !external_alloc_surfaces(w, h)) return;
 
     if (ext_use_d3d9_) {
         ImGui_ImplDX9_NewFrame();
     } else {
-        if (!rtv_) {
-            device_->CreateRenderTargetView(ext_rt_tex_, nullptr, &rtv_);
-        }
+        if (!rtv_) device_->CreateRenderTargetView(ext_rt_tex_, nullptr, &rtv_);
         if (!rtv_) return;
         ImGui_ImplDX11_NewFrame();
     }
@@ -396,19 +384,13 @@ void StarOverlay::external_render_frame()
     apply_cursor_mode();
 
     build_frame_ui();
-    {
-        static bool logged_frame = false;
-        if (!logged_frame) {
-            logged_frame = true;
-            ImDrawData* dd = ImGui::GetDrawData();
-            STAR_LOG("External: first frame open=%d anim=%.3f disp=%.0fx%.0f lists=%d totalvtx=%d backend=%s",
-                (int)open_, panel_anim_,
-                ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y,
-                dd ? dd->CmdListsCount : -1,
-                dd ? dd->TotalVtxCount : -1,
-                ext_use_d3d9_ ? "d3d9" : "d3d11");
-        }
-    }
+    ImDrawData* dd = ImGui::GetDrawData();
+    STAR_LOG_ONCE("External: first frame open=%d anim=%.3f disp=%.0fx%.0f lists=%d totalvtx=%d backend=%s",
+        (int)open_, panel_anim_,
+        ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y,
+        dd ? dd->CmdListsCount : -1,
+        dd ? dd->TotalVtxCount : -1,
+        ext_use_d3d9_ ? "d3d9" : "d3d11");
 
     if (!external_draw_snapshot_.changed(ImGui::GetDrawData())) return;
     if (ext_use_d3d9_) {
@@ -426,9 +408,7 @@ void StarOverlay::external_render_frame()
             if (SUCCEEDED(ext_d3d9_sys_->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
                 const uint8_t* src = (const uint8_t*)lr.pBits;
                 uint8_t* dst = (uint8_t*)ext_pixels_.bits();
-                size_t row = (size_t)w * 4;
-                for (int y = 0; y < h; y++)
-                    memcpy(dst + (size_t)y * row, src + (size_t)y * lr.Pitch, row);
+                copy_pixels32(dst, (size_t)w * 4, src, (size_t)lr.Pitch, (size_t)w, (size_t)h, false);
                 ext_d3d9_sys_->UnlockRect();
                 external_upload_layered(w, h);
             } else external_draw_snapshot_.clear();
@@ -445,9 +425,8 @@ void StarOverlay::external_render_frame()
         if (SUCCEEDED(context_->Map(ext_stage_tex_, 0, D3D11_MAP_READ, 0, &map))) {
             const uint8_t* src = (const uint8_t*)map.pData;
             uint8_t* dst = (uint8_t*)ext_pixels_.bits();
-            size_t row = (size_t)w * 4;
-            for (int y = 0; y < h; y++)
-                memcpy(dst + (size_t)y * row, src + (size_t)y * map.RowPitch, row);
+            // R8G8B8A8_UNORM maps as RGBA; the 32-bit BI_RGB DIB wants BGRA.
+            copy_pixels32(dst, (size_t)w * 4, src, map.RowPitch, (size_t)w, (size_t)h, true);
             context_->Unmap(ext_stage_tex_, 0);
             external_upload_layered(w, h);
         } else external_draw_snapshot_.clear();
@@ -461,6 +440,9 @@ void StarOverlay::external_upload_layered(int w, int h)
     uint8_t* dst = (uint8_t*)ext_pixels_.bits();
     size_t row = (size_t)w * 4;
     size_t bytes = row * (size_t)h;
+    // Layered windows blend as premultiplied alpha; the renderer outputs
+    // straight alpha, so convert before the compare/upload.
+    premultiply_inplace(dst, (size_t)w, (size_t)h);
     if (ext_prev_.size() == bytes &&
         memcmp(ext_prev_.data(), dst, bytes) == 0)
         return;
@@ -474,23 +456,14 @@ void StarOverlay::external_upload_layered(int w, int h)
     dst_pt.y = rc.top;
     SIZE sz{ w, h };
     POINT src_pt{ 0, 0 };
-    BLENDFUNCTION bf{};
-    bf.BlendOp = AC_SRC_OVER;
-    bf.SourceConstantAlpha = 255;
-    bf.AlphaFormat = AC_SRC_ALPHA;
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     HDC screen = GetDC(nullptr);
     BOOL ulw = UpdateLayeredWindow(ext_hwnd_, screen, &dst_pt, &sz, ext_pixels_.dc(),
         &src_pt, 0, &bf, ULW_ALPHA);
     DWORD ulw_err = ulw ? 0 : GetLastError();
     ReleaseDC(nullptr, screen);
-    {
-        static bool logged_ulw = false;
-        if (!logged_ulw) {
-            logged_ulw = true;
-            STAR_LOG("External: first ULW ok=%d err=%lu (%dx%d)", (int)ulw,
-                (unsigned long)ulw_err, w, h);
-        }
-    }
+    STAR_LOG_ONCE("External: first ULW ok=%d err=%lu (%dx%d)", (int)ulw,
+        (unsigned long)ulw_err, w, h);
 }
 
 void StarOverlay::external_thread_proc()
@@ -578,26 +551,18 @@ void StarOverlay::external_thread_proc()
         if ((frame++ % 30) == 0) external_track_game_window();
 
         bool panel_active = open_ || panel_anim_ > 0.001f;
-        bool want = fg_ok_ && panel_active;
-        if (!want && fg_ok_) {
-            want = (notifications_.has_pending() || screenshots_.busy());
-            if (!want)
-                want = Settings::get().overlay_show_fps || Settings::get().overlay_show_playtime;
+        bool want = fg_ok_ && (panel_active || notifications_.has_pending() || screenshots_.busy() ||
+            Settings::get().overlay_show_fps || Settings::get().overlay_show_playtime);
+        if (want != ext_visible_) {
+            ShowWindow(ext_hwnd_, want ? SW_SHOWNOACTIVATE : SW_HIDE);
+            ext_visible_ = want;
         }
         if (want) {
-            if (!ext_visible_) {
-                ShowWindow(ext_hwnd_, SW_SHOWNOACTIVATE);
-                ext_visible_ = true;
-            }
             external_render_frame();
             // Interactive while open, calm while closed (HUD/toasts only).
             // Keep the panel animating out at full rate too.
             std::this_thread::sleep_for(std::chrono::milliseconds(panel_active ? 8 : 33));
         } else {
-            if (ext_visible_) {
-                ShowWindow(ext_hwnd_, SW_HIDE);
-                ext_visible_ = false;
-            }
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
     }

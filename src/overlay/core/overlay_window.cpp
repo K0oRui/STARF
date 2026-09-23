@@ -74,8 +74,7 @@ void StarOverlay::poll_hotkey()
     // Also allow Shift+` (backtick) as alt combo for keyboards/layouts where Tab is swallowed
     if (!down) {
         SHORT oem3 = real_GetAsyncKeyState(VK_OEM_3);
-        SHORT shiftOnly = real_GetAsyncKeyState(VK_SHIFT);
-        if (((shiftOnly & 0x8000) != 0) && ((oem3 & 0x8000) != 0))
+        if (((shift & 0x8000) != 0) && ((oem3 & 0x8000) != 0))
             down = true;
     }
     const bool was_down = hotkey_prev_down_.exchange(down);
@@ -228,27 +227,23 @@ void StarOverlay::hook_window_for(HWND h)
     if (h == hwnd_ && wnd_proc_orig_) return;
     // Window recreated (Unity mode switch / multi-window): unhook old, hook new.
     if (hwnd_ && wnd_proc_orig_ && hwnd_ != h) {
-        if (IsWindow(hwnd_)) {
-            if (IsWindowUnicode(hwnd_))
-                SetWindowLongPtrW(hwnd_, GWLP_WNDPROC, (LONG_PTR)wnd_proc_orig_);
-            else
-                SetWindowLongPtrA(hwnd_, GWLP_WNDPROC, (LONG_PTR)wnd_proc_orig_);
-        }
+        if (IsWindow(hwnd_)) swap_wndproc(hwnd_, wnd_proc_orig_);
         wnd_proc_orig_ = nullptr;
     }
     hwnd_ = h;
     hook_window();
 }
 
+WNDPROC StarOverlay::swap_wndproc(HWND h, WNDPROC p)
+{
+    if (IsWindowUnicode(h)) return (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)p);
+    return (WNDPROC)SetWindowLongPtrA(h, GWLP_WNDPROC, (LONG_PTR)p);
+}
+
 void StarOverlay::hook_window()
 {
     if (hwnd_ && !wnd_proc_orig_ && IsWindow(hwnd_)) {
-        WNDPROC prev = nullptr;
-        if (IsWindowUnicode(hwnd_)) {
-            prev = (WNDPROC)SetWindowLongPtrW(hwnd_, GWLP_WNDPROC, (LONG_PTR)star_wnd_proc);
-        } else {
-            prev = (WNDPROC)SetWindowLongPtrA(hwnd_, GWLP_WNDPROC, (LONG_PTR)star_wnd_proc);
-        }
+        WNDPROC prev = swap_wndproc(hwnd_, star_wnd_proc);
         if (prev) {
             wnd_proc_orig_ = prev;
             STAR_LOG("WndProc hooked hwnd=%p", hwnd_);

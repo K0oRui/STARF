@@ -16,7 +16,7 @@ static void write_default_file(const std::string& path, const char* content)
     if (probe.is_open()) return; // never overwrite user files
     std::ofstream out(utf8_to_wstring(path));
     if (!out.is_open()) {
-        STAR_LOG("bootstrap: cannot create %s", path.c_str());
+        STAR_LOG_ERROR("bootstrap: cannot create %s", path.c_str());
         return;
     }
     out << content;
@@ -28,7 +28,7 @@ static void write_default_file(const std::string& path, const char* content)
 static void bootstrap_star_folder(const std::string& dir)
 {
     if (!Storage::ensure_dir(dir)) {
-        STAR_LOG("bootstrap: cannot create settings dir %s", dir.c_str());
+        STAR_LOG_ERROR("bootstrap: cannot create settings dir %s", dir.c_str());
         return;
     }
     Storage::ensure_dir(dir + "\\Fonts"); // custom overlay TTFs live here
@@ -66,9 +66,8 @@ static void bootstrap_star_folder(const std::string& dir)
         "# Screenshots go to Documents\\STAR\\screenshots\\<appid>\\.\n"
         "# enabled: true | false - master switch. false = no hooks, no window.\n"
         "enabled = true\n"
-        "# mode: auto | hook | external - auto tries hooks, falls back to external window if title hostile.\n"
-        "#       The fallback is temporary: STAR retries hooks after a few launches (exponential backoff).\n"
-        "#       hook = never auto-fall back. external = always use the window (delete fallback_count too).\n"
+        "# mode: auto | hook | external - auto tries hooks every launch, falls back to external window for that session if title hostile or tiny.\n"
+        "#       A crash under hooks pins the next launch to external for one session. hook = never auto-fall back. external = always use the window.\n"
         "mode = auto\n"
         "# scale: 0.75 - 2.0 - UI size multiplier. Needs game restart.\n"
         "scale = 1.25\n"
@@ -152,7 +151,7 @@ void Settings::load(const std::string& dir)
 
     STAR_LOG("App ID: %u", app_id);
     if (app_id == 0) {
-        STAR_LOG("WARNING: no App ID found - put the numeric App ID in STAR/steam_appid.txt "
+        STAR_LOG_WARN("WARNING: no App ID found - put the numeric App ID in STAR/steam_appid.txt "
             "(or steam_appid.txt next to the game EXE). Saves and achievements need it.");
     }
 
@@ -198,7 +197,7 @@ void Settings::load(const std::string& dir)
         }
         if (!lang_found) {
             if (!supported_languages.empty()) {
-                STAR_LOG("Configured language '%s' not found in languages.star. Falling back to '%s'", language.c_str(), supported_languages.front().c_str());
+                STAR_LOG_WARN("Configured language '%s' not found in languages.star. Falling back to '%s'", language.c_str(), supported_languages.front().c_str());
                 language = supported_languages.front();
             } else {
                 supported_languages.push_back(language);
@@ -237,9 +236,7 @@ void Settings::load(const std::string& dir)
         IniFile ini;
         if (ini.load(dir + "\\overlay.star")) {
             overlay_enabled = ini.get_bool("", "enabled", true);
-            overlay_scale = ini.get_float("", "scale", 1.25f);
-            if (overlay_scale < 0.75f) overlay_scale = 0.75f;
-            if (overlay_scale > 2.0f) overlay_scale = 2.0f;
+            overlay_scale = std::clamp(ini.get_float("", "scale", 1.25f), 0.75f, 2.0f);
             overlay_accent = ini.get("", "accent", "blue");
             std::transform(overlay_accent.begin(), overlay_accent.end(), overlay_accent.begin(),
                 [](unsigned char c) { return (char)tolower(c); });
@@ -251,11 +248,6 @@ void Settings::load(const std::string& dir)
             std::transform(overlay_mode.begin(), overlay_mode.end(), overlay_mode.begin(),
                 [](unsigned char c) { return (char)tolower(c); });
             if (overlay_mode != "hook" && overlay_mode != "external") overlay_mode = "auto";
-            overlay_fallback_count = ini.get_int("", "fallback_count", 0);
-            overlay_fallback_level = ini.get_int("", "fallback_level", 0);
-            if (overlay_fallback_count < 0) overlay_fallback_count = 0;
-            if (overlay_fallback_level < 0) overlay_fallback_level = 0;
-            if (overlay_fallback_level > 6) overlay_fallback_level = 6;
             overlay_notify_pos = ini.get("", "notify_pos", "bottom_right");
             std::transform(overlay_notify_pos.begin(), overlay_notify_pos.end(), overlay_notify_pos.begin(),
                 [](unsigned char c) { return (char)tolower(c); });
@@ -292,11 +284,11 @@ void Settings::load(const std::string& dir)
                     }
                 }
             } catch (...) {
-                STAR_LOG("Failed to parse achievements.json");
+                STAR_LOG_WARN("Failed to parse achievements.json");
             }
         }
     }
 
     STAR_LOG("Settings loaded: app_id=%u name='%s' achievements=%zu dlcs=%zu",
-        app_id, account_name.c_str(), achievements.size(), dlc_list.size());
+        app_id, STAR_MaskName(account_name).c_str(), achievements.size(), dlc_list.size());
 }

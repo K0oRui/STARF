@@ -13,11 +13,10 @@ float easeIn(float t) { return t * t * t; }
 
 void draw_star(ImDrawList* dl, ImVec2 c, float r_out, float r_in, ImU32 col)
 {
-    const float PI = 3.14159265f;
     ImVec2 pts[10];
     for (int i = 0; i < 10; i++) {
         float r = (i % 2 == 0) ? r_out : r_in;
-        float ang = -PI / 2.f + (float)i * PI / 5.f;
+        float ang = -kPi / 2.f + (float)i * kPi / 5.f;
         pts[i] = { c.x + cosf(ang) * r, c.y + sinf(ang) * r };
     }
     dl->AddConvexPolyFilled(pts, 10, col);
@@ -29,8 +28,8 @@ std::string fmt_unlock_time(uint32_t t)
     time_t tt = (time_t)t;
     struct tm lt{};
     if (localtime_s(&lt, &tt) != 0) return {};
-    char buf[16];
-    strftime(buf, sizeof(buf), "%d.%m %H:%M", &lt);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%b %d, %I:%M %p", &lt);
     return buf;
 }
 
