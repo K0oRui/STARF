@@ -81,6 +81,7 @@ set(STAR_SOURCES
     core/callbacks.cpp
     core/config.cpp
     core/integrity_hooks.cpp
+    core/logging.cpp
     core/settings.cpp
     core/star_api.cpp
     core/star_flat_stubs.cpp
@@ -222,11 +223,12 @@ if(STAR_BUILD_TESTS)
     target_include_directories(backend_selection_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME backend_selection_smoke COMMAND backend_selection_smoke)
 
-    add_executable(backend_ownership_smoke ../tests/backend_ownership_smoke.cpp)
+    add_executable(backend_ownership_smoke ../tests/backend_ownership_smoke.cpp ../tests/backend_ownership_dx7.cpp ../tests/backend_ownership_dx8.cpp)
+    # No d3d8.lib/ddraw.lib on modern SDKs: the legacy TUs resolve both by hand.
     target_link_libraries(backend_ownership_smoke PRIVATE d3d11 d3d10 d3d12 d3d9 dxgi opengl32 gdi32 user32)
-    target_include_directories(backend_ownership_smoke PRIVATE ${vulkan_headers_SOURCE_DIR}/include)
+    target_include_directories(backend_ownership_smoke PRIVATE ${PROJECT_SOURCE_DIR}/sdk ${vulkan_headers_SOURCE_DIR}/include)
     add_dependencies(backend_ownership_smoke star)
-    set(ownership_apis dx9 dx10 dx11 opengl gdi vulkan vulkan_proc vulkan_late dx11_vulkan)
+    set(ownership_apis dx7 dx8 dx9 dx10 dx11 opengl gdi vulkan vulkan_proc vulkan_late dx11_vulkan)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         list(APPEND ownership_apis dx12 dx12_late)
     endif()
@@ -248,7 +250,7 @@ if(STAR_BUILD_TESTS)
     set_tests_properties(dx12_submission_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
 
     add_executable(async_io_smoke ../tests/async_io_smoke.cpp
-        core/storage.cpp core/callbacks.cpp steam/steam_remote_storage.cpp
+        core/logging.cpp core/storage.cpp core/callbacks.cpp steam/steam_remote_storage.cpp
         steam/steam_utils.cpp steam/steam_user_stats.cpp)
     target_sources(async_io_smoke PRIVATE overlay/capture/screenshot_service.cpp)
     target_include_directories(async_io_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/sdk)
@@ -256,10 +258,28 @@ if(STAR_BUILD_TESTS)
     target_compile_definitions(async_io_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
     add_test(NAME async_io_smoke COMMAND async_io_smoke ${CMAKE_CURRENT_BINARY_DIR}/async-io-test)
 
+    # Controller smoke: fake xinput1_4.dll shadows the system one (app dir is
+    # searched first), so pads are fully scripted with no hardware attached.
+    add_library(fake_xinput SHARED ../tests/fake_xinput.cpp ../tests/fake_xinput.def)
+    set_target_properties(fake_xinput PROPERTIES OUTPUT_NAME "xinput1_4"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/controller-test")
+    add_executable(controller_smoke ../tests/controller_smoke.cpp steam/steam_input.cpp)
+    target_include_directories(controller_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/sdk)
+    target_link_libraries(controller_smoke PRIVATE dinput8 dxguid user32)
+    target_compile_definitions(controller_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    set_target_properties(controller_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/controller-test")
+    add_dependencies(controller_smoke fake_xinput)
+    add_test(NAME controller_smoke COMMAND controller_smoke)
+    set_tests_properties(controller_smoke PROPERTIES TIMEOUT 60)
+
     foreach(check gdi_resources_smoke pixel_copy_smoke)
         add_executable(${check} ../tests/${check}.cpp)
         target_include_directories(${check} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${imgui_SOURCE_DIR})
         target_link_libraries(${check} PRIVATE imgui gdi32 user32)
         add_test(NAME ${check} COMMAND ${check})
     endforeach()
+
+    add_executable(logging_smoke ../tests/logging_smoke.cpp core/logging.cpp)
+    target_include_directories(logging_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME logging_smoke COMMAND logging_smoke)
 endif()

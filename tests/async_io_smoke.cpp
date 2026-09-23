@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-void STAR_WriteLog(const char*, ...) {}
+// Logging links from core/logging.cpp; no stub needed.
 Settings& Settings::get() { static Settings settings; return settings; }
 
 struct TestOverlay : Overlay {

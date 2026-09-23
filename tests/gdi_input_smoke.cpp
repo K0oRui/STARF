@@ -36,10 +36,13 @@ int main(int argc, char** argv)
     wc.lpfnWndProc = DefWindowProcW;
     wc.lpszClassName = L"STAR_GDI_Input_Test";
     assert(RegisterClassW(&wc));
-    game = CreateWindowW(wc.lpszClassName, L"Game", WS_POPUP | WS_VISIBLE,
+    // Shown without activating (SW_SHOWNOACTIVATE): IsWindowVisible passes for
+    // API detection, but the window never steals foreground focus.
+    game = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"Game", WS_POPUP,
         -30000, -30000, mode == "scaled" ? 1280 : 640, mode == "scaled" ? 960 : 480,
         nullptr, nullptr, wc.hInstance, nullptr);
     assert(game);
+    ShowWindow(game, SW_SHOWNOACTIVATE);
     assert(MH_Initialize() == MH_OK);
     auto hook = [](const char* name, void* detour) {
         auto address = (void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), name);

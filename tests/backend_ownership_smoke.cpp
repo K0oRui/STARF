@@ -26,6 +26,17 @@
 #include "../third_party/unity/IUnityGraphicsVulkan.h"
 using Microsoft::WRL::ComPtr;
 
+// DX7/DX8 setup lives in backend_ownership_dx7.cpp / backend_ownership_dx8.cpp:
+// d3d8.h clashes with d3d9.h (main TU) and with d3dtypes.h from d3d.h (dx7 TU),
+// so each D3D generation gets its own translation unit, like the backends.
+bool legacy_create_dx8(HWND window, void** device, void** params);
+void legacy_present_dx8(void* device);
+bool legacy_reset_dx8(void* device, void* params);
+void legacy_release_dx8(void* device, void* params);
+bool legacy_create_dx7(HWND window, void** device);
+void legacy_end_scene_dx7(void* device);
+void legacy_release_dx7(void* device);
+
 // Model a Unity plugin loaded after the real native graphics objects exist.
 static IDXGISwapChain* unity_chain;
 static ID3D12CommandQueue* unity_queue;
@@ -76,14 +87,21 @@ int main(int argc, char** argv)
     wc.lpszClassName = L"STAR_Backend_Test";
     wc.style = CS_OWNDC;
     assert(RegisterClassW(&wc));
-    // Visible to API detection, offscreen so tests do not take focus.
-    HWND main = CreateWindowExW(0, wc.lpszClassName, L"Game", WS_POPUP | WS_VISIBLE,
+    // Visible to API detection (IsWindowVisible) but never activated, so the
+    // tests can't steal foreground focus. Offscreen position alone does not
+    // prevent activation: WS_VISIBLE activates on creation.
+    HWND main = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"Game", WS_POPUP,
         -30000, -30000, 640, 480, nullptr, nullptr, wc.hInstance, nullptr);
-    HWND helper = CreateWindowExW(0, wc.lpszClassName, L"Helper", WS_POPUP | WS_VISIBLE,
+    HWND helper = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"Helper", WS_POPUP,
         -29000, -29000, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
     assert(main && helper);
+    ShowWindow(main, SW_SHOWNOACTIVATE);
+    ShowWindow(helper, SW_SHOWNOACTIVATE);
 
     void (*shutdown)() = nullptr;
+    // Legacy backends latch at init: hook_dx7 only while ddraw is loaded.
+    if (api == "dx7") LoadLibraryW(L"ddraw.dll");
+    if (api == "dx8") LoadLibraryW(L"d3d8.dll");
     auto load_overlay = [&] {
         HMODULE module = LoadLibraryW(dll.c_str());
         assert(module);
@@ -103,16 +121,26 @@ int main(int argc, char** argv)
     };
     if (!late) load_overlay();
 
+    // Skips must still tear down: exiting with overlay threads, a current GL
+    // context, or GPU objects live crashes in driver teardown (atio6axx fastfail).
     HWND gl_window = api == "opengl" ? main : helper;
-    HDC dc = GetDC(gl_window);
+    HDC dc = nullptr;
+    HGLRC gl = nullptr;
+    auto skip = [&]() -> int {
+        if (gl) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(gl); gl = nullptr; }
+        if (dc) { ReleaseDC(gl_window, dc); dc = nullptr; }
+        if (shutdown) shutdown();
+        return 77;
+    };
+    dc = GetDC(gl_window);
     PIXELFORMATDESCRIPTOR pfd{};
     pfd.nSize = sizeof(pfd); pfd.nVersion = 1;
     pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
     pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32;
     int format = ChoosePixelFormat(dc, &pfd);
-    if (!format || !SetPixelFormat(dc, format, &pfd)) return 77;
-    HGLRC gl = wglCreateContext(dc);
-    if (!gl || !wglMakeCurrent(dc, gl)) return 77;
+    if (!format || !SetPixelFormat(dc, format, &pfd)) return skip();
+    gl = wglCreateContext(dc);
+    if (!gl || !wglMakeCurrent(dc, gl)) return skip();
     auto swap = (BOOL(WINAPI*)(HDC))GetProcAddress(GetModuleHandleW(L"opengl32.dll"), "wglSwapBuffers");
     assert(swap);
 
@@ -125,7 +153,7 @@ int main(int argc, char** argv)
     ComPtr<IDXGISwapChain> chain;
     ComPtr<ID3D11Device> device;
     if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        nullptr, 0, D3D11_SDK_VERSION, &desc, &chain, &device, nullptr, nullptr))) return 77;
+        nullptr, 0, D3D11_SDK_VERSION, &desc, &chain, &device, nullptr, nullptr))) return skip();
     ComPtr<IDirect3D9> d3d9;
     ComPtr<IDirect3DDevice9> device9;
     D3DPRESENT_PARAMETERS pp{};
@@ -134,8 +162,13 @@ int main(int argc, char** argv)
         pp.Windowed = TRUE; pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
         pp.hDeviceWindow = main; pp.BackBufferWidth = 640; pp.BackBufferHeight = 480;
         if (!d3d9 || FAILED(d3d9->CreateDevice(0, D3DDEVTYPE_HAL, main,
-            D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &device9))) return 77;
+            D3DCREATE_SOFTWARE_VERTEXPROCESSING, &pp, &device9))) return skip();
     }
+    void* device8 = nullptr;
+    void* params8 = nullptr;
+    if (api == "dx8" && !legacy_create_dx8(main, &device8, &params8)) return skip();
+    void* device7 = nullptr;
+    if (api == "dx7" && !legacy_create_dx7(main, &device7)) return skip();
     ComPtr<IDXGISwapChain> main_chain;
     ComPtr<ID3D10Device> device10;
     ComPtr<ID3D12Device> device12;
@@ -143,11 +176,11 @@ int main(int argc, char** argv)
     if (api == "dx10") {
         desc.OutputWindow = main;
         if (FAILED(D3D10CreateDeviceAndSwapChain(nullptr, D3D10_DRIVER_TYPE_HARDWARE, nullptr,
-            0, D3D10_SDK_VERSION, &desc, &main_chain, &device10))) return 77;
+            0, D3D10_SDK_VERSION, &desc, &main_chain, &device10))) return skip();
     }
 #ifdef _WIN64
     if (api == "dx12") {
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12)))) return 77;
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12)))) return skip();
         D3D12_COMMAND_QUEUE_DESC qd{};
         assert(SUCCEEDED(device12->CreateCommandQueue(&qd, IID_PPV_ARGS(&replacement_queue))));
         assert(SUCCEEDED(device12->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue12))));
@@ -196,11 +229,11 @@ int main(int argc, char** argv)
         assert(vkGetSwapchainImagesKHR(vk_device, vk_chain, &count, images.data()) == VK_SUCCESS);
     };
     if (api == "vulkan" || vulkan_helper) {
-        if (!vulkan || !vkCreateInstance) return 77;
+        if (!vulkan || !vkCreateInstance) return skip();
         const char* extensions[] = {"VK_KHR_surface", "VK_KHR_win32_surface"};
         VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         ici.enabledExtensionCount = 2; ici.ppEnabledExtensionNames = extensions;
-        if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return 77;
+        if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) return skip();
         auto get_instance_proc = (PFN_vkGetInstanceProcAddr)GetProcAddress(vulkan, "vkGetInstanceProcAddr");
         if (vulkan_proc) {
 #define VK_INSTANCE(name) name = (PFN_##name)get_instance_proc(instance, #name); assert(name);
@@ -212,7 +245,7 @@ int main(int argc, char** argv)
         }
         uint32_t count = 0;
         assert(vkEnumeratePhysicalDevices(instance, &count, nullptr) == VK_SUCCESS);
-        if (!count) return 77;
+        if (!count) return skip();
         std::vector<VkPhysicalDevice> physicals(count);
         assert(vkEnumeratePhysicalDevices(instance, &count, physicals.data()) == VK_SUCCESS);
         physical = physicals[0];
@@ -228,7 +261,7 @@ int main(int argc, char** argv)
             vkGetPhysicalDeviceSurfaceSupportKHR(physical, i, surface, &supports);
             if (supports && (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { family = i; break; }
         }
-        if (family == UINT32_MAX) return 77;
+        if (family == UINT32_MAX) return skip();
         float priority = 1.f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qci.queueFamilyIndex = family; qci.queueCount = 1; qci.pQueuePriorities = &priority;
@@ -328,6 +361,8 @@ int main(int argc, char** argv)
         if (api == "vulkan") present_vulkan();
         else if (api == "opengl") swap(dc);
         else if (api == "dx9") device9->Present(nullptr, nullptr, nullptr, nullptr);
+        else if (api == "dx8") legacy_present_dx8(device8);
+        else if (api == "dx7") legacy_end_scene_dx7(device7);
         else if (api == "gdi") StretchDIBits(main_dc, 0, 0, 640, 480, 0, 0, 640, 480,
             pixels.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
         else if (main_chain) main_chain->Present(0, 0);
@@ -356,6 +391,7 @@ int main(int argc, char** argv)
     }
     if (api == "dx11") assert(SUCCEEDED(chain->ResizeBuffers(0, 640, 480, DXGI_FORMAT_UNKNOWN, 0)));
     if (api == "dx9") assert(SUCCEEDED(device9->Reset(&pp)));
+    if (api == "dx8") assert(legacy_reset_dx8(device8, params8));
     if (api == "dx10") assert(SUCCEEDED(main_chain->ResizeBuffers(0, 640, 480, DXGI_FORMAT_UNKNOWN, 0)));
 #ifdef _WIN64
     if (api == "dx12") {
@@ -388,10 +424,11 @@ int main(int argc, char** argv)
     auto init_line = log.find(initialized);
     assert(init_line != std::string::npos && log.find(initialized, init_line + initialized.size()) == std::string::npos);
     const char* ready_message = api == "vulkan" ? "ImGui ready (Vulkan native)" : api == "opengl" ? "ImGui ready (OpenGL)" :
+        api == "dx7" ? "ImGui ready (DX7)" : api == "dx8" ? "ImGui ready (DX8)" :
         api == "dx9" ? "ImGui ready (DX9)" : api == "dx10" ? "ImGui ready (DX10)" :
         api == "dx12" ? "ImGui ready (DX12)" : api == "gdi" ? "ImGui ready (GDI renderer)" : "ImGui ready (DX11)";
     assert(log.find(ready_message) != std::string::npos);
-    for (const char* other : {"ImGui ready (DX9)", "ImGui ready (DX10)", "ImGui ready (DX11)",
+    for (const char* other : {"ImGui ready (DX7)", "ImGui ready (DX8)", "ImGui ready (DX9)", "ImGui ready (DX10)", "ImGui ready (DX11)",
             "ImGui ready (DX12)", "ImGui ready (OpenGL)", "ImGui ready (Vulkan native)", "ImGui ready (GDI renderer)"})
         if (std::string(other) != ready_message) assert(log.find(other) == std::string::npos);
     if (vk_device) {
@@ -406,6 +443,8 @@ int main(int argc, char** argv)
     wglMakeCurrent(nullptr, nullptr);
     wglDeleteContext(gl);
     ReleaseDC(gl_window, dc);
+    if (device8) legacy_release_dx8(device8, params8);
+    if (device7) legacy_release_dx7(device7);
     std::cout << "Backend ownership passed: " << api << '\n';
     // Hooks retain DLL function pointers until process exit; do not FreeLibrary.
 }

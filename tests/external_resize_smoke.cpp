@@ -28,9 +28,11 @@ int main(int argc, char** argv)
     wc.lpfnWndProc = DefWindowProcW;
     wc.lpszClassName = L"STAR_External_Resize_Test";
     assert(RegisterClassW(&wc));
-    HWND window = CreateWindowW(wc.lpszClassName, L"STAR resize test", WS_POPUP | WS_VISIBLE,
+    // Shown without activating: visible for API detection, never steals focus.
+    HWND window = CreateWindowExW(WS_EX_NOACTIVATE, wc.lpszClassName, L"STAR resize test", WS_POPUP,
         -30000, -30000, 640, 480, nullptr, nullptr, wc.hInstance, nullptr);
     assert(window);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
     // Keep this GPU/readback test offscreen and independent of desktop focus.
     test_window = window;
     assert(MH_Initialize() == MH_OK);
@@ -58,7 +60,7 @@ int main(int argc, char** argv)
     const int width = GetSystemMetrics(SM_CXSCREEN) + 64;
     const int height = GetSystemMetrics(SM_CYSCREEN) + 64;
     for (SIZE size : {SIZE{width, height}, SIZE{320, 240}, SIZE{900, 700}}) {
-        assert(SetWindowPos(window, nullptr, -30000, -30000, size.cx, size.cy, SWP_NOZORDER));
+        assert(SetWindowPos(window, nullptr, -30000, -30000, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE));
         pump();
     }
     shutdown();
