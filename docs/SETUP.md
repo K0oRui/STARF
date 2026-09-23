@@ -99,21 +99,16 @@ font =
 | key | default | notes |
 |-----|---------|-------|
 | `enabled` | `true` | master switch |
-| `mode` | `auto` | `auto` tries hooks, falls back to the external window if the title is hostile; `hook` never auto-falls back; `external` always uses the window |
+| `mode` | `auto` | `auto` tries hooks and falls back to the external window if the title is hostile or renders below 960x600 (hook-drawn text would upscale to mush). `hook` never auto-falls back. `external` always uses the window |
 | `scale` | `1.25` | UI size multiplier (0.75-2.0), needs restart |
 | `accent` | `blue` | `blue` `red` `green` `purple` `orange` `yellow` |
 | `show_fps` | `false` | FPS pill, top-left |
 | `show_playtime` | `false` | session clock next to FPS |
 | `play_sound` | `true` | achievement unlock jingle |
-| `notify_pos` | `bottom_right` | `top_left` `top_right` `bottom_left` `bottom_right` |
+| `notify_pos` | `bottom_right` | `top_left` `top_right` `bottom_left` `bottom_right`, or `tl` `tr` `bl` `br` |
 | `font` | *(empty)* | custom TTF in `STAR/Fonts`, needs restart |
 
-**Auto-fallback backoff.** When `mode = auto` and a title is hostile (crashes, device loss, fence timeouts), STAR switches to the external window and writes two keys into `overlay.star`:
-
-- `fallback_level` — how many times it has fallen back in a row (0-6).
-- `fallback_count` — sessions left to skip before retrying hooks (`2^level - 1`: 1, 3, 7, 15, 31, 63).
-
-Each launch with `fallback_count > 0` skips hooks and decrements it. When it reaches 0, STAR retries hooks; if that session ends cleanly, both keys are cleared and `mode` returns to `auto`. If it crashes again, the backoff restarts from the next level. If you set `mode = external` by hand, delete `fallback_count` too so it doesn't surprise you by retrying hooks later.
+**Auto-fallback is per-launch.** When `mode = auto`, every launch starts on hooks. If the title proves hostile (crashes, device loss, fence timeouts) or renders below 960x600 on any backend (hook-drawn text would upscale to mush), STAR switches to the external window for the rest of that session only. Nothing is persisted: the next launch tries hooks again. One exception is the crash pin: if the previous hooks session never shut down cleanly (crash or kill), STAR leaves a `overlay.session` sentinel behind, and the next launch starts external for exactly one session before re-evaluating. A live pid in the sentinel belongs to a concurrent sharer of `STAR/` (e.g. launcher) and never pins. `hook` never auto-falls back; `external` always uses the window. (Old installs may still have `fallback_count`/`fallback_level` keys in `overlay.star`; they are ignored and can be deleted.)
 
 ---
 

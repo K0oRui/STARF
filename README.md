@@ -30,7 +30,7 @@ Steam API emulator. Drops in as `steam_api.dll` / `steam_api64.dll` and pretends
 
 Drop the DLL next to the game executable. Create a `STAR/` folder there with your config files.
 
-**Minimum viable setup:**
+Minimum setup looks like this:
 
 ```
 game.exe
@@ -40,21 +40,21 @@ STAR/
   game.star
 ```
 
-**`STAR/identity.star`**
+`STAR/identity.star`
 ```ini
 display_name = YourName
 xuid = 76561198000000000
 locale = english
 ```
 
-**`STAR/game.star`**
+`STAR/game.star`
 ```ini
 beta = false
 branch = public
 dlc.unlock_all = false
 ```
 
-**`STAR/overlay.star`** (optional, overlay is on by default)
+`STAR/overlay.star` (optional, overlay is on by default)
 ```ini
 enabled = true
 ```
@@ -81,7 +81,7 @@ Put an `achievements.json` in your `STAR/` folder:
 
 Icon paths are relative to the `STAR/` directory. You can unlock and reset achievements live from the overlay.
 
-**Achievement sound** (optional): drop an MP3 at `STAR/Sounds/achievement.mp3` and it plays automatically whenever an achievement is unlocked or test-fired from the overlay.
+For an achievement sound, drop `achievement.mp3` or `achievement.wav` in `STAR/Sounds/`. It plays whenever an achievement unlocks or you hit test-fire in the overlay.
 
 ---
 
@@ -91,7 +91,7 @@ Icon paths are relative to the `STAR/` directory. You can unlock and reset achie
 
 Shows your account info, achievement progress, and a scrollable list of every achievement with Unlock/Reset buttons per row. Hit "Test notify" to fire a fake achievement notification so you can see how it looks without actually unlocking anything.
 
-Supports DX7, DX8, DX9, DX10, DX11, DX12 (x64), OpenGL, Vulkan, and GDI. Hooks frame presentation via MinHook, no game cooperation needed. Hostile titles (crashes, device loss, fence timeouts) automatically fall back to a separate external overlay window; STAR retries hooks after a few launches with exponential backoff and heals itself when a retry succeeds. See `SETUP.md` for the `mode`, `fallback_count`, and `fallback_level` keys.
+Supports DX7, DX8, DX9, DX10, DX11, DX12 (x64), OpenGL, Vulkan, and GDI. It hooks frame presentation with MinHook, so the game does not have to cooperate. Hostile titles that crash, lose the device, or time out on fences fall back to a separate external overlay window. STAR retries hooks after a few launches with exponential backoff and clears the fallback once a retry sticks. See `docs/SETUP.md` for `mode`, `fallback_count`, and `fallback_level`.
 
 The first qualifying presentation on the main game window locks the game API for
 that process. Other APIs pass through without changing overlay rendering, input
@@ -102,8 +102,7 @@ External mode keeps this game API selection but draws its separate window with
 its own DX9/DX11 device. Unity games loaded after graphics initialization recover
 their exact DX12 swapchain/queue or Vulkan device/queue through Unity's native
 plugin interface. Vulkan hooks also cover instance/device function lookups.
-If the required ownership information remains unavailable, auto mode uses the
-external path; STAR does not guess GPU handles.
+If the ownership info is still missing, auto mode goes external. STAR never guesses GPU handles.
 
 ---
 
@@ -111,18 +110,18 @@ external path; STAR does not guess GPU handles.
 
 Requires MSVC and CMake 3.16+. All dependencies pull in automatically via FetchContent.
 
-**Both architectures, packaged to `dist/`:**
+Both architectures, packed into `dist/`
 ```
 .\build.ps1
 ```
 
-**x64 (steam_api64.dll):**
+x64, `steam_api64.dll`
 ```
 cmake --preset x64
 cmake --build --preset x64-release
 ```
 
-**x86 (steam_api.dll):**
+x86, `steam_api.dll`
 ```
 cmake --preset x86
 cmake --build --preset x86-release
@@ -147,12 +146,12 @@ DLL tests also interleave DX9, DX10, DX11, DX12, OpenGL, Vulkan, and GDI with
 helper APIs and exercise resize/reset/context recreation, Vulkan function
 lookups, and Unity graphics objects created before DLL loading. The external
 overlay test grows and shrinks real GPU/readback surfaces offscreen. Native checks skip
-when the required graphics runtime is unavailable; they do not replace testing
+when the required graphics runtime is unavailable. They do not replace testing
 inside a game.
 
 ## logs
 
-`STAR/star.log` next to the DLL. Falls back to `%TEMP%/star.log` if that directory isn't writable. The log tells you what app ID loaded, how many achievements came in, and whether the overlay hooks fired correctly. Routine flat-API calls are omitted by default; set `STAR_TRACE_API=1` before launching the game to include them. Writes are buffered and flushed on the next log message after one second, or at `SteamAPI_Shutdown`.
+`STAR/star.log` next to the DLL, cleared on each launch. Falls back to `%TEMP%/star.log` (also cleared on launch) if that directory isn't writable. The log tells you what app ID loaded, how many achievements came in, and whether the overlay hooks fired correctly. Each line carries a UTC timestamp, pid, thread id, and level (`INFO`, `WARN`, `ERROR`, `TRACE`). Routine flat-API and interface queries are `TRACE` and omitted by default. Set `STAR_TRACE_API=1` before launching the game to include them. SteamIDs and display names are masked unless tracing is on. Writes use atomic appends so launcher and game processes share one file safely. The log rotates to `star.1.log` at 5 MB. Errors flush immediately; other writes flush at least once per second, at `SteamAPI_Shutdown`, and on crash via an unhandled-exception filter. File-hook redirect spam is rate limited. No file I/O runs inside `DllMain`; early messages are buffered and drained on init.
 
 ---
 
@@ -163,11 +162,11 @@ All `.star` files are INI-format. On first load, STAR stamps a small ASCII art h
 | file | what it controls |
 |------|-----------------|
 | `identity.star` | display name, Steam ID, language |
-| `game.star` | app ID, DLC config, beta branch |
+| `game.star` | beta branch, DLC config |
 | `languages.star` | list of languages the game claims to support |
 | `overlay.star` | enable/disable the overlay |
 | `achievements.json` | achievement definitions |
-| `Sounds/achievement.mp3` | sound played on achievement unlock (optional) |
+| `Sounds/achievement.mp3` | sound played on achievement unlock (optional, `.wav` works too, `.mp3` wins) |
 
 ---
 
