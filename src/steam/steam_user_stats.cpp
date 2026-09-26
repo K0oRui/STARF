@@ -4,6 +4,7 @@
 #include "core/storage.h"
 #include "steam/steam_utils.h"
 #include "overlay/overlay.h"
+#include <atomic>
 #include <thread>
 #include <mmsystem.h>
 
@@ -275,14 +276,19 @@ static void play_sound_file(const std::string& sound_path)
         const std::wstring path = utf8_to_wstring(sound_path);
         const wchar_t* order[2] = { looks_wav ? L"waveaudio" : L"mpegvideo",
                                     looks_wav ? L"mpegvideo" : L"waveaudio" };
+        static std::atomic<uint64_t> seq{0};
         for (int i = 0; i < 2; i++) {
-            // Each request owns its device; a shared alias lets concurrent
-            // notifications play or close each other's sound.
+            // Unique alias per request: async play returns instantly so the
+            // next unlock starts over this one instead of waiting for it.
+            uint64_t id = ++seq;
+            wchar_t alias[64];
+            swprintf(alias, 64, L"STAR_%llu_%d", (unsigned long long)id, i);
             MCI_OPEN_PARMSW open{};
             open.lpstrElementName = path.c_str();
             open.lpstrDeviceType = order[i];
+            open.lpstrAlias = alias;
             MCIERROR err = mciSendCommandW(0, MCI_OPEN,
-                MCI_OPEN_ELEMENT | MCI_OPEN_TYPE | MCI_WAIT, (DWORD_PTR)&open);
+                MCI_OPEN_ELEMENT | MCI_OPEN_TYPE | MCI_OPEN_ALIAS | MCI_WAIT, (DWORD_PTR)&open);
             if (err != 0) {
                 char ebuf[128] = {};
                 mciGetErrorStringA(err, ebuf, (UINT)sizeof(ebuf));
@@ -291,16 +297,27 @@ static void play_sound_file(const std::string& sound_path)
                 continue;
             }
             MCI_PLAY_PARMS play{};
-            err = mciSendCommandW(open.wDeviceID, MCI_PLAY, MCI_WAIT, (DWORD_PTR)&play);
-            mciSendCommandW(open.wDeviceID, MCI_CLOSE, MCI_WAIT, 0);
+            err = mciSendCommandW(open.wDeviceID, MCI_PLAY, 0, (DWORD_PTR)&play);
             if (err != 0) {
                 char ebuf[128] = {};
                 mciGetErrorStringA(err, ebuf, (UINT)sizeof(ebuf));
                 STAR_LOG("Sound: play failed (%lu/%s): %s",
                     (unsigned long)err, ebuf, sound_path.c_str());
+                mciSendCommandW(open.wDeviceID, MCI_CLOSE, MCI_WAIT, 0);
                 continue;
             }
-            STAR_LOG("Sound: playback completed: %s", sound_path.c_str());
+            STAR_LOG("Sound: playback started: %s", sound_path.c_str());
+            for (int tick = 0; tick < 600; tick++) {
+                MCI_STATUS_PARMS status{};
+                status.dwItem = MCI_STATUS_MODE;
+                if (mciSendCommandW(open.wDeviceID, MCI_STATUS,
+                        MCI_STATUS_ITEM | MCI_WAIT, (DWORD_PTR)&status) != 0)
+                    break;
+                if (status.dwReturn != MCI_MODE_PLAY)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            mciSendCommandW(open.wDeviceID, MCI_CLOSE, MCI_WAIT, 0);
             return;
         }
     }).detach();
