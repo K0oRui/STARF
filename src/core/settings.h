@@ -38,6 +38,7 @@ public:
     bool overlay_show_fps = false;       // FPS counter HUD (top-left)
     bool overlay_show_playtime = false;  // session playtime HUD (top-left)
     bool overlay_play_sound = true;      // achievement unlock sound
+    bool overlay_click_through = true;   // true = mouse passes to game when closed, false = overlay keeps mouse hits
     std::string overlay_notify_pos = "bottom_right"; // top_left|top_right|bottom_left|bottom_right
     std::string overlay_mode = "auto";   // auto | hook | external
     std::string overlay_font;            // custom TTF (abs path or STAR-relative), empty = system font

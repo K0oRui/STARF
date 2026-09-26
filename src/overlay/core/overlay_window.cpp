@@ -1,5 +1,6 @@
 #include "overlay/overlay_internal.h"
 #include "core/callbacks.h"
+#include "core/settings.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 
@@ -207,6 +208,15 @@ LRESULT CALLBACK StarOverlay::star_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         case WM_KEYDOWN:     case WM_KEYUP:      case WM_CHAR:
         case WM_SYSKEYDOWN:  case WM_SYSKEYUP:   case WM_SYSCHAR:
         case WM_IME_CHAR:    case WM_IME_KEYDOWN: case WM_IME_KEYUP:
+            return 0;
+        }
+    } else if (!Settings::get().overlay_click_through) {
+        switch (msg) {
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        case WM_MOUSEMOVE:   case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
             return 0;
         }
     }
