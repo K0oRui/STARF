@@ -48,7 +48,14 @@ static void bootstrap_star_folder(const std::string& dir)
         "# branch: branch name reported to the game (usually \"public\").\n"
         "branch = public\n"
         "# dlc.unlock_all: true | false - report every DLC as owned.\n"
-        "dlc.unlock_all = false\n");
+        "dlc.unlock_all = false\n"
+        "# disable_networking: true | false - fail lobby creation outright.\n"
+        "# P2P, sockets, servers, HTTP already return failure; this only flips\n"
+        "# CreateLobby from k_EResultOK to k_EResultFail for games that need it.\n"
+        "# disable_networking = false\n"
+        "# offline: true | false - pretend Steam is in offline mode.\n"
+        "# Makes ISteamUser::BLoggedOn() return false. IsSteamRunning stays true.\n"
+        "# offline = false\n");
     write_default_file(dir + "\\languages.star",
         "# Languages the game may claim to support. One \"<name> = 1\" per line,\n"
         "# same names as identity.star locale. Missing locale falls back to first entry.\n"
@@ -219,6 +226,8 @@ void Settings::load(const std::string& dir)
             is_beta_branch = ini.get_bool("", "beta",  false);
             branch_name    = ini.get("",     "branch", "public");
             unlock_all_dlc = ini.get_bool("", "dlc.unlock_all", false);
+            disable_networking = ini.get_bool("", "disable_networking", false);
+            offline = ini.get_bool("", "offline", false);
 
             for (auto& [k, v] : ini.get_section("")) {
                 if (k.size() > 4 && k.substr(0, 4) == "dlc." && k != "dlc.unlock_all") {

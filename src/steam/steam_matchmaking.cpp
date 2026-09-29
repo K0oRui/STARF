@@ -1,5 +1,6 @@
 #include "steam/steam_matchmaking.h"
 #include "core/callbacks.h"
+#include "core/settings.h"
 
 StarSteamMatchmaking& StarSteamMatchmaking::get() { static StarSteamMatchmaking i; return i; }
 CSteamID StarSteamMatchmaking::GetLobbyByIndex(int iLobby) { STAR_UNREFERENCED(iLobby); return k_steamIDNil; }
@@ -15,7 +16,7 @@ void StarSteamMatchmaking::AddRequestLobbyListFilterSlotsAvailable(int n) { STAR
 void StarSteamMatchmaking::AddRequestLobbyListDistanceFilter(ELobbyDistanceFilter f) { STAR_UNREFERENCED(f); }
 void StarSteamMatchmaking::AddRequestLobbyListResultCountFilter(int c) { STAR_UNREFERENCED(c); }
 void StarSteamMatchmaking::AddRequestLobbyListCompatibleMembersFilter(CSteamID s) { STAR_UNREFERENCED(s); }
-SteamAPICall_t StarSteamMatchmaking::CreateLobby(ELobbyType eLobbyType, int cMaxMembers) { STAR_UNREFERENCED(eLobbyType); STAR_UNREFERENCED(cMaxMembers); LobbyCreated_t r{}; r.m_eResult=k_EResultOK; r.m_ulSteamIDLobby=0; return STAR_PostCallResult(LobbyCreated_t::k_iCallback, &r, sizeof(r)); }
+SteamAPICall_t StarSteamMatchmaking::CreateLobby(ELobbyType eLobbyType, int cMaxMembers) { STAR_UNREFERENCED(eLobbyType); STAR_UNREFERENCED(cMaxMembers); LobbyCreated_t r{}; r.m_eResult=Settings::get().disable_networking ? k_EResultFail : k_EResultOK; r.m_ulSteamIDLobby=0; return STAR_PostCallResult(LobbyCreated_t::k_iCallback, &r, sizeof(r)); }
 SteamAPICall_t StarSteamMatchmaking::JoinLobby(CSteamID steamIDLobby) { STAR_UNREFERENCED(steamIDLobby); LobbyEnter_t r{}; r.m_ulSteamIDLobby=0; r.m_rgfChatPermissions=0; r.m_bLocked=false; r.m_EChatRoomEnterResponse=k_EChatRoomEnterResponseDoesntExist; return STAR_PostCallResult(LobbyEnter_t::k_iCallback, &r, sizeof(r)); }
 void StarSteamMatchmaking::LeaveLobby(CSteamID s) { STAR_UNREFERENCED(s); }
 bool StarSteamMatchmaking::InviteUserToLobby(CSteamID l, CSteamID u) { STAR_UNREFERENCED(l); STAR_UNREFERENCED(u); return false; }
