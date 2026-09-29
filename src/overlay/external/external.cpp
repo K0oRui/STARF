@@ -74,6 +74,13 @@ LRESULT CALLBACK StarOverlay::ext_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARA
             case WM_KEYDOWN:     case WM_KEYUP:    case WM_CHAR:
                 return 0;
             }
+        } else if (!Settings::get().overlay_click_through) {
+            switch (msg) {
+            case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+            case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+            case WM_MOUSEMOVE:   case WM_MOUSEWHEEL:
+                return 0;
+            }
         }
     }
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -354,7 +361,8 @@ void StarOverlay::external_render_frame()
     // Click-through state lives here (not below the surface checks) so a
     // bailed frame can never leave an invisible window swallowing the mouse.
     LONG_PTR ex = GetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE);
-    LONG_PTR want_ex = open_ ? (ex & ~WS_EX_TRANSPARENT) : (ex | WS_EX_TRANSPARENT);
+    const bool capture = open_ || !Settings::get().overlay_click_through;
+    LONG_PTR want_ex = capture ? (ex & ~WS_EX_TRANSPARENT) : (ex | WS_EX_TRANSPARENT);
     if (want_ex != ex) SetWindowLongPtrA(ext_hwnd_, GWL_EXSTYLE, want_ex);
     if (!imgui_initialized_) return;
     if (ext_use_d3d9_ ? !ext_d3d9_dev_ : (!device_ || !context_)) return;

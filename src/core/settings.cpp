@@ -57,16 +57,16 @@ static void bootstrap_star_folder(const std::string& dir)
         "# Makes ISteamUser::BLoggedOn() return false. IsSteamRunning stays true.\n"
         "# offline = false\n");
     write_default_file(dir + "\\languages.star",
-        "# Languages the game may claim to support. One \"<name> = 1\" per line,\n"
+        "# Languages the game may claim to support. One per line,\n"
         "# same names as identity.star locale. Missing locale falls back to first entry.\n"
         "[languages]\n"
-        "english = 1\n"
-        "french = 1\n"
-        "german = 1\n"
-        "spanish = 1\n"
-        "russian = 1\n"
-        "schinese = 1\n"
-        "japanese = 1\n");
+        "english\n"
+        "french\n"
+        "german\n"
+        "spanish\n"
+        "russian\n"
+        "schinese\n"
+        "japanese\n");
     write_default_file(dir + "\\overlay.star",
         "# STAR overlay config. Delete any key to restore its default.\n"
         "# Hotkeys: Shift+Tab (or Shift+`) opens the panel, F12 takes a screenshot.\n"
@@ -86,6 +86,8 @@ static void bootstrap_star_folder(const std::string& dir)
         "show_playtime = false\n"
         "# play_sound: true | false - achievement unlock jingle.\n"
         "play_sound = true\n"
+        "# click_through: true | false - false keeps mouse hits on the overlay when closed.\n"
+        "click_through = true\n"
         "# notify_pos: top_left | top_right | bottom_left | bottom_right (tl | tr | bl | br work too)\n"
         "notify_pos = bottom_right\n"
         "# font: custom TTF for the overlay. Put the file in STAR/Fonts and name it here (e.g. poppins.ttf).\n"
@@ -252,6 +254,7 @@ void Settings::load(const std::string& dir)
             overlay_show_fps = ini.get_bool("", "show_fps", false);
             overlay_show_playtime = ini.get_bool("", "show_playtime", false);
             overlay_play_sound = ini.get_bool("", "play_sound", true);
+            overlay_click_through = ini.get_bool("", "click_through", true);
             overlay_font = ini.get("", "font", "");
             overlay_mode = ini.get("", "mode", "auto");
             std::transform(overlay_mode.begin(), overlay_mode.end(), overlay_mode.begin(),
