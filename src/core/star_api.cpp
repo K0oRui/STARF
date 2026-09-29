@@ -41,6 +41,9 @@
 #include "overlay/overlay.h"
 #include "overlay/overlay_internal.h"
 #include "core/integrity_hooks.h"
+#include <cctype>
+#include <cstring>
+#include <cwctype>
 
 #ifndef STAR_EXPORT
 #define STAR_EXPORT extern "C"
@@ -97,6 +100,131 @@ static std::string find_settings_dir()
 // spawns the real game process, STAR's overlay hooks are useless in the
 // launcher.  We hook CreateProcess{W,A} so that when the launcher spawns a
 // child, we inject STAR into that child so the overlay works there.
+//
+// Helpers such as UnrealCEFSubProcess.exe, crash reporters, and Chromium
+// --type= children must never be injected. Their sandbox and guarded code
+// pages do not tolerate MinHook trampolines and overlay hooks.
+
+static bool EndsWithI(const std::wstring& value, const wchar_t* suffix)
+{
+    size_t vlen = value.size();
+    size_t slen = wcslen(suffix);
+    if (vlen < slen) return false;
+    size_t off = vlen - slen;
+    for (size_t i = 0; i < slen; ++i) {
+        if (towlower(value[off + i]) != towlower(suffix[i])) return false;
+    }
+    return true;
+}
+
+static bool EndsWithI(const std::string& value, const char* suffix)
+{
+    size_t vlen = value.size();
+    size_t slen = strlen(suffix);
+    if (vlen < slen) return false;
+    size_t off = vlen - slen;
+    for (size_t i = 0; i < slen; ++i) {
+        if (tolower((unsigned char)value[off + i]) != tolower((unsigned char)suffix[i])) return false;
+    }
+    return true;
+}
+
+static std::wstring BaseNameW(std::wstring path)
+{
+    while (!path.empty() && (path.front() == L'"' || path.front() == L'\'' || path.front() == L' '))
+        path.erase(path.begin());
+    while (!path.empty() && (path.back() == L'"' || path.back() == L'\'' || path.back() == L' '))
+        path.pop_back();
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) path = path.substr(pos + 1);
+    size_t sp = path.find(L' ');
+    if (sp != std::wstring::npos) path = path.substr(0, sp);
+    path.erase(std::remove(path.begin(), path.end(), L'"'), path.end());
+    path.erase(std::remove(path.begin(), path.end(), L'\''), path.end());
+    return path;
+}
+
+static std::string BaseNameA(std::string path)
+{
+    while (!path.empty() && (path.front() == '"' || path.front() == '\'' || path.front() == ' '))
+        path.erase(path.begin());
+    while (!path.empty() && (path.back() == '"' || path.back() == '\'' || path.back() == ' '))
+        path.pop_back();
+    size_t pos = path.find_last_of("\\/");
+    if (pos != std::string::npos) path = path.substr(pos + 1);
+    size_t sp = path.find(' ');
+    if (sp != std::string::npos) path = path.substr(0, sp);
+    path.erase(std::remove(path.begin(), path.end(), '"'), path.end());
+    path.erase(std::remove(path.begin(), path.end(), '\''), path.end());
+    return path;
+}
+
+static bool IsHelperImageW(const std::wstring& base)
+{
+    static const wchar_t* kDeny[] = {
+        L"UnrealCEFSubProcess.exe",
+        L"cefsubprocess.exe",
+        L"crashpad_handler.exe",
+        L"CrashReportClient.exe",
+        L"WerFault.exe",
+        L"UnityCrashHandler64.exe",
+        L"UnityCrashHandler32.exe",
+    };
+    for (const wchar_t* d : kDeny) {
+        if (EndsWithI(base, d)) return true;
+    }
+    return false;
+}
+
+static bool IsHelperImageA(const std::string& base)
+{
+    static const char* kDeny[] = {
+        "UnrealCEFSubProcess.exe",
+        "cefsubprocess.exe",
+        "crashpad_handler.exe",
+        "CrashReportClient.exe",
+        "WerFault.exe",
+        "UnityCrashHandler64.exe",
+        "UnityCrashHandler32.exe",
+    };
+    for (const char* d : kDeny) {
+        if (EndsWithI(base, d)) return true;
+    }
+    return false;
+}
+
+static bool STAR_ShouldSkipChildW(LPCWSTR app, LPCWSTR cmd)
+{
+    std::wstring app_base;
+    if (app && *app) app_base = BaseNameW(app);
+    if (!app_base.empty() && IsHelperImageW(app_base)) return true;
+    // app may be null with the image as the first token of cmd.
+    std::wstring cmd_base;
+    if (cmd && *cmd) cmd_base = BaseNameW(cmd);
+    if (!cmd_base.empty() && IsHelperImageW(cmd_base)) return true;
+    // Chromium/CEF child processes carry --type=renderer/gpu/utility.
+    if (cmd && *cmd && wcsstr(cmd, L"--type=")) return true;
+    return false;
+}
+
+static bool STAR_ShouldSkipChildA(LPCSTR app, LPCSTR cmd)
+{
+    std::string app_base;
+    if (app && *app) app_base = BaseNameA(app);
+    if (!app_base.empty() && IsHelperImageA(app_base)) return true;
+    std::string cmd_base;
+    if (cmd && *cmd) cmd_base = BaseNameA(cmd);
+    if (!cmd_base.empty() && IsHelperImageA(cmd_base)) return true;
+    if (cmd && *cmd && strstr(cmd, "--type=")) return true;
+    return false;
+}
+
+static bool STAR_InHelperProcess()
+{
+    wchar_t exe[MAX_PATH] = {};
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
+    return IsHelperImageW(BaseNameW(exe));
+}
 
 static bool STAR_InjectDll(DWORD target_pid)
 {
@@ -158,8 +286,12 @@ static BOOL WINAPI hooked_CreateProcessW(LPCWSTR app, LPWSTR cmd,
 {
     BOOL ret = orig_CreateProcessW(app, cmd, pa, ta, inherit, flags, env, cur, si, pi);
     if (ret && pi && pi->dwProcessId) {
-        STAR_LOG("CreateProcessW: child pid=%lu injecting", (unsigned long)pi->dwProcessId);
-        STAR_InjectDll(pi->dwProcessId);
+        if (STAR_ShouldSkipChildW(app, cmd)) {
+            STAR_LOG("CreateProcessW: child pid=%lu skipped (helper)", (unsigned long)pi->dwProcessId);
+        } else {
+            STAR_LOG("CreateProcessW: child pid=%lu injecting", (unsigned long)pi->dwProcessId);
+            STAR_InjectDll(pi->dwProcessId);
+        }
     }
     return ret;
 }
@@ -171,8 +303,12 @@ static BOOL WINAPI hooked_CreateProcessA(LPCSTR app, LPSTR cmd,
 {
     BOOL ret = orig_CreateProcessA(app, cmd, pa, ta, inherit, flags, env, cur, si, pi);
     if (ret && pi && pi->dwProcessId) {
-        STAR_LOG("CreateProcessA: child pid=%lu injecting", (unsigned long)pi->dwProcessId);
-        STAR_InjectDll(pi->dwProcessId);
+        if (STAR_ShouldSkipChildA(app, cmd)) {
+            STAR_LOG("CreateProcessA: child pid=%lu skipped (helper)", (unsigned long)pi->dwProcessId);
+        } else {
+            STAR_LOG("CreateProcessA: child pid=%lu injecting", (unsigned long)pi->dwProcessId);
+            STAR_InjectDll(pi->dwProcessId);
+        }
     }
     return ret;
 }
@@ -209,6 +345,12 @@ static DWORD WINAPI STAR_EarlyHookThread(LPVOID)
     // g_dll_module is written before CreateThread, so reading it here is
     // race-free; g_dll_dir is owned by the init thread, never read it here.
     if (g_dll_module) STAR_LogInit(get_dll_dir());
+    // Defense in depth: an old build may have already injected us into a
+    // helper before the parent-side denylist existed. Stay inert there.
+    if (STAR_InHelperProcess()) {
+        STAR_LOG("Helper process detected, STAR staying inert");
+        return 0;
+    }
     STAR_install_integrity_hooks();
     STAR_hook_create_process();
     // Capture Vulkan creation and DX12 swapchain queues before SteamAPI_Init

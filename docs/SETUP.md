@@ -57,6 +57,8 @@ locale = english
 beta = false
 branch = public
 dlc.unlock_all = false
+disable_networking = false
+offline = false
 
 ; individual DLC entries (app ID = display name)
 dlc.1234560 = Some DLC Name
@@ -64,6 +66,10 @@ dlc.1234561 = Another DLC
 ```
 
 `dlc.unlock_all = true` makes `BIsDlcInstalled()` return true for everything. Or list specific DLC app IDs. DLC IDs are on SteamDB under the game's DLC tab.
+
+`disable_networking = true` makes `CreateLobby()` fail with `k_EResultFail` instead of returning `k_EResultOK`. Everything else networking already fails outright: P2P, sockets, server lists, and HTTP return failure or empty results regardless of this key.
+
+`offline = true` makes `ISteamUser::BLoggedOn()` return `false` to mimic Steam offline mode. `SteamAPI_IsSteamRunning()` still returns `true`.
 
 ---
 

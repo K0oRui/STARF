@@ -27,7 +27,7 @@ HSteamUser StarSteamUser::GetHSteamUser()
 
 bool StarSteamUser::BLoggedOn()
 {
-    return true;
+    return !Settings::get().offline;
 }
 
 CSteamID StarSteamUser::GetSteamID()

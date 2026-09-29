@@ -30,6 +30,8 @@ public:
     bool unlock_all_dlc = false;
     bool is_beta_branch = false;
     std::string branch_name = "public";
+    bool disable_networking = false;
+    bool offline = false;
     std::vector<DlcEntry> dlc_list;
     std::vector<AchievementDef> achievements;
     bool overlay_enabled = true;

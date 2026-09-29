@@ -52,6 +52,8 @@ locale = english
 beta = false
 branch = public
 dlc.unlock_all = false
+disable_networking = false
+offline = false
 ```
 
 `STAR/overlay.star` (optional, overlay is on by default)
@@ -162,7 +164,7 @@ All `.star` files are INI-format. On first load, STAR stamps a small ASCII art h
 | file | what it controls |
 |------|-----------------|
 | `identity.star` | display name, Steam ID, language |
-| `game.star` | beta branch, DLC config |
+| `game.star` | beta branch, DLC config, offline and networking toggles |
 | `languages.star` | list of languages the game claims to support |
 | `overlay.star` | enable/disable the overlay |
 | `achievements.json` | achievement definitions |
@@ -173,6 +175,7 @@ All `.star` files are INI-format. On first load, STAR stamps a small ASCII art h
 ## misc
 
 - `SteamAPI_IsSteamRunning()` always returns `true`. You're welcome.
-- Networking interfaces exist but don't actually network anything.
+- `ISteamUser::BLoggedOn()` returns `false` only when `offline = true` in `game.star`.
+- Networking interfaces exist but don't actually network anything. `disable_networking = true` in `game.star` also makes `CreateLobby()` fail outright.
 - Inventory and UGC are stubs, they won't crash but won't do much.
 - Game server stuff returns success and does nothing. Fine for most games.
