@@ -25,6 +25,18 @@ bool IniFile::load(const std::string& path)
     std::string current_section;
     std::string line;
     bool first_line = true;
+    auto strip_comment = [](const std::string& s) {
+        std::string r = s;
+        size_t comment = r.find(';');
+        if (comment != std::string::npos) {
+            r = r.substr(0, comment);
+        }
+        comment = r.find('#');
+        if (comment != std::string::npos) {
+            r = r.substr(0, comment);
+        }
+        return trim(r);
+    };
     while (std::getline(f, line)) {
         if (first_line) {
             first_line = false;
@@ -47,18 +59,14 @@ bool IniFile::load(const std::string& path)
         size_t eq = line.find('=');
         if (eq != std::string::npos) {
             std::string key = trim(line.substr(0, eq));
-            std::string val = trim(line.substr(eq + 1));
-
-            size_t comment = val.find(';');
-            if (comment != std::string::npos) {
-                val = trim(val.substr(0, comment));
-            }
-            comment = val.find('#');
-            if (comment != std::string::npos) {
-                val = trim(val.substr(0, comment));
-            }
+            std::string val = strip_comment(line.substr(eq + 1));
             if (!key.empty()) {
                 data_[current_section][key] = val;
+            }
+        } else {
+            std::string key = strip_comment(line);
+            if (!key.empty()) {
+                data_[current_section][key] = "";
             }
         }
     }
