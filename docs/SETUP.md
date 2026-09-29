@@ -71,12 +71,12 @@ dlc.1234561 = Another DLC
 
 ```ini
 [languages]
-english = 1
-french = 1
-german = 1
+english
+french
+german
 ```
 
-Controls what `GetAvailableGameLanguages()` returns. If the locale in `identity.star` isn't in this list, STAR falls back to the first entry and logs a warning. File is optional, if missing only the configured locale is reported.
+Controls what `GetAvailableGameLanguages()` returns. One name per line, `= 1` suffix is optional for backwards compatibility. If the locale in `identity.star` isn't in this list, STAR falls back to the first entry and logs a warning. File is optional, if missing only the configured locale is reported.
 
 ---
 

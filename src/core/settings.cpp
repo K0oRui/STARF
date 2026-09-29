@@ -50,16 +50,16 @@ static void bootstrap_star_folder(const std::string& dir)
         "# dlc.unlock_all: true | false - report every DLC as owned.\n"
         "dlc.unlock_all = false\n");
     write_default_file(dir + "\\languages.star",
-        "# Languages the game may claim to support. One \"<name> = 1\" per line,\n"
+        "# Languages the game may claim to support. One per line,\n"
         "# same names as identity.star locale. Missing locale falls back to first entry.\n"
         "[languages]\n"
-        "english = 1\n"
-        "french = 1\n"
-        "german = 1\n"
-        "spanish = 1\n"
-        "russian = 1\n"
-        "schinese = 1\n"
-        "japanese = 1\n");
+        "english\n"
+        "french\n"
+        "german\n"
+        "spanish\n"
+        "russian\n"
+        "schinese\n"
+        "japanese\n");
     write_default_file(dir + "\\overlay.star",
         "# STAR overlay config. Delete any key to restore its default.\n"
         "# Hotkeys: Shift+Tab (or Shift+`) opens the panel, F12 takes a screenshot.\n"
